@@ -1,0 +1,9 @@
+[package]
+name = "pandedup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gxhash = "3.5.0"
+ragc-core = "0.1.1"
+simd-minimizers = "3.0.0"
