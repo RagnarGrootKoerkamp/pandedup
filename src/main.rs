@@ -18,7 +18,8 @@ fn main() {
 
     let mut seen = std::collections::HashSet::new();
     let k = 40; // overlap
-    let w = 500; // at most w apart
+    let w = 100; // at most w apart
+    eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
     let syncmers = simd_minimizers::closed_syncmers(k, w);
 
@@ -32,18 +33,22 @@ fn main() {
     let mut output_bp = 0;
     let mut skipped_bp = 0;
     let mut input_bp = 0;
+    let mut num_ranges = 0;
 
     let mut cnt = 0;
     let mut syncmer_poss = vec![];
-    for sample in &samples {
-        eprintln!("sample {}", sample);
+    for (si, sample) in samples.iter().enumerate() {
+        let mut new_ranges = 0;
+        let mut new_bp = 0;
+        let mut new_taken = 0;
+        eprintln!("sample {si}: {}", sample);
         let contigs = decompressor.list_contigs(sample).unwrap();
         for contig in &contigs {
             cnt += 1;
             let seq = decompressor.get_contig(&sample, &contig).unwrap();
             input_bp += seq.len();
 
-            eprintln!("{cnt:>3} ({:>10}): contig {contig}", seq.len());
+            // eprintln!("{cnt:>3} ({:>10}): contig {contig}", seq.len());
 
             // Minimizer-based PFP instead?
             syncmer_poss.clear();
@@ -71,6 +76,9 @@ fn main() {
                 if range.start <= active.end {
                     active.end = range.end;
                 } else {
+                    new_ranges += 1;
+                    num_ranges += 1;
+                    new_bp += active.len();
                     output_bp += active.len();
                     skipped_bp += range.start - active.end;
                     active = range;
@@ -88,6 +96,7 @@ fn main() {
                 if seen.insert(hash) {
                     // eprintln!("take {p} hash={hash}");
                     taken += 1;
+                    new_taken += 1;
                     push(p..p + l);
                 } else {
                     // eprintln!("skip {p} hash={hash}");
@@ -99,17 +108,40 @@ fn main() {
             let suffix = &seq[suffix_range.clone()];
             suffix_bp += suffix.len();
             push(suffix_range);
+            num_ranges += 1;
+            new_ranges += 1;
             output_bp += active.len();
+            new_bp += active.len();
         }
-        eprintln!("taken:   {taken}");
-        eprintln!("skipped: {skipped}");
-        eprintln!("short:   {short}");
-        eprintln!("num_syncmers: {num_syncmers}");
-        eprintln!("prefix_bp:  {prefix_bp}");
-        eprintln!("suffix_bp:  {suffix_bp}");
-        eprintln!("input_bp:   {input_bp}");
-        eprintln!("output_bp:  {output_bp}");
-        eprintln!("skipped_bp: {skipped_bp}");
-        eprintln!("short_bp:   {short_bp}");
+        eprintln!(
+            "  new bp:           {:>8.3} Mbp ({:3.1} bp/range)",
+            new_bp as f32 / 1e6,
+            new_bp as f32 / new_ranges as f32
+        );
+        eprintln!(
+            "  new taken:        {:>8.3} M   ({:3.1} /range)",
+            new_taken as f32 / 1e6,
+            new_taken as f32 / new_ranges as f32
+        );
+        eprintln!(
+            "  syncmers taken:   {:>8.3} M   ({:3.1}%)",
+            taken as f32 / 1e6,
+            100.0 * taken as f32 / num_syncmers as f32
+        );
+        // eprintln!("syncmers skipped: {skipped:>9}");
+        // eprintln!("short:   {short}");
+        // eprintln!("num_syncmers: {num_syncmers}");
+        // eprintln!("prefix_bp:  {prefix_bp}");
+        // eprintln!("suffix_bp:  {suffix_bp}");
+        eprintln!("  num_ranges:       {:>8.3} M", num_ranges as f32 / 1e6);
+        // eprintln!("input_bp:   {:>8.3} Gbp", input_bp as f32 / 1e9);
+        eprintln!(
+            "  output_bp:        {:>8.3} Gbp ({:3.1}%)",
+            output_bp as f32 / 1e9,
+            100.0 * output_bp as f32 / input_bp as f32
+        );
+        // eprintln!("skipped_bp: {:>8.3} Gbp", skipped_bp as f32 / 1e9);
+        // eprintln!("short_bp:   {short_bp}");
+        eprintln!();
     }
 }
