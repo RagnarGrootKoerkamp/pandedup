@@ -124,15 +124,17 @@ fn main() {
                 let prefix = &seq[..syncmer_poss[0] as usize + k - 1];
                 prefix_bp += prefix.len();
                 // Emit the syncmers.
-                for &p in syncmer_poss.iter() {
+                for &[p, q] in syncmer_poss.array_windows::<2>() {
                     let p = p as usize;
+                    let q = q as usize;
                     num_syncmers += 1;
-                    let syncmer = &seq[p..p + l];
+                    // minimizer parse
+                    let syncmer = &seq[p..q + k];
                     let hash = gxhash128(syncmer, 0);
                     if seen.insert(hash) {
                         taken += 1;
                         new_taken += 1;
-                        push(p..p + l);
+                        push(p..q + k);
                     } else {
                         skipped += 1;
                     }
