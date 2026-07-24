@@ -19,6 +19,7 @@ fn main() {
 
     let mut seen = std::collections::HashSet::new();
     let k = 40; // overlap
+    let mini_k = 8; // k for minimizers. smaller to make it more stable
     let w = 100; // at most w apart
     eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
@@ -36,15 +37,15 @@ fn main() {
     let mut num_ranges = 0usize;
 
     let next = AtomicUsize::new(0);
-    let (write, read) = std::sync::mpsc::sync_channel(4);
     std::thread::scope(|scope| {
+        let (write, read) = std::sync::mpsc::sync_channel(4);
         for _t in 0..4 {
             let write = write.clone();
             let config = DecompressorConfig::default();
             let mut decompressor = Decompressor::open(path, config).unwrap();
             let samples = &samples;
             let next = &next;
-            let syncmers = simd_minimizers::closed_syncmers(k, w);
+            let syncmers = simd_minimizers::minimizers(mini_k, w);
             scope.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= samples.len() {
@@ -70,10 +71,15 @@ fn main() {
                         for &[p, q] in syncmer_poss.array_windows() {
                             assert!(p < q, "{p} < {q}");
                             assert!(q <= p + w as u32, "{q} <= {p} + {w}");
+                            assert!(
+                                p as usize + mini_k <= seq.len(),
+                                "{p} + {w} <= {}",
+                                seq.len()
+                            );
                             // assert!(p as usize + w <= seq.len(), "{p} + {w} <= {}", seq.len());
-                            assert!(p as usize + l <= seq.len(), "{p} + {l} <= {}", seq.len());
+                            // assert!(p as usize + l <= seq.len(), "{p} + {l} <= {}", seq.len());
                         }
-                        // assert!(*syncmer_poss.last().unwrap() as usize + l >= seq.len());
+                        assert!(*syncmer_poss.last().unwrap() as usize + l >= seq.len());
 
                         (seq, syncmer_poss)
                     })
@@ -129,18 +135,18 @@ fn main() {
                     let q = q as usize;
                     num_syncmers += 1;
                     // minimizer parse
-                    let syncmer = &seq[p..q + k];
+                    let syncmer = &seq[p..(q + k).min(seq.len())];
                     let hash = gxhash128(syncmer, 0);
                     if seen.insert(hash) {
                         taken += 1;
                         new_taken += 1;
-                        push(p..q + k);
+                        push(p..(q + k).min(seq.len()));
                     } else {
                         skipped += 1;
                     }
                 }
                 // Emit the suffix.
-                let suffix_range = syncmer_poss[syncmer_poss.len() - 1] as usize + w..seq.len();
+                let suffix_range = syncmer_poss[syncmer_poss.len() - 1] as usize..seq.len();
                 let suffix = &seq[suffix_range.clone()];
                 suffix_bp += suffix.len();
                 push(suffix_range);
