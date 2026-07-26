@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 gxhash = "3.5.0"
 ragc-core = "0.1.1"
+seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"

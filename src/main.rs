@@ -1,6 +1,8 @@
+#![allow(unused)]
 use std::{ops::Range, sync::atomic::AtomicUsize};
 
 use gxhash::gxhash128;
+use seq_hash::{packed_seq::u32x8, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
 fn main() {
@@ -18,14 +20,14 @@ fn main() {
     // eprintln!("samples: {samples:?}");
 
     let mut seen = std::collections::HashSet::new();
-    let k = 40; // overlap
+    let k = 40usize; // overlap
     let mini_k = 8; // k for minimizers. smaller to make it more stable
     let w = 100; // at most w apart
     eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
 
-    let mut num_syncmers = 0usize;
-    let mut taken = 0usize;
+    let mut num_phrases = 0usize;
+    let mut phrases = 0usize;
     let mut skipped = 0usize;
     let mut short = 0usize;
     let mut short_bp = 0;
@@ -45,7 +47,10 @@ fn main() {
             let mut decompressor = Decompressor::open(path, config).unwrap();
             let samples = &samples;
             let next = &next;
-            let syncmers = simd_minimizers::minimizers(mini_k, w);
+            // let scheme = simd_minimizers::closed_syncmers(k, w);
+            // let scheme = simd_minimizers::minimizers(k, w);
+            let scheme = simd_minimizers::minimizers(mini_k, w);
+            // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= samples.len() {
@@ -64,24 +69,39 @@ fn main() {
                 let seqs_and_poss: Vec<_> = seqs
                     .into_iter()
                     .map(|seq| {
-                        let mut syncmer_poss = vec![];
-                        syncmers.run(AsciiSeq(&seq), &mut syncmer_poss);
+                        let mut positions = vec![];
+                        scheme.run(AsciiSeq(&seq), &mut positions);
+
+                        // For PFP
+                        // {
+                        //     let threshold = (u32::MAX as u64 * 2 / (w as u64 + 1)) as u32;
+                        //     let simd_threshold = u32x8::splat(threshold);
+                        //     let hashes = scheme
+                        //         .hash_kmers_simd(AsciiSeq(&seq), 1)
+                        //         .map(|h| h.simd_lt(simd_threshold))
+                        //         .collect();
+                        //     for i in 0..hashes.len() {
+                        //         if hashes[i] > 0 {
+                        //             positions.push(i as u32);
+                        //         }
+                        //     }
+                        // }
 
                         // sanity check
-                        for &[p, q] in syncmer_poss.array_windows() {
-                            assert!(p < q, "{p} < {q}");
-                            assert!(q <= p + w as u32, "{q} <= {p} + {w}");
-                            assert!(
-                                p as usize + mini_k <= seq.len(),
-                                "{p} + {w} <= {}",
-                                seq.len()
-                            );
-                            // assert!(p as usize + w <= seq.len(), "{p} + {w} <= {}", seq.len());
-                            // assert!(p as usize + l <= seq.len(), "{p} + {l} <= {}", seq.len());
-                        }
-                        assert!(*syncmer_poss.last().unwrap() as usize + l >= seq.len());
+                        // for &[p, q] in positions.array_windows() {
+                        //     assert!(p < q, "{p} < {q}");
+                        //     assert!(q <= p + w as u32, "{q} <= {p} + {w}");
+                        //     assert!(
+                        //         p as usize + mini_k <= seq.len(),
+                        //         "{p} + {w} <= {}",
+                        //         seq.len()
+                        //     );
+                        //     // assert!(p as usize + w <= seq.len(), "{p} + {w} <= {}", seq.len());
+                        //     // assert!(p as usize + l <= seq.len(), "{p} + {l} <= {}", seq.len());
+                        // }
+                        // assert!(*positions.last().unwrap() as usize + l >= seq.len());
 
-                        (seq, syncmer_poss)
+                        (seq, positions)
                     })
                     .collect();
                 let end = std::time::Instant::now();
@@ -102,18 +122,18 @@ fn main() {
         for (si, sample) in read.into_iter().enumerate() {
             let mut new_ranges = 0;
             let mut new_bp = 0;
-            let mut new_taken = 0;
+            let mut new_phrases = 0;
             let start = std::time::Instant::now();
-            for (seq, syncmer_poss) in sample {
+            for (seq, positions) in sample {
                 input_bp += seq.len();
-                if syncmer_poss.is_empty() {
+                if positions.is_empty() {
                     short += 1;
                     short_bp += seq.len();
                     continue;
                 }
 
                 // Emit the prefix.
-                let mut active = 0..syncmer_poss[0] as usize + k - 1;
+                let mut active = 0..positions[0] as usize + k - 1;
                 let mut push = |range: Range<usize>| {
                     assert!(range.end >= active.end);
                     if range.start <= active.end {
@@ -127,26 +147,26 @@ fn main() {
                         active = range;
                     }
                 };
-                let prefix = &seq[..syncmer_poss[0] as usize + k - 1];
+                let prefix = &seq[..positions[0] as usize + k - 1];
                 prefix_bp += prefix.len();
                 // Emit the syncmers.
-                for &[p, q] in syncmer_poss.array_windows::<2>() {
+                for &[p, q] in positions.array_windows::<2>() {
                     let p = p as usize;
                     let q = q as usize;
-                    num_syncmers += 1;
+                    num_phrases += 1;
                     // minimizer parse
-                    let syncmer = &seq[p..(q + k).min(seq.len())];
-                    let hash = gxhash128(syncmer, 0);
+                    let phrase = &seq[p..(q + k).min(seq.len())];
+                    let hash = gxhash128(phrase, 0);
                     if seen.insert(hash) {
-                        taken += 1;
-                        new_taken += 1;
+                        phrases += 1;
+                        new_phrases += 1;
                         push(p..(q + k).min(seq.len()));
                     } else {
                         skipped += 1;
                     }
                 }
                 // Emit the suffix.
-                let suffix_range = syncmer_poss[syncmer_poss.len() - 1] as usize..seq.len();
+                let suffix_range = positions[positions.len() - 1] as usize..seq.len();
                 let suffix = &seq[suffix_range.clone()];
                 suffix_bp += suffix.len();
                 push(suffix_range);
@@ -162,14 +182,14 @@ fn main() {
                 new_bp as f32 / new_ranges as f32
             );
             eprintln!(
-                "  new taken:        {:>8.3} M   ({:3.1} /range)",
-                new_taken as f32 / 1e6,
-                new_taken as f32 / new_ranges as f32
+                "  new phrases:        {:>8.3} M   ({:3.1} /range)",
+                new_phrases as f32 / 1e6,
+                new_phrases as f32 / new_ranges as f32
             );
             eprintln!(
-                "  syncmers taken:   {:>8.3} M   ({:3.1}%)",
-                taken as f32 / 1e6,
-                100.0 * taken as f32 / num_syncmers as f32
+                "  total phrases:   {:>8.3} M   ({:3.1}%)",
+                phrases as f32 / 1e6,
+                100.0 * phrases as f32 / num_phrases as f32
             );
             // eprintln!("syncmers skipped: {skipped:>9}");
             // eprintln!("short:   {short}");
