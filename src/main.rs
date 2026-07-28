@@ -1,9 +1,15 @@
 #![allow(unused)]
-use std::{ops::Range, sync::atomic::AtomicUsize};
+use std::{
+    io::{BufWriter, Write},
+    ops::Range,
+    sync::atomic::AtomicUsize,
+};
 
 use gxhash::gxhash128;
 use seq_hash::{packed_seq::u32x8, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
+
+const THREADS: usize = 3;
 
 fn main() {
     let path = "/home/philae/git/eth/data/hprcv2.agc";
@@ -38,10 +44,19 @@ fn main() {
     let mut input_bp = 0;
     let mut num_ranges = 0usize;
 
+    // // output text
+    // let mut output = vec![];
+    // // end position of each sequence in output.
+    // let mut ends = vec![0];
+    let mut output = BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(format!("deduped_k{k}_w{w}_mk{mini_k}.fa")).unwrap(),
+    );
+
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let (write, read) = std::sync::mpsc::sync_channel(4);
-        for _t in 0..4 {
+        let (write, read) = std::sync::mpsc::sync_channel(THREADS);
+        for _t in 0..THREADS {
             let write = write.clone();
             let config = DecompressorConfig::default();
             let mut decompressor = Decompressor::open(path, config).unwrap();
@@ -62,7 +77,13 @@ fn main() {
                 let start = std::time::Instant::now();
                 let seqs: Vec<_> = contigs
                     .iter()
-                    .map(|contig| decompressor.get_contig(&sample, &contig).unwrap())
+                    .map(|contig| {
+                        let mut contig = decompressor.get_contig(&sample, &contig).unwrap();
+                        contig
+                            .iter_mut()
+                            .for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
+                        contig
+                    })
                     .collect();
                 let len: usize = seqs.iter().map(|seq| seq.len()).sum();
                 let mid = std::time::Instant::now();
@@ -133,12 +154,21 @@ fn main() {
                 }
 
                 // Emit the prefix.
+                let prefix = &seq[..positions[0] as usize + k - 1];
+                prefix_bp += prefix.len();
                 let mut active = 0..positions[0] as usize + k - 1;
+
                 let mut push = |range: Range<usize>| {
                     assert!(range.end >= active.end);
                     if range.start <= active.end {
                         active.end = range.end;
                     } else {
+                        output.write_all(b">\n");
+                        output.write_all(&seq[active.clone()]).unwrap();
+                        output.write_all(b"\n");
+                        // output.extend_from_slice(&seq[active.clone()]);
+                        // ends.push(output.len());
+
                         new_ranges += 1;
                         num_ranges += 1;
                         new_bp += active.len();
@@ -147,8 +177,7 @@ fn main() {
                         active = range;
                     }
                 };
-                let prefix = &seq[..positions[0] as usize + k - 1];
-                prefix_bp += prefix.len();
+
                 // Emit the syncmers.
                 for &[p, q] in positions.array_windows::<2>() {
                     let p = p as usize;
@@ -170,6 +199,13 @@ fn main() {
                 let suffix = &seq[suffix_range.clone()];
                 suffix_bp += suffix.len();
                 push(suffix_range);
+
+                output.write_all(b">\n");
+                output.write_all(&seq[active.clone()]).unwrap();
+                output.write_all(b"\n");
+                // output.extend_from_slice(&seq[active.clone()]);
+                // ends.push(output.len());
+
                 num_ranges += 1;
                 new_ranges += 1;
                 output_bp += active.len();
