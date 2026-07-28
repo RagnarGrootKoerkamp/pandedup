@@ -1,0 +1,3 @@
+[build]
+# By default, we want maximum performance rather than portability.
+rustflags = ["-C", "target-cpu=native"]
