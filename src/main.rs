@@ -2,7 +2,7 @@
 use std::{
     io::{BufWriter, Write},
     ops::Range,
-    sync::atomic::AtomicUsize,
+    sync::{atomic::AtomicUsize, RwLock},
 };
 
 use gxhash::gxhash128;
@@ -25,15 +25,15 @@ fn main() {
     // println!("Found {} samples", samples.len());
     // eprintln!("samples: {samples:?}");
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = RwLock::new(std::collections::HashSet::new());
     let k = 40usize; // overlap
     let mini_k = 8; // k for minimizers. smaller to make it more stable
     let w = 100; // at most w apart
     eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
 
-    let mut num_phrases = 0usize;
-    let mut phrases = 0usize;
+    let mut total_filtered_phrases = 0usize;
+    let mut taken_phrases = 0usize;
     let mut skipped = 0usize;
     let mut short = 0usize;
     let mut short_bp = 0;
@@ -62,6 +62,7 @@ fn main() {
             let mut decompressor = Decompressor::open(path, config).unwrap();
             let samples = &samples;
             let next = &next;
+            let seen = &seen;
             // let scheme = simd_minimizers::closed_syncmers(k, w);
             // let scheme = simd_minimizers::minimizers(k, w);
             let scheme = simd_minimizers::minimizers(mini_k, w);
@@ -127,13 +128,47 @@ fn main() {
                     .collect();
                 let end = std::time::Instant::now();
 
+                // Pre-filter already seen phrases.
+                let seen = seen.read().unwrap();
+                let seqs_and_phrases = seqs_and_poss
+                    .into_iter()
+                    .map(|(seq, positions)| {
+                        let mut phrases = vec![];
+                        if positions.is_empty() {
+                            return (seq, phrases);
+                        }
+                        // Prefix phrase.
+                        if positions[0] > 0 {
+                            phrases.push((0, (positions[0] as usize + k).min(seq.len())));
+                        }
+                        for &[p, q] in positions.array_windows::<2>() {
+                            let p = p as usize;
+                            let q = (q as usize + k).min(seq.len());
+                            let phrase = &seq[p..q];
+                            let hash = gxhash128(phrase, 0);
+                            if !seen.contains(&hash) {
+                                phrases.push((p, q));
+                            }
+                        }
+                        // Suffix phrase.
+                        if *positions.last().unwrap() as usize + k < seq.len() {
+                            phrases.push((*positions.last().unwrap() as usize, seq.len()));
+                        }
+                        (seq, phrases)
+                    })
+                    .collect::<Vec<_>>();
+                drop(seen);
+
+                let end2 = std::time::Instant::now();
+
                 eprintln!(
-                    "push sample {idx:>3} ({:3.1} Gbp): read: {:?} minis: {:?}",
+                    "push sample {idx:>3} ({:3.1} Gbp): read: {:?} minis: {:?} filter: {:?}",
                     len as f32 / 1e9,
                     mid - start,
-                    end - mid
+                    end - mid,
+                    end2 - end
                 );
-                write.send(seqs_and_poss).unwrap();
+                write.send(seqs_and_phrases).unwrap();
             });
         }
         drop(write);
@@ -144,19 +179,17 @@ fn main() {
             let mut new_ranges = 0;
             let mut new_bp = 0;
             let mut new_phrases = 0;
+            let mut seen = seen.write().unwrap();
             let start = std::time::Instant::now();
-            for (seq, positions) in sample {
+            for (seq, phrases) in sample {
                 input_bp += seq.len();
-                if positions.is_empty() {
+                if phrases.is_empty() {
                     short += 1;
                     short_bp += seq.len();
                     continue;
                 }
 
-                // Emit the prefix.
-                let prefix = &seq[..positions[0] as usize + k - 1];
-                prefix_bp += prefix.len();
-                let mut active = 0..positions[0] as usize + k - 1;
+                let mut active = 0..0;
 
                 let mut push = |range: Range<usize>| {
                     assert!(range.end >= active.end);
@@ -166,8 +199,6 @@ fn main() {
                         output.write_all(b">\n");
                         output.write_all(&seq[active.clone()]).unwrap();
                         output.write_all(b"\n");
-                        // output.extend_from_slice(&seq[active.clone()]);
-                        // ends.push(output.len());
 
                         new_ranges += 1;
                         num_ranges += 1;
@@ -179,38 +210,29 @@ fn main() {
                 };
 
                 // Emit the syncmers.
-                for &[p, q] in positions.array_windows::<2>() {
-                    let p = p as usize;
-                    let q = q as usize;
-                    num_phrases += 1;
-                    // minimizer parse
-                    let phrase = &seq[p..(q + k).min(seq.len())];
+                for (p, q) in phrases {
+                    total_filtered_phrases += 1;
+                    let phrase = &seq[p..q];
                     let hash = gxhash128(phrase, 0);
                     if seen.insert(hash) {
-                        phrases += 1;
+                        taken_phrases += 1;
                         new_phrases += 1;
-                        push(p..(q + k).min(seq.len()));
+                        push(p..q);
                     } else {
                         skipped += 1;
                     }
                 }
-                // Emit the suffix.
-                let suffix_range = positions[positions.len() - 1] as usize..seq.len();
-                let suffix = &seq[suffix_range.clone()];
-                suffix_bp += suffix.len();
-                push(suffix_range);
 
                 output.write_all(b">\n");
                 output.write_all(&seq[active.clone()]).unwrap();
                 output.write_all(b"\n");
-                // output.extend_from_slice(&seq[active.clone()]);
-                // ends.push(output.len());
 
                 num_ranges += 1;
                 new_ranges += 1;
                 output_bp += active.len();
                 new_bp += active.len();
             }
+
             eprintln!("process sample {si}: {:?}", start.elapsed());
             eprintln!(
                 "  new bp:           {:>8.3} Mbp ({:3.1} bp/range)",
@@ -224,18 +246,19 @@ fn main() {
             );
             eprintln!(
                 "  total phrases:   {:>8.3} M   ({:3.1}%)",
-                phrases as f32 / 1e6,
-                100.0 * phrases as f32 / num_phrases as f32
+                taken_phrases as f32 / 1e6,
+                100.0 * taken_phrases as f32 / total_filtered_phrases as f32
             );
+
             // eprintln!("syncmers skipped: {skipped:>9}");
             // eprintln!("short:   {short}");
             // eprintln!("num_syncmers: {num_syncmers}");
             // eprintln!("prefix_bp:  {prefix_bp}");
             // eprintln!("suffix_bp:  {suffix_bp}");
-            eprintln!("  num_ranges:       {:>8.3} M", num_ranges as f32 / 1e6);
+            eprintln!("  num_ranges:        {:>8.3} M", num_ranges as f32 / 1e6);
             // eprintln!("input_bp:   {:>8.3} Gbp", input_bp as f32 / 1e9);
             eprintln!(
-                "  output_bp:        {:>8.3} Gbp ({:3.1}%)",
+                "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
                 output_bp as f32 / 1e9,
                 100.0 * output_bp as f32 / input_bp as f32
             );
