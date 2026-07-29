@@ -862,8 +862,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "ragc-common"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "606d5cd72c0c78a2b02ca29c624c36617eb122fc71d0548a9b168f9c1b63f049"
+source = "git+https://github.com/ragnargrootkoerkamp/ragc#0547315401927fffaa46776941ff0011ae9426f1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -878,8 +877,7 @@ dependencies = [
 [[package]]
 name = "ragc-core"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23fd9e2f44e1cf5470134fb657c07655f113b80ae79e114e6080e05b2356ef08"
+source = "git+https://github.com/ragnargrootkoerkamp/ragc#0547315401927fffaa46776941ff0011ae9426f1"
 dependencies = [
  "ahash",
  "anyhow",

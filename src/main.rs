@@ -2,14 +2,14 @@
 use std::{
     io::{BufWriter, Write},
     ops::Range,
-    sync::{atomic::AtomicUsize, RwLock},
+    sync::{atomic::AtomicUsize, Mutex, RwLock},
 };
 
 use gxhash::gxhash128;
 use seq_hash::{packed_seq::u32x8, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
-const THREADS: usize = 3;
+const THREADS: usize = 6;
 
 fn main() {
     let path = "/home/philae/git/eth/data/hprcv2.agc";
@@ -17,11 +17,17 @@ fn main() {
 
     // Open an archive
     let config = DecompressorConfig::default();
-    let decompressor = Decompressor::open(path, config).unwrap();
+    let mut decompressor = Decompressor::open(path, config).unwrap();
 
     // List available samples
     let samples = decompressor.list_samples();
-    drop(decompressor);
+    let samples: Vec<_> = samples
+        .into_iter()
+        .map(|sample| {
+            let contigs = decompressor.list_contigs(&sample).unwrap();
+            (sample, contigs)
+        })
+        .collect();
     // println!("Found {} samples", samples.len());
     // eprintln!("samples: {samples:?}");
 
@@ -58,8 +64,7 @@ fn main() {
         let (write, read) = std::sync::mpsc::sync_channel(THREADS);
         for _t in 0..THREADS {
             let write = write.clone();
-            let config = DecompressorConfig::default();
-            let mut decompressor = Decompressor::open(path, config).unwrap();
+            let decompressor = &decompressor;
             let samples = &samples;
             let next = &next;
             let seen = &seen;
@@ -72,14 +77,16 @@ fn main() {
                 if idx >= samples.len() {
                     break;
                 }
-                let sample = &samples[idx];
-                let contigs = decompressor.list_contigs(sample).unwrap();
+
+                let (sample, contigs) = &samples[idx];
 
                 let start = std::time::Instant::now();
                 let seqs: Vec<_> = contigs
                     .iter()
                     .map(|contig| {
-                        let mut contig = decompressor.get_contig(&sample, &contig).unwrap();
+                        let mut contig = decompressor
+                            .get_contig(&sample, &contig)
+                            .unwrap();
                         contig
                             .iter_mut()
                             .for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
@@ -130,6 +137,7 @@ fn main() {
 
                 // Pre-filter already seen phrases.
                 let seen = seen.read().unwrap();
+                let locking = std::time::Instant::now();
                 let seqs_and_phrases = seqs_and_poss
                     .into_iter()
                     .map(|(seq, positions)| {
@@ -162,11 +170,12 @@ fn main() {
                 let end2 = std::time::Instant::now();
 
                 eprintln!(
-                    "push sample {idx:>3} ({:3.1} Gbp): read: {:?} minis: {:?} filter: {:?}",
+                    "push sample {idx:>3} ({:3.1} Gbp): read: {:?} minis: {:?} read-lock: {:?} filter: {:?}",
                     len as f32 / 1e9,
                     mid - start,
                     end - mid,
-                    end2 - end
+                    locking-end,
+                    end2 - locking
                 );
                 write.send(seqs_and_phrases).unwrap();
             });
