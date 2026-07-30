@@ -1,5 +1,6 @@
 #![allow(unused)]
 use clap::Parser;
+use either::Either;
 use ragc_core::{Decompressor, DecompressorConfig};
 use std::{
     collections::HashSet,
@@ -90,7 +91,11 @@ fn main() {
             let seen = &seen;
             // let scheme = simd_minimizers::closed_syncmers(k, w);
             // let scheme = simd_minimizers::minimizers(k, w);
-            let scheme = simd_minimizers::canonical_minimizers(mini_k, w);
+            let scheme = if canonical {
+                Either::Left(simd_minimizers::canonical_minimizers(mini_k, w))
+            } else {
+                Either::Right(simd_minimizers::minimizers(mini_k, w))
+            };
             let mut rc_seq = vec![];
             // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
@@ -120,7 +125,10 @@ fn main() {
                     .into_iter()
                     .map(|seq| {
                         let mut positions = vec![];
-                        scheme.run(AsciiSeq(&seq), &mut positions);
+                        match scheme {
+                            Either::Left(ref scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                            Either::Right(ref scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                        }
 
                         // For PFP
                         // {

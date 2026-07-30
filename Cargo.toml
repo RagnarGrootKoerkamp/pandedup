@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
+either = "1.17.0"
 gxhash = "3.5.0"
 # ragc-core = "0.1.1"
 # ragc-core.path = "../forks/ragc/ragc-core"
