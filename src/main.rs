@@ -7,6 +7,7 @@ use std::{
 };
 
 use gxhash::gxhash128;
+use ragc_core::reverse_complement;
 use seq_hash::{packed_seq::u32x8, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
@@ -71,7 +72,8 @@ fn main() {
             let seen = &seen;
             // let scheme = simd_minimizers::closed_syncmers(k, w);
             // let scheme = simd_minimizers::minimizers(k, w);
-            let scheme = simd_minimizers::minimizers(mini_k, w);
+            let scheme = simd_minimizers::canonical_minimizers(mini_k, w);
+            let mut rc_seq = vec![];
             // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -146,22 +148,33 @@ fn main() {
                         if positions.is_empty() {
                             return (seq, phrases);
                         }
+
+                        rc_seq.clear();
+                        rc_seq.extend(seq.iter().rev().map(|bp| 3-bp));
+
+                        let with_hash = |p, q| {
+                            let phrase = &seq[p..q];
+                            let hash = gxhash128(phrase, 0);
+                            let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
+                            let rc_hash = gxhash128(rc_phrase, 0);
+                            (p, q, hash + rc_hash)
+                        };
+
                         // Prefix phrase.
                         if positions[0] > 0 {
-                            phrases.push((0, (positions[0] as usize + k).min(seq.len())));
+                            phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
                         }
                         for &[p, q] in positions.array_windows::<2>() {
                             let p = p as usize;
                             let q = (q as usize + k).min(seq.len());
-                            let phrase = &seq[p..q];
-                            let hash = gxhash128(phrase, 0);
+                            let (p, q, hash) = with_hash(p, q);
                             if !seen.contains(&hash) {
-                                phrases.push((p, q));
+                                phrases.push((p, q, hash));
                             }
                         }
                         // Suffix phrase.
                         if *positions.last().unwrap() as usize + k < seq.len() {
-                            phrases.push((*positions.last().unwrap() as usize, seq.len()));
+                            phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
                         }
                         (seq, phrases)
                     })
@@ -187,7 +200,7 @@ fn main() {
 
         let mut si = 0;
         let mut process =
-            move |seen: &mut HashSet<u128>, sample: Vec<(Vec<u8>, Vec<(usize, usize)>)>| {
+            move |seen: &mut HashSet<u128>, sample: Vec<(Vec<u8>, Vec<(usize, usize, u128)>)>| {
                 let mut new_ranges = 0;
                 let mut new_bp = 0;
                 let mut new_phrases = 0;
@@ -221,10 +234,9 @@ fn main() {
                     };
 
                     // Emit the syncmers.
-                    for (p, q) in phrases {
+                    for (p, q, hash) in phrases {
                         total_filtered_phrases += 1;
                         let phrase = &seq[p..q];
-                        let hash = gxhash128(phrase, 0);
                         if seen.insert(hash) {
                             taken_phrases += 1;
                             new_phrases += 1;
