@@ -14,8 +14,6 @@ use ragc_core::reverse_complement;
 use seq_hash::{packed_seq::u32x8, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
-const THREADS: usize = 6;
-
 #[derive(clap::Parser)]
 struct Args {
     #[clap(default_value = "/home/philae/git/eth/data/hprcv2.agc")]
@@ -26,6 +24,8 @@ struct Args {
     k: usize,
     #[clap(short, default_value = "100")]
     w: usize,
+    #[clap(long)]
+    threads: usize,
 
     #[clap(long)]
     canonical: bool,
@@ -42,6 +42,7 @@ fn main() {
         w,
         canonical,
         mini_k,
+        threads,
     } = Args::parse();
 
     // Open an archive
@@ -80,8 +81,8 @@ fn main() {
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let (write, read) = std::sync::mpsc::sync_channel(THREADS);
-        for _t in 0..THREADS {
+        let (write, read) = std::sync::mpsc::sync_channel(threads);
+        for _t in 0..threads {
             let write = write.clone();
             let decompressor = &decompressor;
             let samples = &samples;
