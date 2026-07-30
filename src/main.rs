@@ -1,8 +1,11 @@
 #![allow(unused)]
+use clap::Parser;
+use ragc_core::{Decompressor, DecompressorConfig};
 use std::{
     collections::HashSet,
     io::{BufWriter, Write},
     ops::Range,
+    path::PathBuf,
     sync::{atomic::AtomicUsize, Mutex, RwLock},
 };
 
@@ -13,13 +16,37 @@ use simd_minimizers::packed_seq::AsciiSeq;
 
 const THREADS: usize = 6;
 
+#[derive(clap::Parser)]
+struct Args {
+    #[clap(default_value = "/home/philae/git/eth/data/hprcv2.agc")]
+    input: PathBuf,
+    #[clap(short, default_value = "deduped.fa")]
+    output: PathBuf,
+    #[clap(short, default_value = "64")]
+    k: usize,
+    #[clap(short, default_value = "100")]
+    w: usize,
+
+    #[clap(long)]
+    canonical: bool,
+
+    #[clap(long, default_value = "8")]
+    mini_k: usize,
+}
+
 fn main() {
-    let path = "/home/philae/git/eth/data/hprcv2.agc";
-    use ragc_core::{Decompressor, DecompressorConfig};
+    let Args {
+        input,
+        output,
+        k,
+        w,
+        canonical,
+        mini_k,
+    } = Args::parse();
 
     // Open an archive
     let config = DecompressorConfig::default();
-    let mut decompressor = Decompressor::open(path, config).unwrap();
+    let mut decompressor = Decompressor::open(&input.to_string_lossy(), config).unwrap();
 
     // List available samples
     let samples = decompressor.list_samples();
@@ -33,12 +60,9 @@ fn main() {
     // println!("Found {} samples", samples.len());
     // eprintln!("samples: {samples:?}");
 
-    let mut seen = RwLock::new(std::collections::HashSet::new());
-    let k = 40usize; // overlap
-    let mini_k = 8; // k for minimizers. smaller to make it more stable
-    let w = 100; // at most w apart
     eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
+    let mut seen = RwLock::new(std::collections::HashSet::new());
 
     let mut total_filtered_phrases = 0usize;
     let mut taken_phrases = 0usize;
@@ -52,14 +76,7 @@ fn main() {
     let mut input_bp = 0;
     let mut num_ranges = 0usize;
 
-    // // output text
-    // let mut output = vec![];
-    // // end position of each sequence in output.
-    // let mut ends = vec![0];
-    let mut output = BufWriter::with_capacity(
-        1 << 20,
-        std::fs::File::create(format!("deduped_k{k}_w{w}_mk{mini_k}.fa")).unwrap(),
-    );
+    let mut output = BufWriter::with_capacity(1 << 20, std::fs::File::create(output).unwrap());
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -155,9 +172,13 @@ fn main() {
                         let with_hash = |p, q| {
                             let phrase = &seq[p..q];
                             let hash = gxhash128(phrase, 0);
-                            let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
-                            let rc_hash = gxhash128(rc_phrase, 0);
-                            (p, q, hash + rc_hash)
+                            if canonical {
+                                let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
+                                let rc_hash = gxhash128(rc_phrase, 0);
+                                (p, q, hash + rc_hash)
+                            } else {
+                                (p,q,hash)
+                            }
                         };
 
                         // Prefix phrase.
