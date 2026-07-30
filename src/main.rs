@@ -12,7 +12,7 @@ use std::{
 
 use gxhash::gxhash128;
 use ragc_core::reverse_complement;
-use seq_hash::{packed_seq::u32x8, KmerHasher};
+use seq_hash::{packed_seq::u32x8, AntiLexHasher, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
 #[derive(clap::Parser)]
@@ -83,6 +83,16 @@ fn main() {
 
     let mut output = BufWriter::with_capacity(1 << 20, std::fs::File::create(output).unwrap());
 
+    let hasher = AntiLexHasher::<false>::new(mini_k);
+    // let scheme = simd_minimizers::closed_syncmers(k, w);
+    // let scheme = simd_minimizers::minimizers(k, w);
+    let scheme = if canonical {
+        Either::Left(simd_minimizers::canonical_minimizers(mini_k, w))
+    } else {
+        // Either::Right(simd_minimizers::minimizers(mini_k, w))
+        Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
+    };
+
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (write, read) = std::sync::mpsc::sync_channel(max_queue_size.unwrap_or(threads));
@@ -92,13 +102,7 @@ fn main() {
             let samples = &samples;
             let next = &next;
             let seen = &seen;
-            // let scheme = simd_minimizers::closed_syncmers(k, w);
-            // let scheme = simd_minimizers::minimizers(k, w);
-            let scheme = if canonical {
-                Either::Left(simd_minimizers::canonical_minimizers(mini_k, w))
-            } else {
-                Either::Right(simd_minimizers::minimizers(mini_k, w))
-            };
+            let scheme = &scheme;
             let mut rc_seq = vec![];
             // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
@@ -129,8 +133,8 @@ fn main() {
                     .map(|seq| {
                         let mut positions = vec![];
                         match scheme {
-                            Either::Left(ref scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
-                            Either::Right(ref scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                            Either::Left(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                            Either::Right(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
                         }
 
                         // For PFP

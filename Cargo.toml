@@ -12,3 +12,8 @@ gxhash = "3.5.0"
 ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
+
+
+[patch.crates-io]
+# seq-hash = { path = "../seq-hash" }
+seq-hash.git = "https://github.com/rust-seq/seq-hash"

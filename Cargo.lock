@@ -1024,8 +1024,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "seq-hash"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51964cd37dd62e0376ecfec7b08e221bb02c37faad1ffc46ad304d30f551721b"
+source = "git+https://github.com/rust-seq/seq-hash#4cd7eed354923f908e8d284a93a359a899199d2c"
 dependencies = [
  "packed-seq",
 ]
