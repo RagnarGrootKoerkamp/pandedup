@@ -187,6 +187,10 @@ fn main() {
                             phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
                         }
                         for &[p, q] in positions.array_windows::<2>() {
+                            // Skip non-forward minimizer pairs.
+                            if q < p {
+                                continue;
+                            }
                             let p = p as usize;
                             let q = (q as usize + k).min(seq.len());
                             let (p, q, hash) = with_hash(p, q);
@@ -238,9 +242,9 @@ fn main() {
                     let mut active = 0..0;
 
                     let mut push = |range: Range<usize>| {
-                        assert!(range.end >= active.end);
                         if range.start <= active.end {
-                            active.end = range.end;
+                            // End can decrease for non-forward canonical minimizers.
+                            active.end = active.end.max(range.end);
                         } else {
                             output.write_all(b">\n");
                             output.write_all(&seq[active.clone()]).unwrap();
