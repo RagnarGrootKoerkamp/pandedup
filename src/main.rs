@@ -47,7 +47,7 @@ fn main() {
     } = Args::parse();
 
     // Open an archive
-    let config = DecompressorConfig::default();
+    let config = DecompressorConfig { verbosity: 0 };
     let mut decompressor = Decompressor::open(&input.to_string_lossy(), config).unwrap();
 
     // List available samples
