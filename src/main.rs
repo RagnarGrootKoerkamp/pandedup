@@ -27,6 +27,8 @@ struct Args {
     w: usize,
     #[clap(long)]
     threads: usize,
+    #[clap(long)]
+    queue: Option<usize>,
 
     #[clap(long)]
     canonical: bool,
@@ -44,6 +46,7 @@ fn main() {
         canonical,
         mini_k,
         threads,
+        queue: max_queue_size,
     } = Args::parse();
 
     // Open an archive
@@ -82,7 +85,7 @@ fn main() {
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let (write, read) = std::sync::mpsc::sync_channel(threads);
+        let (write, read) = std::sync::mpsc::sync_channel(max_queue_size.unwrap_or(threads));
         for _t in 0..threads {
             let write = write.clone();
             let decompressor = &decompressor;
