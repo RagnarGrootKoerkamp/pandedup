@@ -1,5 +1,6 @@
 #![allow(unused)]
 use std::{
+    collections::HashSet,
     io::{BufWriter, Write},
     ops::Range,
     sync::{atomic::AtomicUsize, Mutex, RwLock},
@@ -184,96 +185,110 @@ fn main() {
 
         // Read from the queue in the current thread.
 
-        for (si, sample) in read.into_iter().enumerate() {
-            let mut new_ranges = 0;
-            let mut new_bp = 0;
-            let mut new_phrases = 0;
+        let mut si = 0;
+        let mut process =
+            move |seen: &mut HashSet<u128>, sample: Vec<(Vec<u8>, Vec<(usize, usize)>)>| {
+                let mut new_ranges = 0;
+                let mut new_bp = 0;
+                let mut new_phrases = 0;
+                let start = std::time::Instant::now();
+                for (seq, phrases) in sample {
+                    input_bp += seq.len();
+                    if phrases.is_empty() {
+                        short += 1;
+                        short_bp += seq.len();
+                        continue;
+                    }
+
+                    let mut active = 0..0;
+
+                    let mut push = |range: Range<usize>| {
+                        assert!(range.end >= active.end);
+                        if range.start <= active.end {
+                            active.end = range.end;
+                        } else {
+                            output.write_all(b">\n");
+                            output.write_all(&seq[active.clone()]).unwrap();
+                            output.write_all(b"\n");
+
+                            new_ranges += 1;
+                            num_ranges += 1;
+                            new_bp += active.len();
+                            output_bp += active.len();
+                            skipped_bp += range.start - active.end;
+                            active = range;
+                        }
+                    };
+
+                    // Emit the syncmers.
+                    for (p, q) in phrases {
+                        total_filtered_phrases += 1;
+                        let phrase = &seq[p..q];
+                        let hash = gxhash128(phrase, 0);
+                        if seen.insert(hash) {
+                            taken_phrases += 1;
+                            new_phrases += 1;
+                            push(p..q);
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+
+                    output.write_all(b">\n");
+                    output.write_all(&seq[active.clone()]).unwrap();
+                    output.write_all(b"\n");
+
+                    num_ranges += 1;
+                    new_ranges += 1;
+                    output_bp += active.len();
+                    new_bp += active.len();
+                }
+
+                eprintln!("process sample {si}: {:?}", start.elapsed());
+                eprintln!(
+                    "  new bp:           {:>8.3} Mbp ({:3.1} bp/range)",
+                    new_bp as f32 / 1e6,
+                    new_bp as f32 / new_ranges as f32
+                );
+                eprintln!(
+                    "  new phrases:        {:>8.3} M   ({:3.1} /range)",
+                    new_phrases as f32 / 1e6,
+                    new_phrases as f32 / new_ranges as f32
+                );
+                eprintln!(
+                    "  total phrases:   {:>8.3} M   ({:3.1}%)",
+                    taken_phrases as f32 / 1e6,
+                    100.0 * taken_phrases as f32 / total_filtered_phrases as f32
+                );
+
+                // eprintln!("syncmers skipped: {skipped:>9}");
+                // eprintln!("short:   {short}");
+                // eprintln!("num_syncmers: {num_syncmers}");
+                // eprintln!("prefix_bp:  {prefix_bp}");
+                // eprintln!("suffix_bp:  {suffix_bp}");
+                eprintln!("  num_ranges:        {:>8.3} M", num_ranges as f32 / 1e6);
+                // eprintln!("input_bp:   {:>8.3} Gbp", input_bp as f32 / 1e9);
+                eprintln!(
+                    "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
+                    output_bp as f32 / 1e9,
+                    100.0 * output_bp as f32 / input_bp as f32
+                );
+                // eprintln!("skipped_bp: {:>8.3} Gbp", skipped_bp as f32 / 1e9);
+                // eprintln!("short_bp:   {short_bp}");
+                eprintln!();
+                si += 1;
+            };
+
+        loop {
+            let Ok(sample) = read.recv() else {
+                break;
+            };
             let mut seen = seen.write().unwrap();
-            let start = std::time::Instant::now();
-            for (seq, phrases) in sample {
-                input_bp += seq.len();
-                if phrases.is_empty() {
-                    short += 1;
-                    short_bp += seq.len();
-                    continue;
-                }
-
-                let mut active = 0..0;
-
-                let mut push = |range: Range<usize>| {
-                    assert!(range.end >= active.end);
-                    if range.start <= active.end {
-                        active.end = range.end;
-                    } else {
-                        output.write_all(b">\n");
-                        output.write_all(&seq[active.clone()]).unwrap();
-                        output.write_all(b"\n");
-
-                        new_ranges += 1;
-                        num_ranges += 1;
-                        new_bp += active.len();
-                        output_bp += active.len();
-                        skipped_bp += range.start - active.end;
-                        active = range;
-                    }
-                };
-
-                // Emit the syncmers.
-                for (p, q) in phrases {
-                    total_filtered_phrases += 1;
-                    let phrase = &seq[p..q];
-                    let hash = gxhash128(phrase, 0);
-                    if seen.insert(hash) {
-                        taken_phrases += 1;
-                        new_phrases += 1;
-                        push(p..q);
-                    } else {
-                        skipped += 1;
-                    }
-                }
-
-                output.write_all(b">\n");
-                output.write_all(&seq[active.clone()]).unwrap();
-                output.write_all(b"\n");
-
-                num_ranges += 1;
-                new_ranges += 1;
-                output_bp += active.len();
-                new_bp += active.len();
+            process(&mut seen, sample);
+            // Process other already-available elements as well.
+            while let Ok(sample) = read.recv_timeout(std::time::Duration::from_millis(0)) {
+                process(&mut seen, sample);
             }
-
-            eprintln!("process sample {si}: {:?}", start.elapsed());
-            eprintln!(
-                "  new bp:           {:>8.3} Mbp ({:3.1} bp/range)",
-                new_bp as f32 / 1e6,
-                new_bp as f32 / new_ranges as f32
-            );
-            eprintln!(
-                "  new phrases:        {:>8.3} M   ({:3.1} /range)",
-                new_phrases as f32 / 1e6,
-                new_phrases as f32 / new_ranges as f32
-            );
-            eprintln!(
-                "  total phrases:   {:>8.3} M   ({:3.1}%)",
-                taken_phrases as f32 / 1e6,
-                100.0 * taken_phrases as f32 / total_filtered_phrases as f32
-            );
-
-            // eprintln!("syncmers skipped: {skipped:>9}");
-            // eprintln!("short:   {short}");
-            // eprintln!("num_syncmers: {num_syncmers}");
-            // eprintln!("prefix_bp:  {prefix_bp}");
-            // eprintln!("suffix_bp:  {suffix_bp}");
-            eprintln!("  num_ranges:        {:>8.3} M", num_ranges as f32 / 1e6);
-            // eprintln!("input_bp:   {:>8.3} Gbp", input_bp as f32 / 1e9);
-            eprintln!(
-                "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
-                output_bp as f32 / 1e9,
-                100.0 * output_bp as f32 / input_bp as f32
-            );
-            // eprintln!("skipped_bp: {:>8.3} Gbp", skipped_bp as f32 / 1e9);
-            // eprintln!("short_bp:   {short_bp}");
-            eprintln!();
         }
     });
 }
