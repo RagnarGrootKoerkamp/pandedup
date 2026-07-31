@@ -256,7 +256,13 @@ fn process_sample(
                 let seq = &seq[p..];
                 // hash was seen before at given `pos` in `reference_vec`.
                 // Linear scan to find the equal range, and skip it.
-                assert_eq!(&seq[..q - p], &ref_seq[..q - p]);
+                assert_eq!(
+                    &seq[..q - p],
+                    &ref_seq[..q - p],
+                    "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
+                    gxhash128(&seq[..q - p], 0),
+                    gxhash128(&ref_seq[..q - p], 0)
+                );
                 let mut i = q - p;
                 while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
                     i += 1;
@@ -409,7 +415,7 @@ fn process_sample(
         local_stats.output_bp as f32 / local_stats.output_contigs as f32
     );
     eprintln!(
-        "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%; {:4.1}% filtered)",
+        "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%; {:4.1}% filtered away)",
         local_stats.unique_phrases as f32 / 1e6,
         local_stats.unique_phrases as f32 / local_stats.output_contigs as f32,
         local_stats.unique_phrases as f32 / local_stats.total_phrases as f32 * 100.0,
