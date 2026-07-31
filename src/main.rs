@@ -93,6 +93,8 @@ fn main() {
         Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
     };
 
+    let mut remaining_readers = Mutex::new(1);
+    let condvar = std::sync::Condvar::new();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (write, read) = std::sync::mpsc::sync_channel(max_queue_size.unwrap_or(threads));
@@ -103,6 +105,8 @@ fn main() {
             let next = &next;
             let seen = &seen;
             let scheme = &scheme;
+            let condvar = &condvar;
+            let remaining_readers = &remaining_readers;
             let mut rc_seq = vec![];
             // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
@@ -171,7 +175,9 @@ fn main() {
                     .collect();
                 let end = std::time::Instant::now();
 
-                // Pre-filter already seen phrases.
+                // Wait for a reader to be available.
+                *condvar.wait_while(remaining_readers.lock().unwrap(), |x| *x == 0).unwrap()-=1;
+
                 let seen = seen.read().unwrap();
                 let locking = std::time::Instant::now();
                 let seqs_and_phrases = seqs_and_poss
@@ -245,6 +251,7 @@ fn main() {
                 let mut new_ranges = 0;
                 let mut new_bp = 0;
                 let mut new_phrases = 0;
+                let mut filtered_phrases = 0;
                 let start = std::time::Instant::now();
                 for (seq, phrases) in sample {
                     input_bp += seq.len();
@@ -276,6 +283,7 @@ fn main() {
 
                     // Emit the syncmers.
                     for (p, q, hash) in phrases {
+                        filtered_phrases += 1;
                         total_filtered_phrases += 1;
                         let phrase = &seq[p..q];
                         if seen.insert(hash) {
@@ -299,17 +307,18 @@ fn main() {
 
                 eprintln!("process sample {si}: {:?}", start.elapsed());
                 eprintln!(
-                    "  new bp:           {:>8.3} Mbp ({:3.1} bp/range)",
+                    "  new bp:            {:>8.3} Mbp ({:3.1} bp/range)",
                     new_bp as f32 / 1e6,
                     new_bp as f32 / new_ranges as f32
                 );
                 eprintln!(
-                    "  new phrases:        {:>8.3} M   ({:3.1} /range)",
+                    "  new phrases:       {:>8.3} M   ({:3.1} /range; {:3.1} %)",
                     new_phrases as f32 / 1e6,
-                    new_phrases as f32 / new_ranges as f32
+                    new_phrases as f32 / new_ranges as f32,
+                    new_phrases as f32 / filtered_phrases as f32 * 100.0
                 );
                 eprintln!(
-                    "  total phrases:   {:>8.3} M   ({:3.1}%)",
+                    "  total phrases:     {:>8.3} M   ({:3.1}%)",
                     taken_phrases as f32 / 1e6,
                     100.0 * taken_phrases as f32 / total_filtered_phrases as f32
                 );
@@ -332,6 +341,7 @@ fn main() {
                 si += 1;
             };
 
+        let mut new_readers = [10].into_iter().chain(std::iter::repeat(100));
         loop {
             let Ok(sample) = read.recv() else {
                 break;
@@ -342,6 +352,9 @@ fn main() {
             while let Ok(sample) = read.recv_timeout(std::time::Duration::from_millis(0)) {
                 process(&mut seen, sample);
             }
+            // add extra readers.
+            *remaining_readers.lock().unwrap() += new_readers.next().unwrap();
+            condvar.notify_all();
         }
     });
 }
