@@ -15,6 +15,7 @@ ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
 rand = "0.10.2"
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 zstd = "0.13.3"
 
 

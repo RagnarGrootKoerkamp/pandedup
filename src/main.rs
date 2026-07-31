@@ -9,7 +9,12 @@ use std::{
     time::Duration,
 };
 
-use gxhash::gxhash128;
+fn hasher(seq: &[u8]) -> u128 {
+    // const SEED: i64 = 1983274983247984327;
+    // gxhash::gxhash128(seq, SEED)
+    xxhash_rust::xxh3::xxh3_128(seq)
+}
+
 use seq_hash::AntiLexHasher;
 use simd_minimizers::packed_seq::AsciiSeq;
 
@@ -49,8 +54,6 @@ struct Stats {
     unique_phrases: usize,
     output_contigs: usize,
 }
-
-const SEED: i64 = 1983274983247984327;
 
 fn main() {
     let args = Args::parse();
@@ -187,7 +190,7 @@ fn process_sample(
 
         let mut positions = vec![];
 
-        let hasher = AntiLexHasher::<false>::new(mini_k);
+        let nthasher = AntiLexHasher::<false>::new(mini_k);
         if canonical {
             simd_minimizers::canonical_minimizers(mini_k, w).run(AsciiSeq(&seq), &mut positions);
         } else {
@@ -195,7 +198,7 @@ fn process_sample(
             // let scheme = simd_minimizers::minimizers(k, w);
             // Either::Right(simd_minimizers::minimizers(mini_k, w))
             simd_minimizers::minimizers(mini_k, w)
-                .hasher(&hasher)
+                .hasher(&nthasher)
                 .run(AsciiSeq(&seq), &mut positions);
         };
 
@@ -214,10 +217,10 @@ fn process_sample(
 
         let with_hash = |p, q| {
             let phrase = &seq[p..q];
-            let hash = gxhash128(phrase, SEED);
+            let hash = hasher(phrase);
             if canonical {
                 let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
-                let rc_hash = gxhash128(rc_phrase, SEED);
+                let rc_hash = hasher(rc_phrase);
                 (p, q, hash + rc_hash)
             } else {
                 (p, q, hash)
@@ -262,8 +265,8 @@ fn process_sample(
                     &seq[..q - p],
                     &ref_seq[..q - p],
                     "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
-                    gxhash128(&seq[..q - p], SEED),
-                    gxhash128(&ref_seq[..q - p], SEED)
+                    hasher(&seq[..q - p]),
+                    hasher(&ref_seq[..q - p])
                 );
                 let mut i = q - p;
                 while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
