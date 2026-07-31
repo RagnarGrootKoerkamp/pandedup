@@ -124,6 +124,7 @@ fn main() {
                 let mut t_sort = Duration::ZERO;
                 let mut t_lookups = Duration::ZERO;
                 let mut t_sort2 = Duration::ZERO;
+                let mut t_lock = Duration::ZERO;
                 let mut t_output = Duration::ZERO;
 
                 let (sample, contigs) = &samples[idx];
@@ -242,6 +243,8 @@ fn main() {
 
                     // Write new contigs.
                     let mut writer = writer.lock().unwrap();
+                    let i_lock = std::time::Instant::now();
+                    t_lock += i_lock - i_sort2;
 
                     // Output contigs
 
@@ -271,13 +274,13 @@ fn main() {
                     assert!(active.len() == 0);
 
                     let i_output = std::time::Instant::now();
-                    t_output += i_output - i_sort2;
+                    t_output += i_output - i_lock;
                 }
 
                 eprintln!(
                     "push sample {idx:>3} ({:3.1} Gbp {:3} ctg): \
                      read: {:5.2?}s minis: {:5.2?}s phrases: \
-                     {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s output: {:5.2?}s",
+                     {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s lock: {:5.2?}s output: {:5.2?}s",
                     (local_stats.input_bp as f32) / 1e9,
                     contigs.len(),
                     t_read.as_secs_f32(),
@@ -286,6 +289,7 @@ fn main() {
                     t_sort.as_secs_f32(),
                     t_lookups.as_secs_f32(),
                     t_sort2.as_secs_f32(),
+                    t_lock.as_secs_f32(),
                     t_output.as_secs_f32()
                 );
 
