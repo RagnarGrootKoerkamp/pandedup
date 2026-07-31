@@ -94,7 +94,8 @@ fn main() {
         Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
     };
 
-    let mut seen: [_; 256] = std::array::from_fn(|_i| Mutex::new(std::collections::HashSet::new()));
+    let mut seen: [_; 256] =
+        std::array::from_fn(|_i| RwLock::new(std::collections::HashSet::new()));
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -236,14 +237,30 @@ fn main() {
                     }
                 let end3 = std::time::Instant::now();
                 let mut perm = (0..=255).collect::<Vec<_>>();
-                perm.shuffle(&mut rand::rng());
+                // perm.shuffle(&mut rand::rng());
                 for part in perm {
-                    let mut seen = seen[part as usize].lock().unwrap();
-                    for &idx in &order[part as usize] {
-                        let (i, p, q, hash) = &mut phrases[idx as usize];
-                        assert!(*hash as u8 == part);
-                        if !seen.insert(*hash) {
-                            *i = usize::MAX;
+                    // Read 
+                    {
+                        let seen = seen[part as usize].read().unwrap();
+                        for &idx in &order[part as usize] {
+                            let (i, p, q, hash) = &mut phrases[idx as usize];
+                            assert!(*hash as u8 == part);
+                            if seen.contains(hash) {
+                                *i = usize::MAX;
+                            }
+                        }
+                    }
+
+                    // Try to write missing
+                    {
+                        let mut seen = seen[part as usize].write().unwrap();
+                        for &idx in &order[part as usize] {
+                            let (i, p, q, hash) = &mut phrases[idx as usize];
+                            if *i != usize::MAX {
+                                if !seen.insert(*hash) {
+                                    *i = usize::MAX;
+                                }
+                            }
                         }
                     }
                 }
@@ -266,6 +283,7 @@ fn main() {
                 ).unwrap();
             });
         }
+        drop(write);
 
         // Read from the queue in the current thread.
 
@@ -360,7 +378,6 @@ fn main() {
                 eprintln!();
                 si += 1;
             };
-        drop(write);
 
         for sample in read.iter() {
             process(sample);
