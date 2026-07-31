@@ -1,19 +1,15 @@
-#![allow(unused)]
 use clap::Parser;
 use either::Either;
 use ragc_core::{Decompressor, DecompressorConfig};
-use rand::seq::SliceRandom;
 use std::{
-    collections::HashSet,
     io::{BufWriter, Write},
     ops::Range,
     path::PathBuf,
-    sync::{atomic::AtomicUsize, Mutex, RwLock},
+    sync::{atomic::AtomicUsize, RwLock},
 };
 
 use gxhash::gxhash128;
-use ragc_core::reverse_complement;
-use seq_hash::{packed_seq::u32x8, AntiLexHasher, KmerHasher};
+use seq_hash::AntiLexHasher;
 use simd_minimizers::packed_seq::AsciiSeq;
 
 /// Build a non-minimal SPSS (spectrum-preserving string set, or k-mer spectrum) from an .agc file.
@@ -71,21 +67,21 @@ fn main() {
     // eprintln!("samples: {samples:?}");
 
     eprintln!("k: {k}   w: {w}");
-    let l = k + w - 1; // syncmer length
 
     let mut total_filtered_phrases = 0usize;
     let mut taken_phrases = 0usize;
-    let mut skipped = 0usize;
-    let mut short = 0usize;
-    let mut short_bp = 0;
-    let mut prefix_bp = 0;
-    let mut suffix_bp = 0;
     let mut output_bp = 0;
     let mut skipped_bp = 0;
     let mut input_bp = 0;
     let mut num_ranges = 0usize;
 
     // TODO: zstd output
+    if let Some(output) = &output {
+        assert!(
+            output.extension().unwrap() == "zst",
+            "Output file must have .zst extension"
+        );
+    }
     let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
     let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
     let mut writer = zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish();
@@ -100,8 +96,7 @@ fn main() {
         Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
     };
 
-    let mut seen: [_; 256] =
-        std::array::from_fn(|_i| RwLock::new(std::collections::HashSet::new()));
+    let seen: [_; 256] = std::array::from_fn(|_i| RwLock::new(std::collections::HashSet::new()));
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -243,14 +238,12 @@ fn main() {
                         order[part as usize].push(i as u32);
                     }
                 let end3 = std::time::Instant::now();
-                let mut perm = (0..=255).collect::<Vec<_>>();
-                // perm.shuffle(&mut rand::rng());
-                for part in perm {
+                for part in 0..=255 {
                     // Read 
                     {
                         let seen = seen[part as usize].read().unwrap();
                         for &idx in &order[part as usize] {
-                            let (i, p, q, hash) = &mut phrases[idx as usize];
+                            let (i, _p, _q, hash) = &mut phrases[idx as usize];
                             assert!(*hash as u8 == part);
                             if seen.contains(hash) {
                                 *i = usize::MAX;
@@ -262,7 +255,7 @@ fn main() {
                     {
                         let mut seen = seen[part as usize].write().unwrap();
                         for &idx in &order[part as usize] {
-                            let (i, p, q, hash) = &mut phrases[idx as usize];
+                            let (i, _p, _q, hash) = &mut phrases[idx as usize];
                             if *i != usize::MAX {
                                 if !seen.insert(*hash) {
                                     *i = usize::MAX;
@@ -313,9 +306,9 @@ fn main() {
                             // End can decrease for non-forward canonical minimizers.
                             active.end = active.end.max(range.end);
                         } else {
-                            writer.write_all(b">\n");
+                            writer.write_all(b">\n").unwrap();
                             writer.write_all(&seq[active.clone()]).unwrap();
-                            writer.write_all(b"\n");
+                            writer.write_all(b"\n").unwrap();
 
                             new_ranges += 1;
                             num_ranges += 1;
@@ -327,22 +320,17 @@ fn main() {
                     };
 
                     // Emit the syncmers.
-                    for &(_i, p, q, hash) in phrases {
+                    for &(_i, p, q, _hash) in phrases {
                         filtered_phrases += 1;
                         total_filtered_phrases += 1;
-                        let phrase = &seq[p..q];
-                        // if seen.insert(hash) {
                         taken_phrases += 1;
                         new_phrases += 1;
                         push(p..q);
-                        // } else {
-                        // skipped += 1;
-                        // }
                     }
 
-                    writer.write_all(b">\n");
+                    writer.write_all(b">\n").unwrap();
                     writer.write_all(&seq[active.clone()]).unwrap();
-                    writer.write_all(b"\n");
+                    writer.write_all(b"\n").unwrap();
 
                     num_ranges += 1;
                     new_ranges += 1;
@@ -368,20 +356,12 @@ fn main() {
                     100.0 * taken_phrases as f32 / total_filtered_phrases as f32
                 );
 
-                // eprintln!("syncmers skipped: {skipped:>9}");
-                // eprintln!("short:   {short}");
-                // eprintln!("num_syncmers: {num_syncmers}");
-                // eprintln!("prefix_bp:  {prefix_bp}");
-                // eprintln!("suffix_bp:  {suffix_bp}");
                 eprintln!("  num_ranges:        {:>8.3} M", num_ranges as f32 / 1e6);
-                // eprintln!("input_bp:   {:>8.3} Gbp", input_bp as f32 / 1e9);
                 eprintln!(
                     "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
                     output_bp as f32 / 1e9,
                     100.0 * output_bp as f32 / input_bp as f32
                 );
-                // eprintln!("skipped_bp: {:>8.3} Gbp", skipped_bp as f32 / 1e9);
-                // eprintln!("short_bp:   {short_bp}");
                 eprintln!();
                 si += 1;
             };
