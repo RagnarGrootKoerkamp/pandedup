@@ -1,4 +1,5 @@
 use clap::Parser;
+use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 use std::{
     io::{BufWriter, Write},
@@ -88,7 +89,7 @@ fn main() {
     let writer = &Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
     let global_stats = &Mutex::new(Stats::default());
 
-    let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(std::collections::HashSet::new()));
+    let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
 
     // Process the first/reference sample separately.
     process_sample(&args, decompressor, samples, seen, global_stats, writer, 0);
@@ -121,7 +122,7 @@ fn process_sample(
     args: &Args,
     decompressor: &Decompressor,
     samples: &Vec<(String, Vec<String>)>,
-    seen: &[RwLock<std::collections::HashSet<u128>>; 256],
+    seen: &[RwLock<FxHashSet<u128>>; 256],
     global_stats: &Mutex<Stats>,
     writer: &Mutex<
         zstd::stream::AutoFinishEncoder<

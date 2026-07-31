@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
+fxhash = "0.2.1"
 gxhash = "3.5.0"
 num_cpus = "1.17.0"
 # ragc-core = "0.1.1"
