@@ -772,6 +772,7 @@ dependencies = [
  "rand",
  "seq-hash",
  "simd-minimizers",
+ "zstd",
 ]
 
 [[package]]

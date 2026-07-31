@@ -14,6 +14,7 @@ ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
 rand = "0.10.2"
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
+zstd = "0.13.3"
 
 
 [patch.crates-io]

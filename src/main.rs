@@ -86,8 +86,9 @@ fn main() {
     let mut num_ranges = 0usize;
 
     // TODO: zstd output
-    let output = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
-    let mut output = BufWriter::with_capacity(1 << 20, std::fs::File::create(output).unwrap());
+    let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
+    let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
+    let mut writer = zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish();
 
     let hasher = AntiLexHasher::<false>::new(mini_k);
     // let scheme = simd_minimizers::closed_syncmers(k, w);
@@ -312,9 +313,9 @@ fn main() {
                             // End can decrease for non-forward canonical minimizers.
                             active.end = active.end.max(range.end);
                         } else {
-                            output.write_all(b">\n");
-                            output.write_all(&seq[active.clone()]).unwrap();
-                            output.write_all(b"\n");
+                            writer.write_all(b">\n");
+                            writer.write_all(&seq[active.clone()]).unwrap();
+                            writer.write_all(b"\n");
 
                             new_ranges += 1;
                             num_ranges += 1;
@@ -339,9 +340,9 @@ fn main() {
                         // }
                     }
 
-                    output.write_all(b">\n");
-                    output.write_all(&seq[active.clone()]).unwrap();
-                    output.write_all(b"\n");
+                    writer.write_all(b">\n");
+                    writer.write_all(&seq[active.clone()]).unwrap();
+                    writer.write_all(b"\n");
 
                     num_ranges += 1;
                     new_ranges += 1;
