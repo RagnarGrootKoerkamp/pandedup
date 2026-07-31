@@ -767,6 +767,7 @@ dependencies = [
  "clap",
  "either",
  "gxhash",
+ "num_cpus",
  "ragc-core",
  "rand",
  "seq-hash",

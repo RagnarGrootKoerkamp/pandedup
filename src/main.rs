@@ -16,24 +16,29 @@ use ragc_core::reverse_complement;
 use seq_hash::{packed_seq::u32x8, AntiLexHasher, KmerHasher};
 use simd_minimizers::packed_seq::AsciiSeq;
 
+/// Build a non-minimal SPSS (spectrum-preserving string set, or k-mer spectrum) from an .agc file.
 #[derive(clap::Parser)]
 struct Args {
-    #[clap(default_value = "/home/philae/git/eth/data/hprcv2.agc")]
+    /// Input .agc file.
     input: PathBuf,
-    #[clap(short, default_value = "deduped.fa")]
-    output: PathBuf,
+    /// Output path. Defaults to `input.dedup.fa.zst`.
+    #[clap(short)]
+    output: Option<PathBuf>,
+    /// Build a k-mer spectrum.
     #[clap(short, default_value = "64")]
     k: usize,
+    /// Window-size for minimizer-phrases. Small w shrink the output but need more memory.
     #[clap(short, default_value = "100")]
     w: usize,
-    #[clap(long)]
-    threads: usize,
-    #[clap(long)]
-    queue: Option<usize>,
+    /// Number of threads to use. Defaults to the number of logical cores.
+    #[clap(short = 'j', long)]
+    threads: Option<usize>,
 
+    /// Dedup across reverse-complements.
     #[clap(long)]
     canonical: bool,
 
+    /// Minimizer length for phrases.
     #[clap(long, default_value = "8")]
     mini_k: usize,
 }
@@ -47,7 +52,6 @@ fn main() {
         canonical,
         mini_k,
         threads,
-        queue: max_queue_size,
     } = Args::parse();
 
     // Open an archive
@@ -82,6 +86,7 @@ fn main() {
     let mut num_ranges = 0usize;
 
     // TODO: zstd output
+    let output = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
     let mut output = BufWriter::with_capacity(1 << 20, std::fs::File::create(output).unwrap());
 
     let hasher = AntiLexHasher::<false>::new(mini_k);
@@ -99,7 +104,8 @@ fn main() {
 
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let (write, read) = std::sync::mpsc::sync_channel(max_queue_size.unwrap_or(threads));
+        let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
+        let (write, read) = std::sync::mpsc::sync_channel(threads);
         for _t in 0..threads {
             let write = write.clone();
             let decompressor = &decompressor;
