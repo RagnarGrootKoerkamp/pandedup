@@ -5,7 +5,7 @@ use std::{
     io::{BufWriter, Write},
     ops::Range,
     path::PathBuf,
-    sync::{atomic::AtomicUsize, RwLock},
+    sync::{atomic::AtomicUsize, Mutex, RwLock},
 };
 
 use gxhash::gxhash128;
@@ -39,6 +39,15 @@ struct Args {
     mini_k: usize,
 }
 
+#[derive(Default, Clone, Copy, derive_more::AddAssign)]
+struct Stats {
+    input_bp: usize,
+    total_phrases: usize,
+    output_bp: usize,
+    unique_phrases: usize,
+    output_contigs: usize,
+}
+
 fn main() {
     let Args {
         input,
@@ -68,13 +77,6 @@ fn main() {
 
     eprintln!("k: {k}   w: {w}");
 
-    let mut total_filtered_phrases = 0usize;
-    let mut taken_phrases = 0usize;
-    let mut output_bp = 0;
-    let mut skipped_bp = 0;
-    let mut input_bp = 0;
-    let mut num_ranges = 0usize;
-
     // TODO: zstd output
     if let Some(output) = &output {
         assert!(
@@ -82,16 +84,20 @@ fn main() {
             "Output file must have .zst extension"
         );
     }
-    let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
-    let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
-    let mut writer = zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish();
+    let stats_and_writer = {
+        let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
+        let buf_writer =
+            BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
+        let writer = zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish();
+        Mutex::new((Stats::default(), writer))
+    };
 
     let hasher = AntiLexHasher::<false>::new(mini_k);
-    // let scheme = simd_minimizers::closed_syncmers(k, w);
-    // let scheme = simd_minimizers::minimizers(k, w);
     let scheme = if canonical {
         Either::Left(simd_minimizers::canonical_minimizers(mini_k, w))
     } else {
+        // let scheme = simd_minimizers::closed_syncmers(k, w);
+        // let scheme = simd_minimizers::minimizers(k, w);
         // Either::Right(simd_minimizers::minimizers(mini_k, w))
         Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
     };
@@ -101,19 +107,19 @@ fn main() {
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
-        let (write, read) = std::sync::mpsc::sync_channel(threads);
         for _t in 0..threads {
-            let write = write.clone();
             let decompressor = &decompressor;
             let samples = &samples;
             let next = &next;
             let seen = &seen;
             let scheme = &scheme;
-            scope.spawn(move || loop {
+            let stats_and_writer = &stats_and_writer;
+            scope.spawn(|| loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= samples.len() {
                     break;
                 }
+                let mut local_stats = Stats::default();
 
                 let (sample, contigs) = &samples[idx];
 
@@ -130,7 +136,7 @@ fn main() {
                         contig
                     })
                     .collect();
-                let len: usize = seqs.iter().map(|seq| seq.len()).sum();
+                local_stats.input_bp = seqs.iter().map(|seq| seq.len()).sum();
                 let mid = std::time::Instant::now();
                 let (seqs, poss): (Vec<_>, Vec<_>) = seqs
                     .into_iter()
@@ -140,35 +146,6 @@ fn main() {
                             Either::Left(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
                             Either::Right(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
                         }
-
-                        // For PFP
-                        // {
-                        //     let threshold = (u32::MAX as u64 * 2 / (w as u64 + 1)) as u32;
-                        //     let simd_threshold = u32x8::splat(threshold);
-                        //     let hashes = scheme
-                        //         .hash_kmers_simd(AsciiSeq(&seq), 1)
-                        //         .map(|h| h.simd_lt(simd_threshold))
-                        //         .collect();
-                        //     for i in 0..hashes.len() {
-                        //         if hashes[i] > 0 {
-                        //             positions.push(i as u32);
-                        //         }
-                        //     }
-                        // }
-
-                        // sanity check
-                        // for &[p, q] in positions.array_windows() {
-                        //     assert!(p < q, "{p} < {q}");
-                        //     assert!(q <= p + w as u32, "{q} <= {p} + {w}");
-                        //     assert!(
-                        //         p as usize + mini_k <= seq.len(),
-                        //         "{p} + {w} <= {}",
-                        //         seq.len()
-                        //     );
-                        //     // assert!(p as usize + w <= seq.len(), "{p} + {w} <= {}", seq.len());
-                        //     // assert!(p as usize + l <= seq.len(), "{p} + {l} <= {}", seq.len());
-                        // }
-                        // assert!(*positions.last().unwrap() as usize + l >= seq.len());
 
                         (seq, positions)
                     })
@@ -220,15 +197,14 @@ fn main() {
                             let p = p as usize;
                             let q = (q as usize + k).min(seq.len());
                             let (i,p, q, hash) = with_hash(p, q);
-                            // if !seen.contains(&hash) {
-                                phrases.push((i,p, q, hash));
-                            // }
+                            phrases.push((i,p, q, hash));
                         }
                         // Suffix phrase.
-                        if *positions.last().unwrap() as usize + k < seq.len() {
+                        if (*positions.last().unwrap() as usize) + k < seq.len() {
                             phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
                         }
                     }
+                local_stats.total_phrases = phrases.len();
 
                 let end2 = std::time::Instant::now();
 
@@ -239,7 +215,7 @@ fn main() {
                     }
                 let end3 = std::time::Instant::now();
                 for part in 0..=255 {
-                    // Read 
+                    // Read-only filter phase
                     {
                         let seen = seen[part as usize].read().unwrap();
                         for &idx in &order[part as usize] {
@@ -266,11 +242,12 @@ fn main() {
                 }
                 let end4 = std::time::Instant::now();
                 phrases.retain(|(i,_p,_q,_hash)| *i != usize::MAX);
+                local_stats.unique_phrases = phrases.len();
                 let end5 = std::time::Instant::now();
 
                 eprintln!(
                     "push sample {idx:>3} ({:3.1} Gbp): read: {:5.2?}s minis: {:5.2?}s phrases: {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s",
-                    len as f32 / 1e9,
+                    local_stats.input_bp as f32 / 1e9,
                     (mid - start).as_secs_f32(),
                     (end-mid).as_secs_f32(),
                     (end2-end).as_secs_f32(),
@@ -278,26 +255,14 @@ fn main() {
                     (end4-end3).as_secs_f32(),
                     (end5-end4).as_secs_f32(),
                 );
-                write.send(
-                    (seqs, phrases)
-                ).unwrap();
-            });
-        }
-        drop(write);
 
-        // Read from the queue in the current thread.
+                let mut stats_and_writer = stats_and_writer.lock().unwrap();
+                let (global_stats, writer) = &mut *stats_and_writer;
 
-        let mut si = 0;
-        let mut process =
-            move |(seqs, phrases): (Vec<Vec<u8>>, Vec<(usize, usize, usize, u128)>)| {
-                let mut new_ranges = 0;
-                let mut new_bp = 0;
-                let mut new_phrases = 0;
-                let mut filtered_phrases = 0;
+                // Process
                 let start = std::time::Instant::now();
                 for phrases in phrases.chunk_by(|l, r| l.0 == r.0) {
                     let seq = &seqs[phrases[0].0];
-                    input_bp += seq.len();
 
                     let mut active = 0..0;
 
@@ -310,64 +275,50 @@ fn main() {
                             writer.write_all(&seq[active.clone()]).unwrap();
                             writer.write_all(b"\n").unwrap();
 
-                            new_ranges += 1;
-                            num_ranges += 1;
-                            new_bp += active.len();
-                            output_bp += active.len();
-                            skipped_bp += range.start - active.end;
+                            local_stats.output_contigs += 1;
+                            local_stats.output_bp += active.len();
+
                             active = range;
                         }
                     };
 
                     // Emit the syncmers.
                     for &(_i, p, q, _hash) in phrases {
-                        filtered_phrases += 1;
-                        total_filtered_phrases += 1;
-                        taken_phrases += 1;
-                        new_phrases += 1;
                         push(p..q);
                     }
 
-                    writer.write_all(b">\n").unwrap();
-                    writer.write_all(&seq[active.clone()]).unwrap();
-                    writer.write_all(b"\n").unwrap();
-
-                    num_ranges += 1;
-                    new_ranges += 1;
-                    output_bp += active.len();
-                    new_bp += active.len();
+                    push(usize::MAX..usize::MAX);
                 }
 
-                eprintln!("process sample {si}: {:?}", start.elapsed());
+                *global_stats += local_stats;
+                
+
+                eprintln!("process sample {idx}: {:?}", start.elapsed());
                 eprintln!(
-                    "  new bp:            {:>8.3} Mbp ({:3.1} bp/range)",
-                    new_bp as f32 / 1e6,
-                    new_bp as f32 / new_ranges as f32
+                    "  new bp:            {:>8.3} Mbp ({:3.1} bp/contig)",
+                    local_stats.output_bp as f32 / 1e6,
+                    local_stats.output_bp as f32 / local_stats.output_contigs as f32
                 );
                 eprintln!(
-                    "  new phrases:       {:>8.3} M   ({:3.1} /range; {:3.1} %)",
-                    new_phrases as f32 / 1e6,
-                    new_phrases as f32 / new_ranges as f32,
-                    new_phrases as f32 / filtered_phrases as f32 * 100.0
+                    "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%)",
+                    local_stats.unique_phrases as f32 / 1e6,
+                    local_stats.unique_phrases as f32 / local_stats.output_contigs as f32,
+                    local_stats.unique_phrases as f32 / local_stats.total_phrases as f32 * 100.0
                 );
                 eprintln!(
-                    "  total phrases:     {:>8.3} M   ({:3.1}%)",
-                    taken_phrases as f32 / 1e6,
-                    100.0 * taken_phrases as f32 / total_filtered_phrases as f32
+                    "  unique phrases:    {:>8.3} M   ({:3.1}%)",
+                    global_stats.unique_phrases as f32 / 1e6,
+                    100.0 * global_stats.unique_phrases as f32 / global_stats.total_phrases as f32
                 );
 
-                eprintln!("  num_ranges:        {:>8.3} M", num_ranges as f32 / 1e6);
+                eprintln!("  num_contigs:       {:>8.3} M", global_stats.output_contigs as f32 / 1e6);
                 eprintln!(
                     "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
-                    output_bp as f32 / 1e9,
-                    100.0 * output_bp as f32 / input_bp as f32
+                    global_stats.output_bp as f32 / 1e9,
+                    100.0 * global_stats.output_bp as f32 / global_stats.input_bp as f32
                 );
                 eprintln!();
-                si += 1;
-            };
-
-        for sample in read.iter() {
-            process(sample);
+            });
         }
     });
 }
