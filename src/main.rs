@@ -44,6 +44,7 @@ struct Args {
 struct Stats {
     input_bp: usize,
     total_phrases: usize,
+    filtered_phrases: usize,
     output_bp: usize,
     unique_phrases: usize,
     output_contigs: usize,
@@ -92,7 +93,17 @@ fn main() {
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
 
     // Process the first/reference sample separately.
-    process_sample(&args, decompressor, samples, seen, global_stats, writer, 0);
+    let reference = RwLock::new((vec![], FxHashMap::default()));
+    process_sample(
+        &args,
+        decompressor,
+        samples,
+        seen,
+        global_stats,
+        writer,
+        0,
+        &reference,
+    );
 
     let next = &AtomicUsize::new(1);
 
@@ -112,6 +123,7 @@ fn main() {
                     global_stats,
                     writer,
                     idx,
+                    &reference,
                 );
             });
         }
@@ -132,6 +144,7 @@ fn process_sample(
         >,
     >,
     idx: usize,
+    reference: &RwLock<(Vec<u8>, FxHashMap<u128, usize>)>,
 ) {
     let Args {
         k,
@@ -152,6 +165,13 @@ fn process_sample(
     let mut t_output = Duration::ZERO;
 
     let (sample, contigs) = &samples[idx];
+
+    let reference_guard = (idx > 0).then(|| reference.read().unwrap());
+    let reference_vec = reference_guard.as_ref().map(|x| &x.0);
+    let reference_map = reference_guard.as_ref().map(|x| &x.1);
+
+    let mut build_reference_vec = vec![];
+    let mut build_reference_map: FxHashMap<u128, usize> = FxHashMap::default();
 
     for contig in contigs {
         let i_start = std::time::Instant::now();
@@ -206,6 +226,7 @@ fn process_sample(
         if positions[0] > 0 {
             phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
         }
+        let mut end_of_seen = 0usize;
         for &[p, q] in positions.array_windows::<2>() {
             // Skip non-forward minimizer pairs.
             if q < p {
@@ -213,15 +234,46 @@ fn process_sample(
             }
             let p = p as usize;
             let q = (q as usize + k).min(seq.len());
+
+            local_stats.total_phrases += 1;
+
+            // Add extra buffer so that coming up minimizers don't mess things up.
+            if q + w < end_of_seen {
+                local_stats.filtered_phrases += 1;
+                continue;
+            }
+
             let (p, q, hash) = with_hash(p, q);
+
+            // if q + w < end_of_seen {
+            //     eprintln!("p {p} q {q} end_of_seen {end_of_seen}");
+            //     assert!(reference_map.unwrap().contains_key(&hash));
+            //     continue;
+            // }
+
+            if let Some(&pos) = reference_map.and_then(|map| map.get(&hash)) {
+                let ref_seq = reference_vec.as_ref().unwrap()[pos..].as_ref();
+                let seq = &seq[p..];
+                // hash was seen before at given `pos` in `reference_vec`.
+                // Linear scan to find the equal range, and skip it.
+                assert_eq!(&seq[..q - p], &ref_seq[..q - p]);
+                let mut i = q - p;
+                while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
+                    i += 1;
+                }
+                end_of_seen = p + i;
+                // eprintln!(
+                //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
+                //     pos + q - p
+                // );
+            }
+
             phrases.push((p, q, hash));
         }
         // Suffix phrase.
         if (*positions.last().unwrap() as usize) + k < seq.len() {
             phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
         }
-
-        local_stats.total_phrases += phrases.len();
 
         let i_phrases = std::time::Instant::now();
         t_phrases += i_phrases - i_minis;
@@ -282,7 +334,8 @@ fn process_sample(
 
         let mut active = 0..0;
 
-        let mut push = |range: Range<usize>| {
+        let mut push = |range: Range<usize>| -> usize {
+            assert!(range.start >= active.start);
             if range.start <= active.end {
                 // End can decrease for non-forward canonical minimizers.
                 active.end = active.end.max(range.end);
@@ -291,22 +344,44 @@ fn process_sample(
                 writer.write_all(&seq[active.clone()]).unwrap();
                 writer.write_all(b"\n").unwrap();
 
+                if idx == 0 {
+                    build_reference_vec.extend_from_slice(&seq[active.clone()]);
+                    build_reference_vec.push(b'\n');
+                }
+
                 local_stats.output_contigs += 1;
                 local_stats.output_bp += active.len();
 
-                active = range;
+                active = range.clone();
             }
+            let ref_pos = build_reference_vec.len() + range.start - active.start;
+            ref_pos
         };
 
         // Emit the phrases.
-        for (p, q, _hash) in phrases {
-            push(p..q);
+        for (p, q, hash) in phrases {
+            let pos = push(p..q);
+            if idx == 0 {
+                assert!(build_reference_map.insert(hash, pos).is_none());
+            }
         }
         push(usize::MAX..usize::MAX);
         assert!(active.len() == 0);
 
         let i_output = std::time::Instant::now();
         t_output += i_output - i_lock;
+    }
+
+    if idx == 0 {
+        eprintln!(
+            "Reference vec: {:8.2} Mbp",
+            build_reference_vec.len() as f32 / 1e6
+        );
+        eprintln!(
+            "Reference map: {:8.2} M phrases",
+            build_reference_map.len() as f32 / 1e6
+        );
+        *reference.write().unwrap() = (build_reference_vec, build_reference_map);
     }
 
     eprintln!(
@@ -334,10 +409,11 @@ fn process_sample(
         local_stats.output_bp as f32 / local_stats.output_contigs as f32
     );
     eprintln!(
-        "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%)",
+        "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%; {:4.1}% filtered)",
         local_stats.unique_phrases as f32 / 1e6,
         local_stats.unique_phrases as f32 / local_stats.output_contigs as f32,
-        local_stats.unique_phrases as f32 / local_stats.total_phrases as f32 * 100.0
+        local_stats.unique_phrases as f32 / local_stats.total_phrases as f32 * 100.0,
+        local_stats.filtered_phrases as f32 / local_stats.total_phrases as f32 * 100.0,
     );
     eprintln!(
         "  unique phrases:    {:>8.3} M   ({:3.1}%)",
