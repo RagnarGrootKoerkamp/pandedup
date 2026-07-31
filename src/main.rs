@@ -2,6 +2,7 @@
 use clap::Parser;
 use either::Either;
 use ragc_core::{Decompressor, DecompressorConfig};
+use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
     io::{BufWriter, Write},
@@ -67,7 +68,6 @@ fn main() {
 
     eprintln!("k: {k}   w: {w}");
     let l = k + w - 1; // syncmer length
-    let mut seen = RwLock::new(std::collections::HashSet::new());
 
     let mut total_filtered_phrases = 0usize;
     let mut taken_phrases = 0usize;
@@ -81,6 +81,7 @@ fn main() {
     let mut input_bp = 0;
     let mut num_ranges = 0usize;
 
+    // TODO: zstd output
     let mut output = BufWriter::with_capacity(1 << 20, std::fs::File::create(output).unwrap());
 
     let hasher = AntiLexHasher::<false>::new(mini_k);
@@ -93,8 +94,8 @@ fn main() {
         Either::Right(simd_minimizers::minimizers(mini_k, w).hasher(&hasher))
     };
 
-    let mut remaining_readers = Mutex::new(1);
-    let condvar = std::sync::Condvar::new();
+    let mut seen: [_; 256] = std::array::from_fn(|_i| Mutex::new(std::collections::HashSet::new()));
+
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (write, read) = std::sync::mpsc::sync_channel(max_queue_size.unwrap_or(threads));
@@ -105,10 +106,6 @@ fn main() {
             let next = &next;
             let seen = &seen;
             let scheme = &scheme;
-            let condvar = &condvar;
-            let remaining_readers = &remaining_readers;
-            let mut rc_seq = vec![];
-            // let scheme = seq_hash::NtHasher::<false>::new(mini_k);
             scope.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= samples.len() {
@@ -132,7 +129,7 @@ fn main() {
                     .collect();
                 let len: usize = seqs.iter().map(|seq| seq.len()).sum();
                 let mid = std::time::Instant::now();
-                let seqs_and_poss: Vec<_> = seqs
+                let (seqs, poss): (Vec<_>, Vec<_>) = seqs
                     .into_iter()
                     .map(|seq| {
                         let mut positions = vec![];
@@ -172,24 +169,29 @@ fn main() {
 
                         (seq, positions)
                     })
-                    .collect();
+                    .unzip();
                 let end = std::time::Instant::now();
 
-                // Wait for a reader to be available.
-                *condvar.wait_while(remaining_readers.lock().unwrap(), |x| *x == 0).unwrap()-=1;
+                let rc_seqs: Vec<_> = if canonical {
+                    seqs
+                    .iter()
+                    .map(|seq| {
+                        let mut rc_seq = vec![];
+                        rc_seq.extend(seq.iter().rev().map(|bp| 3-bp));
+                        rc_seq
+                    })
+                    .collect()}
+                else {vec![]};
 
-                let seen = seen.read().unwrap();
-                let locking = std::time::Instant::now();
-                let seqs_and_phrases = seqs_and_poss
-                    .into_iter()
-                    .map(|(seq, positions)| {
-                        let mut phrases = vec![];
+                let mut phrases = vec![];
+                for (i, positions) in poss.into_iter().enumerate() {
                         if positions.is_empty() {
-                            return (seq, phrases);
+                            continue;
                         }
 
-                        rc_seq.clear();
-                        rc_seq.extend(seq.iter().rev().map(|bp| 3-bp));
+                        let seq = &seqs[i];
+                    let empty = vec![];
+                        let rc_seq = rc_seqs.get(i).unwrap_or(&empty);
 
                         let with_hash = |p, q| {
                             let phrase = &seq[p..q];
@@ -197,9 +199,9 @@ fn main() {
                             if canonical {
                                 let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
                                 let rc_hash = gxhash128(rc_phrase, 0);
-                                (p, q, hash + rc_hash)
+                                (i,p, q, hash + rc_hash)
                             } else {
-                                (p,q,hash)
+                                (i,p,q,hash)
                             }
                         };
 
@@ -214,52 +216,70 @@ fn main() {
                             }
                             let p = p as usize;
                             let q = (q as usize + k).min(seq.len());
-                            let (p, q, hash) = with_hash(p, q);
-                            if !seen.contains(&hash) {
-                                phrases.push((p, q, hash));
-                            }
+                            let (i,p, q, hash) = with_hash(p, q);
+                            // if !seen.contains(&hash) {
+                                phrases.push((i,p, q, hash));
+                            // }
                         }
                         // Suffix phrase.
                         if *positions.last().unwrap() as usize + k < seq.len() {
                             phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
                         }
-                        (seq, phrases)
-                    })
-                    .collect::<Vec<_>>();
-                drop(seen);
+                    }
 
                 let end2 = std::time::Instant::now();
 
+                let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
+                    for (i, p) in phrases.iter().enumerate() {
+                        let part = p.3 as u8;
+                        order[part as usize].push(i as u32);
+                    }
+                let end3 = std::time::Instant::now();
+                let mut perm = (0..=255).collect::<Vec<_>>();
+                perm.shuffle(&mut rand::rng());
+                for part in perm {
+                    let mut seen = seen[part as usize].lock().unwrap();
+                    for &idx in &order[part as usize] {
+                        let (i, p, q, hash) = &mut phrases[idx as usize];
+                        assert!(*hash as u8 == part);
+                        if !seen.insert(*hash) {
+                            *i = usize::MAX;
+                        }
+                    }
+                }
+                let end4 = std::time::Instant::now();
+                phrases.retain(|(i,_p,_q,_hash)| *i != usize::MAX);
+                let end5 = std::time::Instant::now();
+
                 eprintln!(
-                    "push sample {idx:>3} ({:3.1} Gbp): read: {:?} minis: {:?} read-lock: {:?} filter: {:?}",
+                    "push sample {idx:>3} ({:3.1} Gbp): read: {:5.2?}s minis: {:5.2?}s phrases: {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s",
                     len as f32 / 1e9,
-                    mid - start,
-                    end - mid,
-                    locking-end,
-                    end2 - locking
+                    (mid - start).as_secs_f32(),
+                    (end-mid).as_secs_f32(),
+                    (end2-end).as_secs_f32(),
+                    (end3-end2).as_secs_f32(),
+                    (end4-end3).as_secs_f32(),
+                    (end5-end4).as_secs_f32(),
                 );
-                write.send(seqs_and_phrases).unwrap();
+                write.send(
+                    (seqs, phrases)
+                ).unwrap();
             });
         }
-        drop(write);
 
         // Read from the queue in the current thread.
 
         let mut si = 0;
         let mut process =
-            move |seen: &mut HashSet<u128>, sample: Vec<(Vec<u8>, Vec<(usize, usize, u128)>)>| {
+            move |(seqs, phrases): (Vec<Vec<u8>>, Vec<(usize, usize, usize, u128)>)| {
                 let mut new_ranges = 0;
                 let mut new_bp = 0;
                 let mut new_phrases = 0;
                 let mut filtered_phrases = 0;
                 let start = std::time::Instant::now();
-                for (seq, phrases) in sample {
+                for phrases in phrases.chunk_by(|l, r| l.0 == r.0) {
+                    let seq = &seqs[phrases[0].0];
                     input_bp += seq.len();
-                    if phrases.is_empty() {
-                        short += 1;
-                        short_bp += seq.len();
-                        continue;
-                    }
 
                     let mut active = 0..0;
 
@@ -282,17 +302,17 @@ fn main() {
                     };
 
                     // Emit the syncmers.
-                    for (p, q, hash) in phrases {
+                    for &(_i, p, q, hash) in phrases {
                         filtered_phrases += 1;
                         total_filtered_phrases += 1;
                         let phrase = &seq[p..q];
-                        if seen.insert(hash) {
-                            taken_phrases += 1;
-                            new_phrases += 1;
-                            push(p..q);
-                        } else {
-                            skipped += 1;
-                        }
+                        // if seen.insert(hash) {
+                        taken_phrases += 1;
+                        new_phrases += 1;
+                        push(p..q);
+                        // } else {
+                        // skipped += 1;
+                        // }
                     }
 
                     output.write_all(b">\n");
@@ -340,21 +360,10 @@ fn main() {
                 eprintln!();
                 si += 1;
             };
+        drop(write);
 
-        let mut new_readers = [10].into_iter().chain(std::iter::repeat(100));
-        loop {
-            let Ok(sample) = read.recv() else {
-                break;
-            };
-            let mut seen = seen.write().unwrap();
-            process(&mut seen, sample);
-            // Process other already-available elements as well.
-            while let Ok(sample) = read.recv_timeout(std::time::Duration::from_millis(0)) {
-                process(&mut seen, sample);
-            }
-            // add extra readers.
-            *remaining_readers.lock().unwrap() += new_readers.next().unwrap();
-            condvar.notify_all();
+        for sample in read.iter() {
+            process(sample);
         }
     });
 }

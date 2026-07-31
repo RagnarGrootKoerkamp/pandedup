@@ -10,6 +10,7 @@ gxhash = "3.5.0"
 # ragc-core = "0.1.1"
 # ragc-core.path = "../forks/ragc/ragc-core"
 ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
+rand = "0.10.2"
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
 
