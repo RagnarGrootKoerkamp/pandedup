@@ -90,7 +90,11 @@ fn main() {
 
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(std::collections::HashSet::new()));
 
-    let next = &AtomicUsize::new(0);
+    // Process the first/reference sample separately.
+    process_sample(&args, decompressor, samples, seen, global_stats, writer, 0);
+
+    let next = &AtomicUsize::new(1);
+
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
