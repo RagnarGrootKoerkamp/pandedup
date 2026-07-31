@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::{atomic::AtomicUsize, Mutex, RwLock},
+    time::Duration,
 };
 
 use gxhash::gxhash128;
@@ -83,13 +84,10 @@ fn main() {
             "Output file must have .zst extension"
         );
     }
-    let stats_and_writer = {
-        let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
-        let buf_writer =
-            BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
-        let writer = zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish();
-        Mutex::new((Stats::default(), writer))
-    };
+    let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
+    let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
+    let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
+    let stats = Mutex::new(Stats::default());
 
     let hasher = AntiLexHasher::<false>::new(mini_k);
     let scheme = if canonical {
@@ -112,68 +110,52 @@ fn main() {
             let next = &next;
             let seen = &seen;
             let scheme = &scheme;
-            let stats_and_writer = &stats_and_writer;
+            let global_stats = &stats;
+            let writer = &writer;
             scope.spawn(|| loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= samples.len() {
                     break;
                 }
                 let mut local_stats = Stats::default();
+                let mut t_read = Duration::ZERO;
+                let mut t_minis = Duration::ZERO;
+                let mut t_phrases = Duration::ZERO;
+                let mut t_sort = Duration::ZERO;
+                let mut t_lookups = Duration::ZERO;
+                let mut t_sort2 = Duration::ZERO;
+                let mut t_output = Duration::ZERO;
 
                 let (sample, contigs) = &samples[idx];
 
-                let start = std::time::Instant::now();
-                let seqs: Vec<_> = contigs
-                    .iter()
-                    .map(|contig| {
-                        let mut contig = decompressor.get_contig(&sample, &contig).unwrap();
-                        contig
-                            .iter_mut()
-                            .for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
-                        contig
-                    })
-                    .collect();
-                local_stats.input_bp = seqs.iter().map(|seq| seq.len()).sum();
-                let mid = std::time::Instant::now();
-                let (seqs, poss): (Vec<_>, Vec<_>) = seqs
-                    .into_iter()
-                    .map(|seq| {
-                        let mut positions = vec![];
-                        match scheme {
-                            Either::Left(scheme) => {
-                                drop(scheme.run(AsciiSeq(&seq), &mut positions))
-                            }
-                            Either::Right(scheme) => {
-                                drop(scheme.run(AsciiSeq(&seq), &mut positions))
-                            }
-                        }
+                for contig in contigs {
+                    let i_start = std::time::Instant::now();
 
-                        (seq, positions)
-                    })
-                    .unzip();
-                let end = std::time::Instant::now();
+                    let mut seq = decompressor.get_contig(&sample, &contig).unwrap();
+                    seq.iter_mut().for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
+                    local_stats.input_bp += seq.len();
 
-                let rc_seqs: Vec<_> = if canonical {
-                    seqs.iter()
-                        .map(|seq| {
-                            let mut rc_seq = vec![];
-                            rc_seq.extend(seq.iter().rev().map(|bp| 3 - bp));
-                            rc_seq
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                };
+                    let i_read = std::time::Instant::now();
+                    t_read += i_read - i_start;
 
-                let mut phrases = vec![];
-                for (i, positions) in poss.into_iter().enumerate() {
-                    if positions.is_empty() {
-                        continue;
+                    let mut positions = vec![];
+                    match scheme {
+                        Either::Left(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                        Either::Right(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
                     }
 
-                    let seq = &seqs[i];
-                    let empty = vec![];
-                    let rc_seq = rc_seqs.get(i).unwrap_or(&empty);
+                    let i_minis = std::time::Instant::now();
+                    t_minis += i_minis - i_read;
+
+                    let rc_seq: Vec<_> = if canonical {
+                        let mut rc_seq = vec![];
+                        rc_seq.extend(seq.iter().rev().map(|bp| 3 - bp));
+                        rc_seq
+                    } else {
+                        vec![]
+                    };
+
+                    let mut phrases = vec![];
 
                     let with_hash = |p, q| {
                         let phrase = &seq[p..q];
@@ -181,9 +163,9 @@ fn main() {
                         if canonical {
                             let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
                             let rc_hash = gxhash128(rc_phrase, 0);
-                            (i, p, q, hash + rc_hash)
+                            (p, q, hash + rc_hash)
                         } else {
-                            (i, p, q, hash)
+                            (p, q, hash)
                         }
                     };
 
@@ -198,75 +180,70 @@ fn main() {
                         }
                         let p = p as usize;
                         let q = (q as usize + k).min(seq.len());
-                        let (i, p, q, hash) = with_hash(p, q);
-                        phrases.push((i, p, q, hash));
+                        let (p, q, hash) = with_hash(p, q);
+                        phrases.push((p, q, hash));
                     }
                     // Suffix phrase.
                     if (*positions.last().unwrap() as usize) + k < seq.len() {
                         phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
                     }
-                }
-                local_stats.total_phrases = phrases.len();
 
-                let end2 = std::time::Instant::now();
+                    local_stats.total_phrases += phrases.len();
 
-                let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
-                for (i, p) in phrases.iter().enumerate() {
-                    let part = p.3 as u8;
-                    order[part as usize].push(i as u32);
-                }
-                let end3 = std::time::Instant::now();
-                for part in 0..=255 {
-                    // Read-only filter phase
-                    {
-                        let seen = seen[part as usize].read().unwrap();
-                        for &idx in &order[part as usize] {
-                            let (i, _p, _q, hash) = &mut phrases[idx as usize];
-                            assert!(*hash as u8 == part);
-                            if seen.contains(hash) {
-                                *i = usize::MAX;
+                    let i_phrases = std::time::Instant::now();
+                    t_phrases += i_phrases - i_minis;
+
+                    let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
+                    for (i, p) in phrases.iter().enumerate() {
+                        let part = p.2 as u8;
+                        order[part as usize].push(i as u32);
+                    }
+                    let i_sort = std::time::Instant::now();
+                    t_sort += i_sort - i_phrases;
+
+                    for part in 0..=255 {
+                        if order[part as usize].is_empty() {
+                            continue;
+                        }
+
+                        // Read-only filter phase
+                        {
+                            let seen = seen[part as usize].read().unwrap();
+                            for &idx in &order[part as usize] {
+                                let (p, _q, hash) = &mut phrases[idx as usize];
+                                assert!(*hash as u8 == part);
+                                if seen.contains(hash) {
+                                    *p = usize::MAX;
+                                }
                             }
                         }
-                    }
 
-                    // Try to write missing
-                    {
-                        let mut seen = seen[part as usize].write().unwrap();
-                        for &idx in &order[part as usize] {
-                            let (i, _p, _q, hash) = &mut phrases[idx as usize];
-                            if *i != usize::MAX {
-                                if !seen.insert(*hash) {
-                                    *i = usize::MAX;
+                        // Try to write missing
+                        {
+                            let mut seen = seen[part as usize].write().unwrap();
+                            for &idx in &order[part as usize] {
+                                let (p, _q, hash) = &mut phrases[idx as usize];
+                                if *p != usize::MAX {
+                                    if !seen.insert(*hash) {
+                                        *p = usize::MAX;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                let end4 = std::time::Instant::now();
-                phrases.retain(|(i, _p, _q, _hash)| *i != usize::MAX);
-                local_stats.unique_phrases = phrases.len();
-                let end5 = std::time::Instant::now();
+                    let i_lookups = std::time::Instant::now();
+                    t_lookups += i_lookups - i_sort;
 
-                eprintln!(
-                    "push sample {idx:>3} ({:3.1} Gbp): \
-                     read: {:5.2?}s minis: {:5.2?}s phrases: \
-                     {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s",
-                    (local_stats.input_bp as f32) / 1e9,
-                    (mid - start).as_secs_f32(),
-                    (end - mid).as_secs_f32(),
-                    (end2 - end).as_secs_f32(),
-                    (end3 - end2).as_secs_f32(),
-                    (end4 - end3).as_secs_f32(),
-                    (end5 - end4).as_secs_f32(),
-                );
+                    phrases.retain(|(p, _q, _hash)| *p != usize::MAX);
+                    local_stats.unique_phrases += phrases.len();
 
-                let mut stats_and_writer = stats_and_writer.lock().unwrap();
-                let (global_stats, writer) = &mut *stats_and_writer;
+                    let i_sort2 = std::time::Instant::now();
+                    t_sort2 += i_sort2 - i_lookups;
 
-                // Process
-                let start = std::time::Instant::now();
-                for phrases in phrases.chunk_by(|l, r| l.0 == r.0) {
-                    let seq = &seqs[phrases[0].0];
+                    // Write new contigs.
+                    let mut writer = writer.lock().unwrap();
+
+                    // Output contigs
 
                     let mut active = 0..0;
 
@@ -286,18 +263,35 @@ fn main() {
                         }
                     };
 
-                    // Emit the syncmers.
-                    for &(_i, p, q, _hash) in phrases {
+                    // Emit the phrases.
+                    for (p, q, _hash) in phrases {
                         push(p..q);
                     }
-
                     push(usize::MAX..usize::MAX);
                     assert!(active.len() == 0);
+
+                    let i_output = std::time::Instant::now();
+                    t_output += i_output - i_sort2;
                 }
 
+                eprintln!(
+                    "push sample {idx:>3} ({:3.1} Gbp {:3} ctg): \
+                     read: {:5.2?}s minis: {:5.2?}s phrases: \
+                     {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s output: {:5.2?}s",
+                    (local_stats.input_bp as f32) / 1e9,
+                    contigs.len(),
+                    t_read.as_secs_f32(),
+                    t_minis.as_secs_f32(),
+                    t_phrases.as_secs_f32(),
+                    t_sort.as_secs_f32(),
+                    t_lookups.as_secs_f32(),
+                    t_sort2.as_secs_f32(),
+                    t_output.as_secs_f32()
+                );
+
+                let mut global_stats = global_stats.lock().unwrap();
                 *global_stats += local_stats;
 
-                eprintln!("process sample {idx}: {:?}", start.elapsed());
                 eprintln!(
                     "  new bp:            {:>8.3} Mbp ({:3.1} bp/contig)",
                     local_stats.output_bp as f32 / 1e6,
