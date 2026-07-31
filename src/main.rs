@@ -50,6 +50,8 @@ struct Stats {
     output_contigs: usize,
 }
 
+const SEED: i64 = 1983274983247984327;
+
 fn main() {
     let args = Args::parse();
     let Args {
@@ -212,10 +214,10 @@ fn process_sample(
 
         let with_hash = |p, q| {
             let phrase = &seq[p..q];
-            let hash = gxhash128(phrase, 0);
+            let hash = gxhash128(phrase, SEED);
             if canonical {
                 let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
-                let rc_hash = gxhash128(rc_phrase, 0);
+                let rc_hash = gxhash128(rc_phrase, SEED);
                 (p, q, hash + rc_hash)
             } else {
                 (p, q, hash)
@@ -260,8 +262,8 @@ fn process_sample(
                     &seq[..q - p],
                     &ref_seq[..q - p],
                     "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
-                    gxhash128(&seq[..q - p], 0),
-                    gxhash128(&ref_seq[..q - p], 0)
+                    gxhash128(&seq[..q - p], SEED),
+                    gxhash128(&ref_seq[..q - p], SEED)
                 );
                 let mut i = q - p;
                 while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
