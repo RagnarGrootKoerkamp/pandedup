@@ -59,6 +59,7 @@ fn main() {
         threads,
     } = Args::parse();
 
+    eprintln!("k: {k}   w: {w}");
     // Open an archive
     let config = DecompressorConfig { verbosity: 0 };
     let mut decompressor = Decompressor::open(&input.to_string_lossy(), config).unwrap();
@@ -72,10 +73,8 @@ fn main() {
             (sample, contigs)
         })
         .collect();
-    // println!("Found {} samples", samples.len());
-    // eprintln!("samples: {samples:?}");
 
-    eprintln!("k: {k}   w: {w}");
+    println!("Found {} samples", samples.len());
 
     // TODO: zstd output
     if let Some(output) = &output {
@@ -127,9 +126,7 @@ fn main() {
                 let seqs: Vec<_> = contigs
                     .iter()
                     .map(|contig| {
-                        let mut contig = decompressor
-                            .get_contig(&sample, &contig)
-                            .unwrap();
+                        let mut contig = decompressor.get_contig(&sample, &contig).unwrap();
                         contig
                             .iter_mut()
                             .for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
@@ -143,8 +140,12 @@ fn main() {
                     .map(|seq| {
                         let mut positions = vec![];
                         match scheme {
-                            Either::Left(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
-                            Either::Right(scheme) => drop(scheme.run(AsciiSeq(&seq), &mut positions)),
+                            Either::Left(scheme) => {
+                                drop(scheme.run(AsciiSeq(&seq), &mut positions))
+                            }
+                            Either::Right(scheme) => {
+                                drop(scheme.run(AsciiSeq(&seq), &mut positions))
+                            }
                         }
 
                         (seq, positions)
@@ -153,66 +154,67 @@ fn main() {
                 let end = std::time::Instant::now();
 
                 let rc_seqs: Vec<_> = if canonical {
-                    seqs
-                    .iter()
-                    .map(|seq| {
-                        let mut rc_seq = vec![];
-                        rc_seq.extend(seq.iter().rev().map(|bp| 3-bp));
-                        rc_seq
-                    })
-                    .collect()}
-                else {vec![]};
+                    seqs.iter()
+                        .map(|seq| {
+                            let mut rc_seq = vec![];
+                            rc_seq.extend(seq.iter().rev().map(|bp| 3 - bp));
+                            rc_seq
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
 
                 let mut phrases = vec![];
                 for (i, positions) in poss.into_iter().enumerate() {
-                        if positions.is_empty() {
+                    if positions.is_empty() {
+                        continue;
+                    }
+
+                    let seq = &seqs[i];
+                    let empty = vec![];
+                    let rc_seq = rc_seqs.get(i).unwrap_or(&empty);
+
+                    let with_hash = |p, q| {
+                        let phrase = &seq[p..q];
+                        let hash = gxhash128(phrase, 0);
+                        if canonical {
+                            let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
+                            let rc_hash = gxhash128(rc_phrase, 0);
+                            (i, p, q, hash + rc_hash)
+                        } else {
+                            (i, p, q, hash)
+                        }
+                    };
+
+                    // Prefix phrase.
+                    if positions[0] > 0 {
+                        phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
+                    }
+                    for &[p, q] in positions.array_windows::<2>() {
+                        // Skip non-forward minimizer pairs.
+                        if q < p {
                             continue;
                         }
-
-                        let seq = &seqs[i];
-                    let empty = vec![];
-                        let rc_seq = rc_seqs.get(i).unwrap_or(&empty);
-
-                        let with_hash = |p, q| {
-                            let phrase = &seq[p..q];
-                            let hash = gxhash128(phrase, 0);
-                            if canonical {
-                                let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
-                                let rc_hash = gxhash128(rc_phrase, 0);
-                                (i,p, q, hash + rc_hash)
-                            } else {
-                                (i,p,q,hash)
-                            }
-                        };
-
-                        // Prefix phrase.
-                        if positions[0] > 0 {
-                            phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
-                        }
-                        for &[p, q] in positions.array_windows::<2>() {
-                            // Skip non-forward minimizer pairs.
-                            if q < p {
-                                continue;
-                            }
-                            let p = p as usize;
-                            let q = (q as usize + k).min(seq.len());
-                            let (i,p, q, hash) = with_hash(p, q);
-                            phrases.push((i,p, q, hash));
-                        }
-                        // Suffix phrase.
-                        if (*positions.last().unwrap() as usize) + k < seq.len() {
-                            phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
-                        }
+                        let p = p as usize;
+                        let q = (q as usize + k).min(seq.len());
+                        let (i, p, q, hash) = with_hash(p, q);
+                        phrases.push((i, p, q, hash));
                     }
+                    // Suffix phrase.
+                    if (*positions.last().unwrap() as usize) + k < seq.len() {
+                        phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
+                    }
+                }
                 local_stats.total_phrases = phrases.len();
 
                 let end2 = std::time::Instant::now();
 
                 let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
-                    for (i, p) in phrases.iter().enumerate() {
-                        let part = p.3 as u8;
-                        order[part as usize].push(i as u32);
-                    }
+                for (i, p) in phrases.iter().enumerate() {
+                    let part = p.3 as u8;
+                    order[part as usize].push(i as u32);
+                }
                 let end3 = std::time::Instant::now();
                 for part in 0..=255 {
                     // Read-only filter phase
@@ -241,19 +243,21 @@ fn main() {
                     }
                 }
                 let end4 = std::time::Instant::now();
-                phrases.retain(|(i,_p,_q,_hash)| *i != usize::MAX);
+                phrases.retain(|(i, _p, _q, _hash)| *i != usize::MAX);
                 local_stats.unique_phrases = phrases.len();
                 let end5 = std::time::Instant::now();
 
                 eprintln!(
-                    "push sample {idx:>3} ({:3.1} Gbp): read: {:5.2?}s minis: {:5.2?}s phrases: {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s",
-                    local_stats.input_bp as f32 / 1e9,
+                    "push sample {idx:>3} ({:3.1} Gbp): \
+                     read: {:5.2?}s minis: {:5.2?}s phrases: \
+                     {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s",
+                    (local_stats.input_bp as f32) / 1e9,
                     (mid - start).as_secs_f32(),
-                    (end-mid).as_secs_f32(),
-                    (end2-end).as_secs_f32(),
-                    (end3-end2).as_secs_f32(),
-                    (end4-end3).as_secs_f32(),
-                    (end5-end4).as_secs_f32(),
+                    (end - mid).as_secs_f32(),
+                    (end2 - end).as_secs_f32(),
+                    (end3 - end2).as_secs_f32(),
+                    (end4 - end3).as_secs_f32(),
+                    (end5 - end4).as_secs_f32(),
                 );
 
                 let mut stats_and_writer = stats_and_writer.lock().unwrap();
@@ -288,10 +292,10 @@ fn main() {
                     }
 
                     push(usize::MAX..usize::MAX);
+                    assert!(active.len() == 0);
                 }
 
                 *global_stats += local_stats;
-                
 
                 eprintln!("process sample {idx}: {:?}", start.elapsed());
                 eprintln!(
@@ -311,7 +315,10 @@ fn main() {
                     100.0 * global_stats.unique_phrases as f32 / global_stats.total_phrases as f32
                 );
 
-                eprintln!("  num_contigs:       {:>8.3} M", global_stats.output_contigs as f32 / 1e6);
+                eprintln!(
+                    "  num_contigs:       {:>8.3} M",
+                    global_stats.output_contigs as f32 / 1e6
+                );
                 eprintln!(
                     "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
                     global_stats.output_bp as f32 / 1e9,
