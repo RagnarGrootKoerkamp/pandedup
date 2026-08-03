@@ -3,8 +3,10 @@ use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 use std::{
     io::{BufWriter, Read, Write},
+    marker::PhantomPinned,
     ops::Range,
     path::PathBuf,
+    pin::Pin,
     sync::{atomic::AtomicUsize, Mutex, RwLock},
     time::Duration,
 };
@@ -73,11 +75,13 @@ fn main() {
     eprintln!("k: {k}   w: {w}");
     // Open an archive
     let reader = match input.extension().unwrap().to_str().unwrap() {
-        "agc" => Box::new(AgcReader::new(&args.input.to_string_lossy())) as Box<dyn InputReader>,
-        "tar.gz" => Box::new(TarGzReader::new(&args.input.to_string_lossy())),
+        "agc" => {
+            Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+        }
+        "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
         _ => panic!("Input file must be .agc or .tar.gz"),
     };
-    let reader = reader.as_ref();
+    let reader = reader.as_ref().get_ref();
 
     // TODO: zstd output
     if let Some(output) = &output {
@@ -424,9 +428,6 @@ fn process_sample(
 }
 
 trait InputReader: Send + Sync {
-    fn new(path: &str) -> Self
-    where
-        Self: Sized;
     /// Return sample idx and iterator over contigs on ACTG.
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)>;
 }
@@ -437,7 +438,7 @@ struct AgcReader {
     idx: AtomicUsize,
 }
 
-impl InputReader for AgcReader {
+impl AgcReader {
     fn new(path: &str) -> Self {
         let config = DecompressorConfig { verbosity: 0 };
         let mut decompressor = Decompressor::open(path, config).unwrap();
@@ -456,6 +457,9 @@ impl InputReader for AgcReader {
             idx: AtomicUsize::new(0),
         }
     }
+}
+
+impl InputReader for AgcReader {
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
         let idx = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if idx >= self.samples.len() {
@@ -474,24 +478,50 @@ impl InputReader for AgcReader {
 /// Take an input .tar.gz containing many .fa files. Each call to `next_sample`
 /// returns an iterator over the contigs in the next .fa file.
 struct TarGzReader {
-    reader: Mutex<tar::Archive<flate2::read::GzDecoder<std::fs::File>>>,
+    reader: tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
+    entries: Mutex<Option<tar::Entries<'static, flate2::read::GzDecoder<std::fs::File>>>>,
     idx: AtomicUsize,
+    _pin: PhantomPinned,
+}
+
+// Access to the archive iterator is serialized by `entries`.
+unsafe impl Sync for TarGzReader {}
+unsafe impl Send for TarGzReader {}
+
+impl TarGzReader {
+    fn new(path: &str) -> Pin<Box<Self>> {
+        let reader = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
+        let mut reader = Box::pin(Self {
+            reader: tar::Archive::new(reader),
+            entries: Mutex::new(None),
+            idx: AtomicUsize::new(0),
+            _pin: PhantomPinned,
+        });
+        // `entries` borrows `reader`; the pin guarantees that this address stays
+        // valid for the lifetime of the archive.
+        let entries = unsafe {
+            std::mem::transmute::<
+                tar::Entries<'_, flate2::read::GzDecoder<std::fs::File>>,
+                tar::Entries<'static, flate2::read::GzDecoder<std::fs::File>>,
+            >(
+                reader
+                    .as_mut()
+                    .get_unchecked_mut()
+                    .reader
+                    .entries()
+                    .unwrap(),
+            )
+        };
+        *reader.entries.lock().unwrap() = Some(entries);
+        reader
+    }
 }
 
 impl InputReader for TarGzReader {
-    fn new(path: &str) -> Self {
-        let reader = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
-        let reader = Mutex::new(tar::Archive::new(reader));
-        Self {
-            reader,
-            idx: AtomicUsize::new(0),
-        }
-    }
-
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
         let idx = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut reader = self.reader.lock().unwrap();
-        let mut entries = reader.entries().unwrap();
+        let mut entries = self.entries.lock().unwrap();
+        let entries = entries.as_mut().unwrap();
 
         let mut data = Vec::new();
         loop {
