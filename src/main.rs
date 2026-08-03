@@ -520,8 +520,8 @@ impl TarGzReader {
 impl InputReader for TarGzReader {
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
         let idx = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut entries = self.entries.lock().unwrap();
-        let entries = entries.as_mut().unwrap();
+        let mut guard = self.entries.lock().unwrap();
+        let entries = guard.as_mut().unwrap();
 
         let mut data = Vec::new();
         loop {
@@ -540,6 +540,7 @@ impl InputReader for TarGzReader {
             entry.read_to_end(&mut data).unwrap();
             break;
         }
+        drop(guard);
         let mut binding = std::io::Cursor::new(data);
         let mut reader = needletail::parse_fastx_reader(&mut binding).unwrap();
         let mut contigs = vec![];
