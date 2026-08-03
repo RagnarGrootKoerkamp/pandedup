@@ -2,7 +2,7 @@ use clap::Parser;
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 use std::{
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     ops::Range,
     path::PathBuf,
     sync::{atomic::AtomicUsize, Mutex, RwLock},
@@ -72,20 +72,12 @@ fn main() {
 
     eprintln!("k: {k}   w: {w}");
     // Open an archive
-    let config = DecompressorConfig { verbosity: 0 };
-    let decompressor = &mut Decompressor::open(&input.to_string_lossy(), config).unwrap();
-
-    // List available samples
-    let samples = decompressor.list_samples();
-    let samples: &Vec<_> = &samples
-        .into_iter()
-        .map(|sample| {
-            let contigs = decompressor.list_contigs(&sample).unwrap();
-            (sample, contigs)
-        })
-        .collect();
-
-    println!("Found {} samples", samples.len());
+    let reader = match input.extension().unwrap().to_str().unwrap() {
+        "agc" => Box::new(AgcReader::new(&args.input.to_string_lossy())) as Box<dyn InputReader>,
+        "tar.gz" => Box::new(TarGzReader::new(&args.input.to_string_lossy())),
+        _ => panic!("Input file must be .agc or .tar.gz"),
+    };
+    let reader = reader.as_ref();
 
     // TODO: zstd output
     if let Some(output) = &output {
@@ -102,41 +94,18 @@ fn main() {
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
 
     // Process the first/reference sample separately.
-    let next = &AtomicUsize::new(1);
     let reference = RwLock::new((vec![], FxHashMap::default()));
-
     if args.reference {
-        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        process_sample(
-            &args,
-            decompressor,
-            samples,
-            seen,
-            global_stats,
-            writer,
-            idx,
-            &reference,
-        );
+        process_sample(&args, reader, seen, global_stats, writer, &reference);
     }
 
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
             scope.spawn(|| loop {
-                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if idx >= samples.len() {
+                if process_sample(&args, reader, seen, global_stats, writer, &reference) == None {
                     break;
-                }
-                process_sample(
-                    &args,
-                    decompressor,
-                    samples,
-                    seen,
-                    global_stats,
-                    writer,
-                    idx,
-                    &reference,
-                );
+                };
             });
         }
     });
@@ -144,8 +113,7 @@ fn main() {
 
 fn process_sample(
     args: &Args,
-    decompressor: &Decompressor,
-    samples: &Vec<(String, Vec<String>)>,
+    reader: &dyn InputReader,
     seen: &[RwLock<FxHashSet<u128>>; 256],
     global_stats: &Mutex<Stats>,
     writer: &Mutex<
@@ -155,9 +123,8 @@ fn process_sample(
             Box<dyn FnMut(Result<BufWriter<std::fs::File>, std::io::Error>) + Send>,
         >,
     >,
-    idx: usize,
     reference: &RwLock<(Vec<u8>, FxHashMap<u128, usize>)>,
-) {
+) -> Option<()> {
     let Args {
         k,
         mini_k,
@@ -176,7 +143,7 @@ fn process_sample(
     let mut t_lock = Duration::ZERO;
     let mut t_output = Duration::ZERO;
 
-    let (sample, contigs) = &samples[idx];
+    let (idx, contigs) = reader.next_sample()?;
 
     let build_reference = args.reference && idx == 0;
     let use_reference = args.reference && idx > 0;
@@ -188,11 +155,11 @@ fn process_sample(
     let mut build_reference_vec = vec![];
     let mut build_reference_map: FxHashMap<u128, usize> = FxHashMap::default();
 
-    for contig in contigs {
+    let mut input_contigs = 0;
+    for seq in contigs {
+        input_contigs += 1;
         let i_start = std::time::Instant::now();
 
-        let mut seq = decompressor.get_contig(&sample, &contig).unwrap();
-        seq.iter_mut().for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
         local_stats.input_bp += seq.len();
 
         let i_read = std::time::Instant::now();
@@ -410,7 +377,7 @@ fn process_sample(
                      read: {:5.2?}s minis: {:5.2?}s phrases: \
                      {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s lock: {:5.2?}s output: {:5.2?}s",
         (local_stats.input_bp as f32) / 1e9,
-        contigs.len(),
+        input_contigs,
         t_read.as_secs_f32(),
         t_minis.as_secs_f32(),
         t_phrases.as_secs_f32(),
@@ -452,4 +419,100 @@ fn process_sample(
         100.0 * global_stats.output_bp as f32 / global_stats.input_bp as f32
     );
     eprintln!();
+
+    Some(())
+}
+
+trait InputReader: Send + Sync {
+    fn new(path: &str) -> Self
+    where
+        Self: Sized;
+    /// Return sample idx and iterator over contigs on ACTG.
+    fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)>;
+}
+
+struct AgcReader {
+    decompressor: Decompressor,
+    samples: Vec<(String, Vec<String>)>,
+    idx: AtomicUsize,
+}
+
+impl InputReader for AgcReader {
+    fn new(path: &str) -> Self {
+        let config = DecompressorConfig { verbosity: 0 };
+        let mut decompressor = Decompressor::open(path, config).unwrap();
+        let samples: Vec<_> = decompressor
+            .list_samples()
+            .into_iter()
+            .map(|sample| {
+                let contigs = decompressor.list_contigs(&sample).unwrap();
+                (sample, contigs)
+            })
+            .collect();
+        println!("Found {} samples", samples.len());
+        Self {
+            decompressor,
+            samples,
+            idx: AtomicUsize::new(0),
+        }
+    }
+    fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
+        let idx = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if idx >= self.samples.len() {
+            return None;
+        }
+        let (sample, contigs) = &self.samples[idx];
+        let iter = contigs.iter().map(move |contig| {
+            let mut seq = self.decompressor.get_contig(sample, contig).unwrap();
+            seq.iter_mut().for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
+            seq
+        });
+        Some((idx, Box::new(iter)))
+    }
+}
+
+/// Take an input .tar.gz containing many .fa files. Each call to `next_sample`
+/// returns an iterator over the contigs in the next .fa file.
+struct TarGzReader {
+    reader: Mutex<tar::Archive<flate2::read::GzDecoder<std::fs::File>>>,
+    idx: AtomicUsize,
+}
+
+impl InputReader for TarGzReader {
+    fn new(path: &str) -> Self {
+        let reader = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
+        let reader = Mutex::new(tar::Archive::new(reader));
+        Self {
+            reader,
+            idx: AtomicUsize::new(0),
+        }
+    }
+
+    fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
+        let idx = self.idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reader = self.reader.lock().unwrap();
+        let mut entries = reader.entries().unwrap();
+
+        let mut data = Vec::new();
+        loop {
+            let Some(entry) = entries.next() else {
+                return None;
+            };
+            let mut entry = entry.unwrap();
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            eprintln!("Path: {}", entry.header().path().unwrap().display());
+            entry.read_to_end(&mut data).unwrap();
+            break;
+        }
+        let mut binding = std::io::Cursor::new(data);
+        let mut reader = needletail::parse_fastx_reader(&mut binding).unwrap();
+        let mut contigs = vec![];
+        while let Some(record) = reader.next() {
+            contigs.push(record.unwrap().seq().to_vec());
+        }
+
+        Some((idx, Box::new(contigs.into_iter())))
+    }
 }

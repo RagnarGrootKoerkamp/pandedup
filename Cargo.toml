@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
+flate2 = { version = "1.1.9", features = ["zlib-ng"] }
 fxhash = "0.2.1"
 gxhash = "3.5.0"
+needletail = "0.7.3"
 num_cpus = "1.17.0"
 # ragc-core = "0.1.1"
 # ragc-core.path = "../forks/ragc/ragc-core"
@@ -15,6 +17,7 @@ ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
 rand = "0.10.2"
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
+tar = "0.4.46"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 zstd = "0.13.3"
 
