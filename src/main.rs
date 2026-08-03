@@ -502,7 +502,11 @@ impl InputReader for TarGzReader {
             if !entry.header().entry_type().is_file() {
                 continue;
             }
-            eprintln!("Path: {}", entry.header().path().unwrap().display());
+            let path = entry.header().path().unwrap();
+            eprintln!("Path: {}", path.display());
+            if path.extension().unwrap_or_default() != "gz" {
+                continue;
+            }
             entry.read_to_end(&mut data).unwrap();
             break;
         }
