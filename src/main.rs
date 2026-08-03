@@ -36,7 +36,11 @@ struct Args {
     #[clap(short = 'j', long)]
     threads: Option<usize>,
 
-    /// Dedup across reverse-complements.
+    /// Skip using the first input as a reference.
+    #[clap(long="no-reference", default_value_t = true, action = clap::ArgAction::SetFalse)]
+    reference: bool,
+
+    /// Dedup across reverse-complements. Not well-tested.
     #[clap(long)]
     canonical: bool,
 
@@ -98,19 +102,22 @@ fn main() {
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
 
     // Process the first/reference sample separately.
-    let reference = RwLock::new((vec![], FxHashMap::default()));
-    process_sample(
-        &args,
-        decompressor,
-        samples,
-        seen,
-        global_stats,
-        writer,
-        0,
-        &reference,
-    );
-
     let next = &AtomicUsize::new(1);
+    let reference = RwLock::new((vec![], FxHashMap::default()));
+
+    if args.reference {
+        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        process_sample(
+            &args,
+            decompressor,
+            samples,
+            seen,
+            global_stats,
+            writer,
+            idx,
+            &reference,
+        );
+    }
 
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
@@ -171,7 +178,10 @@ fn process_sample(
 
     let (sample, contigs) = &samples[idx];
 
-    let reference_guard = (idx > 0).then(|| reference.read().unwrap());
+    let build_reference = args.reference && idx == 0;
+    let use_reference = args.reference && idx > 0;
+
+    let reference_guard = use_reference.then(|| reference.read().unwrap());
     let reference_vec = reference_guard.as_ref().map(|x| &x.0);
     let reference_map = reference_guard.as_ref().map(|x| &x.1);
 
@@ -355,7 +365,7 @@ fn process_sample(
                 writer.write_all(&seq[active.clone()]).unwrap();
                 writer.write_all(b"\n").unwrap();
 
-                if idx == 0 {
+                if build_reference {
                     build_reference_vec.extend_from_slice(&seq[active.clone()]);
                     build_reference_vec.push(b'\n');
                 }
@@ -372,7 +382,7 @@ fn process_sample(
         // Emit the phrases.
         for (p, q, hash) in phrases {
             let pos = push(p..q);
-            if idx == 0 {
+            if build_reference {
                 assert!(build_reference_map.insert(hash, pos).is_none());
             }
         }
@@ -383,7 +393,7 @@ fn process_sample(
         t_output += i_output - i_lock;
     }
 
-    if idx == 0 {
+    if build_reference {
         eprintln!(
             "Reference vec: {:8.2} Mbp",
             build_reference_vec.len() as f32 / 1e6
