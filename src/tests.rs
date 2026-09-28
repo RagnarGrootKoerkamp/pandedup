@@ -57,10 +57,39 @@ fn encode_kmer(kmer: &[u8]) -> u128 {
     })
 }
 
-fn kmer_values<'a>(sequences: impl IntoIterator<Item = &'a [u8]>, k: usize) -> HashSet<u128> {
+fn encode_reverse_complement(kmer: &[u8]) -> u128 {
+    kmer.iter().rev().fold(0, |encoded, &base| {
+        (encoded << 2)
+            | match base {
+                b'A' => 3,
+                b'C' => 2,
+                b'G' => 1,
+                b'T' => 0,
+                _ => panic!("unexpected base {base}"),
+            }
+    })
+}
+
+fn encode_kmer_for_spectrum(kmer: &[u8], canonical: bool) -> u128 {
+    let value = encode_kmer(kmer);
+    if canonical {
+        value.min(encode_reverse_complement(kmer))
+    } else {
+        value
+    }
+}
+
+fn kmer_values<'a>(
+    sequences: impl IntoIterator<Item = &'a [u8]>,
+    k: usize,
+    canonical: bool,
+) -> HashSet<u128> {
     sequences
         .into_iter()
-        .flat_map(|seq| seq.windows(k).map(encode_kmer))
+        .flat_map(|seq| {
+            seq.windows(k)
+                .map(move |kmer| encode_kmer_for_spectrum(kmer, canonical))
+        })
         .collect()
 }
 
@@ -73,11 +102,16 @@ fn decode_kmer(mut value: u128, k: usize) -> Vec<u8> {
     kmer
 }
 
-fn locate_kmer(sequences: &[Vec<u8>], k: usize, value: u128) -> Option<(usize, usize)> {
+fn locate_kmer(
+    sequences: &[Vec<u8>],
+    k: usize,
+    value: u128,
+    canonical: bool,
+) -> Option<(usize, usize)> {
     sequences.iter().enumerate().find_map(|(sequence, bases)| {
         bases
             .windows(k)
-            .position(|kmer| encode_kmer(kmer) == value)
+            .position(|kmer| encode_kmer_for_spectrum(kmer, canonical) == value)
             .map(|offset| (sequence, offset))
     })
 }
@@ -91,6 +125,7 @@ fn report_spectrum_failure(
     output: &[Vec<u8>],
     k: usize,
     w: usize,
+    canonical: bool,
     expected: &HashSet<u128>,
     actual: &HashSet<u128>,
 ) -> ! {
@@ -114,7 +149,7 @@ fn report_spectrum_failure(
         eprintln!(
             "  {} at input {:?}",
             ascii_kmer(value, k),
-            locate_kmer(input, k, value)
+            locate_kmer(input, k, value, canonical)
         );
     }
     eprintln!("extra k-mers:");
@@ -122,7 +157,7 @@ fn report_spectrum_failure(
         eprintln!(
             "  {} at output {:?}",
             ascii_kmer(value, k),
-            locate_kmer(output, k, value)
+            locate_kmer(output, k, value, canonical)
         );
     }
     panic!("k-mer spectrum mismatch");
@@ -144,39 +179,52 @@ fn random_sequences_preserve_the_kmer_set() {
                 }
 
                 for &k in &[3, 7, 15, 31, 63] {
-                    let expected = kmer_values(sequences.iter().map(Vec::as_slice), k);
-                    for &w in &[5, 25, 100, 500] {
-                        let args = Args {
-                            input: PathBuf::new(),
-                            output: None,
-                            k,
-                            w,
-                            threads: Some(1),
-                            reference: false,
-                            canonical: false,
-                            mini_k: 8,
-                        };
-                        let reader = MemoryReader::new(sequences.clone());
-                        let writer = Mutex::new(Vec::new());
-                        process(&args, &reader, &writer);
+                    for canonical in [false, true] {
+                        let expected =
+                            kmer_values(sequences.iter().map(Vec::as_slice), k, canonical);
+                        for &w in &[8, 24, 100, 500] {
+                            for reference in [false, true] {
+                                for threads in [1, 3] {
+                                    let args = Args {
+                                        input: PathBuf::new(),
+                                        output: None,
+                                        k,
+                                        w,
+                                        threads: Some(threads),
+                                        reference,
+                                        canonical,
+                                        mini_k: 8,
+                                    };
+                                    let reader = MemoryReader::new(sequences.clone());
+                                    let writer = Mutex::new(Vec::new());
+                                    process(&args, &reader, &writer);
 
-                        let output = writer.into_inner().unwrap();
-                        let mut output_reader =
-                            needletail::parse_fastx_reader(Cursor::new(output)).unwrap();
-                        let mut output_sequences = Vec::new();
-                        while let Some(record) = output_reader.next() {
-                            output_sequences.push(record.unwrap().seq().into_owned());
-                        }
-                        let actual = kmer_values(output_sequences.iter().map(Vec::as_slice), k);
-                        if actual != expected {
-                            report_spectrum_failure(
-                                &sequences,
-                                &output_sequences,
-                                k,
-                                w,
-                                &expected,
-                                &actual,
-                            );
+                                    let output = writer.into_inner().unwrap();
+                                    let mut output_reader =
+                                        needletail::parse_fastx_reader(Cursor::new(output))
+                                            .unwrap();
+                                    let mut output_sequences = Vec::new();
+                                    while let Some(record) = output_reader.next() {
+                                        output_sequences.push(record.unwrap().seq().into_owned());
+                                    }
+                                    let actual = kmer_values(
+                                        output_sequences.iter().map(Vec::as_slice),
+                                        k,
+                                        canonical,
+                                    );
+                                    if actual != expected {
+                                        report_spectrum_failure(
+                                            &sequences,
+                                            &output_sequences,
+                                            k,
+                                            w,
+                                            canonical,
+                                            &expected,
+                                            &actual,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
