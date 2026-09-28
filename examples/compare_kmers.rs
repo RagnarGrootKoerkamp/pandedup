@@ -99,16 +99,23 @@ fn remove_agc_kmers(path: &Path, output: FxHashSet<u128>) -> FxHashSet<u128> {
                     let i = next_sample.fetch_add(1, Ordering::Relaxed);
                     let Some(sample) = samples.get(i) else { break };
                     for contig in reader.list_contigs(sample).unwrap() {
-                        let mut sequence = reader.get_contig(sample, &contig).unwrap();
-                        sequence
-                            .iter_mut()
-                            .for_each(|base| *base = b"ACGT"[(*base as usize) % 4]);
-                        visit_sequence_kmers(&sequence, |value| {
-                            batch.insert(value);
-                            if batch.len() >= MERGE_BATCH_SIZE {
-                                remove_present_kmers(&mut batch, remaining);
-                            }
-                        });
+                        let sequence = reader.get_contig(sample, &contig).unwrap();
+                        let seqs = sequence
+                            .split(|&base| base >= 4)
+                            .filter(|run| !run.is_empty())
+                            .map(|run| {
+                                run.iter()
+                                    .map(|&base| b"ACGT"[base as usize])
+                                    .collect::<Vec<_>>()
+                            });
+                        for seq in seqs {
+                            visit_sequence_kmers(&seq, |value| {
+                                batch.insert(value);
+                                if batch.len() >= MERGE_BATCH_SIZE {
+                                    remove_present_kmers(&mut batch, remaining);
+                                }
+                            });
+                        }
                     }
                     remove_present_kmers(&mut batch, remaining);
                     let unmatched = remaining.read().unwrap().len();

@@ -438,7 +438,7 @@ fn process_sample<W: Write>(
 }
 
 trait InputReader: Send + Sync {
-    /// Return sample idx and iterator over contigs on ACTG.
+    /// Return sample idx and iterator over unambiguous A/C/G/T runs.
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)>;
 }
 
@@ -476,10 +476,12 @@ impl InputReader for AgcReader {
             return None;
         }
         let (sample, contigs) = &self.samples[idx];
-        let iter = contigs.iter().map(move |contig| {
-            let mut seq = self.decompressor.get_contig(sample, contig).unwrap();
-            seq.iter_mut().for_each(|b| *b = b"ACGT"[(*b as usize) % 4]);
-            seq
+        let iter = contigs.iter().flat_map(move |contig| {
+            let seq = self.decompressor.get_contig(sample, contig).unwrap();
+            seq.split(|&base| base >= 4)
+                .filter(|run| !run.is_empty())
+                .map(|run| run.iter().map(|&base| b"ACGT"[base as usize]).collect())
+                .collect::<Vec<_>>()
         });
         Some((idx, Box::new(iter)))
     }
