@@ -93,7 +93,7 @@ fn main() {
     }
     let output_path = output
         .clone()
-        .unwrap_or_else(|| input.with_extension("dedup.fa"));
+        .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
     let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
     let writer = &Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
     process(&args, reader, writer);
