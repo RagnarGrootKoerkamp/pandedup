@@ -79,7 +79,10 @@ fn main() {
             Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
         }
         "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
-        _ => panic!("Input file must be .agc or .tar.gz"),
+        "zst" => {
+            Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+        }
+        _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
     };
     let reader = reader.as_ref().get_ref();
 
@@ -549,5 +552,32 @@ impl InputReader for TarGzReader {
         }
 
         Some((idx, Box::new(contigs.into_iter())))
+    }
+}
+
+/// Read a single FASTA/FASTQ sample from a (possibly compressed) input stream.
+struct FastxReader {
+    reader: Mutex<Box<dyn needletail::FastxReader>>,
+    consumed: AtomicUsize,
+}
+
+impl FastxReader {
+    fn new(path: &str) -> Self {
+        let reader = needletail::parse_fastx_file(path).unwrap();
+        Self {
+            reader: Mutex::new(reader),
+            consumed: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl InputReader for FastxReader {
+    fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
+        let mut reader = self.reader.lock().unwrap();
+        let record = reader.next()?.unwrap();
+        let idx = self
+            .consumed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some((idx, Box::new(std::iter::once(record.seq().to_vec()))))
     }
 }
