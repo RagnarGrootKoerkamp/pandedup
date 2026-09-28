@@ -65,6 +65,7 @@ struct Stats {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     let Args {
         input,
@@ -75,7 +76,7 @@ fn main() {
         ..
     } = Args::parse();
 
-    eprintln!("k: {k}   w: {w}");
+    tracing::info!(k, w, "starting pandedup");
     // Open an archive
     let reader = match input.extension().unwrap().to_str().unwrap() {
         "agc" => {
@@ -112,10 +113,13 @@ fn main() {
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
-            scope.spawn(|| loop {
-                if process_sample(&args, reader, seen, global_stats, writer, &reference) == None {
-                    break;
-                };
+            scope.spawn(|| {
+                loop {
+                    if process_sample(&args, reader, seen, global_stats, writer, &reference) == None
+                    {
+                        break;
+                    };
+                }
             });
         }
     });
@@ -238,7 +242,7 @@ fn process_sample<W: Write>(
                 let (p, q, hash) = with_hash(p, q);
 
                 // if q + w < end_of_seen {
-                //     eprintln!("p {p} q {q} end_of_seen {end_of_seen}");
+                //     trace!("p {p} q {q} end_of_seen {end_of_seen}");
                 //     assert!(reference_map.unwrap().contains_key(&hash));
                 //     continue;
                 // }
@@ -260,7 +264,7 @@ fn process_sample<W: Write>(
                         i += 1;
                     }
                     end_of_seen = p + i;
-                    // eprintln!(
+                    // trace!(
                     //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
                     //     pos + q - p
                     // );
@@ -372,18 +376,18 @@ fn process_sample<W: Write>(
     }
 
     if build_reference {
-        eprintln!(
+        tracing::info!(
             "Reference vec: {:8.2} Mbp",
             build_reference_vec.len() as f32 / 1e6
         );
-        eprintln!(
+        tracing::info!(
             "Reference map: {:8.2} M phrases",
             build_reference_map.len() as f32 / 1e6
         );
         *reference.write().unwrap() = (build_reference_vec, build_reference_map);
     }
 
-    eprintln!(
+    tracing::debug!(
         "push sample {idx:>3} ({:3.1} Gbp {:3} ctg): \
                      read: {:5.2?}s minis: {:5.2?}s phrases: \
                      {:5.2?}s sort: {:5.2?}s lookups: {:5.2?}s sort: {:5.2?}s lock: {:5.2?}s output: {:5.2?}s",
@@ -402,34 +406,34 @@ fn process_sample<W: Write>(
     let mut global_stats = global_stats.lock().unwrap();
     *global_stats += local_stats;
 
-    eprintln!(
+    tracing::debug!(
         "  new bp:            {:>8.3} Mbp ({:3.1} bp/contig)",
         local_stats.output_bp as f32 / 1e6,
         local_stats.output_bp as f32 / local_stats.output_contigs as f32
     );
-    eprintln!(
+    tracing::debug!(
         "  new phrases:       {:>8.3} M   ({:3.1} /contig; {:4.1}%; {:4.1}% filtered away)",
         local_stats.unique_phrases as f32 / 1e6,
         local_stats.unique_phrases as f32 / local_stats.output_contigs as f32,
         local_stats.unique_phrases as f32 / local_stats.total_phrases as f32 * 100.0,
         local_stats.filtered_phrases as f32 / local_stats.total_phrases as f32 * 100.0,
     );
-    eprintln!(
+    tracing::debug!(
         "  unique phrases:    {:>8.3} M   ({:3.1}%)",
         global_stats.unique_phrases as f32 / 1e6,
         100.0 * global_stats.unique_phrases as f32 / global_stats.total_phrases as f32
     );
 
-    eprintln!(
+    tracing::debug!(
         "  num_contigs:       {:>8.3} M",
         global_stats.output_contigs as f32 / 1e6
     );
-    eprintln!(
+    tracing::debug!(
         "  output_bp:         {:>8.3} Gbp ({:3.1}%)",
         global_stats.output_bp as f32 / 1e9,
         100.0 * global_stats.output_bp as f32 / global_stats.input_bp as f32
     );
-    eprintln!();
+    tracing::debug!("");
 
     Some(())
 }
@@ -540,7 +544,7 @@ impl InputReader for TarGzReader {
                 continue;
             }
             let path = entry.header().path().unwrap();
-            eprintln!("Path: {}", path.display());
+            tracing::debug!(path = %path.display(), "reading archive entry");
             if path.extension().unwrap_or_default() != "gz" {
                 continue;
             }

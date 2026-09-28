@@ -1,5 +1,5 @@
 use super::*;
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::io::Cursor;
 
@@ -130,12 +130,13 @@ fn report_spectrum_failure(
 
 #[test]
 fn random_sequences_preserve_the_kmer_set() {
+    tracing_subscriber::fmt::init();
     let mut rng = StdRng::seed_from_u64(0x4d595df4d0f33173);
 
-    for &n in &[10, 30, 100, 1_000, 10_000] {
+    for &n in &[10, 30, 100, 300, 1_000, 3_000, 10_000] {
         eprintln!("n={n}");
         for &rate in &[0.1, 0.01, 0.001] {
-            for &c in &[1, 2, 5, 10, 100, 1000] {
+            for &c in &[1, 2, 5, 10, 30, 100, 300] {
                 let base: Vec<_> = (0..n).map(|_| b"ACGT"[rng.random_range(0..4)]).collect();
                 let mut sequences = Vec::new();
                 for _ in 0..c {
