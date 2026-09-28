@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+mod tests;
+
 fn hasher(seq: &[u8]) -> u128 {
     // const SEED: i64 = 1983274983247984327;
     // gxhash::gxhash128(seq, SEED)
@@ -109,30 +112,21 @@ fn main() {
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    if process_sample(&args, reader, seen, global_stats, writer, &reference) == None
-                    {
-                        break;
-                    };
-                }
+            scope.spawn(|| loop {
+                if process_sample(&args, reader, seen, global_stats, writer, &reference) == None {
+                    break;
+                };
             });
         }
     });
 }
 
-fn process_sample(
+fn process_sample<W: Write>(
     args: &Args,
     reader: &dyn InputReader,
     seen: &[RwLock<FxHashSet<u128>>; 256],
     global_stats: &Mutex<Stats>,
-    writer: &Mutex<
-        zstd::stream::AutoFinishEncoder<
-            '_,
-            BufWriter<std::fs::File>,
-            Box<dyn FnMut(Result<BufWriter<std::fs::File>, std::io::Error>) + Send>,
-        >,
-    >,
+    writer: &Mutex<W>,
     reference: &RwLock<(Vec<u8>, FxHashMap<u128, usize>)>,
 ) -> Option<()> {
     let Args {
