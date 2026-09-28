@@ -3,6 +3,9 @@ name = "pandedup"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
