@@ -7,7 +7,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     pin::Pin,
-    sync::{atomic::AtomicUsize, Mutex, RwLock},
+    sync::{Mutex, RwLock, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -109,10 +109,13 @@ fn main() {
     std::thread::scope(|scope| {
         let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
-            scope.spawn(|| loop {
-                if process_sample(&args, reader, seen, global_stats, writer, &reference) == None {
-                    break;
-                };
+            scope.spawn(|| {
+                loop {
+                    if process_sample(&args, reader, seen, global_stats, writer, &reference) == None
+                    {
+                        break;
+                    };
+                }
             });
         }
     });
@@ -211,63 +214,70 @@ fn process_sample(
             }
         };
 
-        // Prefix phrase.
-        if positions[0] > 0 {
-            phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
-        }
-        let mut end_of_seen = 0usize;
-        for &[p, q] in positions.array_windows::<2>() {
-            // Skip non-forward minimizer pairs.
-            if q < p {
-                continue;
-            }
-            let p = p as usize;
-            let q = (q as usize + k).min(seq.len());
-
+        if positions.is_empty() {
+            // A short contig can have no minimizers, but it should still be
+            // represented by one phrase covering the entire sequence.
             local_stats.total_phrases += 1;
-
-            // Add extra buffer so that coming up minimizers don't mess things up.
-            if q + w < end_of_seen {
-                local_stats.filtered_phrases += 1;
-                continue;
+            phrases.push(with_hash(0, seq.len()));
+        } else {
+            // Prefix phrase.
+            if positions[0] > 0 {
+                phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
             }
-
-            let (p, q, hash) = with_hash(p, q);
-
-            // if q + w < end_of_seen {
-            //     eprintln!("p {p} q {q} end_of_seen {end_of_seen}");
-            //     assert!(reference_map.unwrap().contains_key(&hash));
-            //     continue;
-            // }
-
-            if let Some(&pos) = reference_map.and_then(|map| map.get(&hash)) {
-                let ref_seq = reference_vec.as_ref().unwrap()[pos..].as_ref();
-                let seq = &seq[p..];
-                // hash was seen before at given `pos` in `reference_vec`.
-                // Linear scan to find the equal range, and skip it.
-                assert_eq!(
-                    &seq[..q - p],
-                    &ref_seq[..q - p],
-                    "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
-                    hasher(&seq[..q - p]),
-                    hasher(&ref_seq[..q - p])
-                );
-                let mut i = q - p;
-                while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
-                    i += 1;
+            let mut end_of_seen = 0usize;
+            for &[p, q] in positions.array_windows::<2>() {
+                // Skip non-forward minimizer pairs.
+                if q < p {
+                    continue;
                 }
-                end_of_seen = p + i;
-                // eprintln!(
-                //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
-                //     pos + q - p
-                // );
-            }
+                let p = p as usize;
+                let q = (q as usize + k).min(seq.len());
 
-            phrases.push((p, q, hash));
-        }
-        // Suffix phrase.
-        if (*positions.last().unwrap() as usize) + k < seq.len() {
-            phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
+                local_stats.total_phrases += 1;
+
+                // Add extra buffer so that coming up minimizers don't mess things up.
+                if q + w < end_of_seen {
+                    local_stats.filtered_phrases += 1;
+                    continue;
+                }
+
+                let (p, q, hash) = with_hash(p, q);
+
+                // if q + w < end_of_seen {
+                //     eprintln!("p {p} q {q} end_of_seen {end_of_seen}");
+                //     assert!(reference_map.unwrap().contains_key(&hash));
+                //     continue;
+                // }
+
+                if let Some(&pos) = reference_map.and_then(|map| map.get(&hash)) {
+                    let ref_seq = reference_vec.as_ref().unwrap()[pos..].as_ref();
+                    let seq = &seq[p..];
+                    // hash was seen before at given `pos` in `reference_vec`.
+                    // Linear scan to find the equal range, and skip it.
+                    assert_eq!(
+                        &seq[..q - p],
+                        &ref_seq[..q - p],
+                        "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
+                        hasher(&seq[..q - p]),
+                        hasher(&ref_seq[..q - p])
+                    );
+                    let mut i = q - p;
+                    while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
+                        i += 1;
+                    }
+                    end_of_seen = p + i;
+                    // eprintln!(
+                    //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
+                    //     pos + q - p
+                    // );
+                }
+
+                phrases.push((p, q, hash));
+            }
+            // Suffix phrase.
+            if (*positions.last().unwrap() as usize) + k < seq.len() {
+                phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
+            }
         }
 
         let i_phrases = std::time::Instant::now();
