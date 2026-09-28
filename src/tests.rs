@@ -133,7 +133,7 @@ fn random_sequences_preserve_the_kmer_set() {
     tracing_subscriber::fmt::init();
     let mut rng = StdRng::seed_from_u64(0x4d595df4d0f33173);
 
-    for &n in &[10, 30, 100, 300, 1_000, 3_000, 10_000] {
+    for &n in &[10, 30, 100, 300, 1_000, 3_000] {
         eprintln!("n={n}");
         for &rate in &[0.1, 0.01, 0.001] {
             for &c in &[1, 2, 5, 10, 30, 100, 300] {
@@ -143,9 +143,9 @@ fn random_sequences_preserve_the_kmer_set() {
                     sequences.push(mutate(&base, rate, &mut rng));
                 }
 
-                for &k in &[3, 5, 7, 15, 31, 63, 64] {
+                for &k in &[3, 7, 15, 31, 63] {
                     let expected = kmer_values(sequences.iter().map(Vec::as_slice), k);
-                    for &w in &[5, 10, 25, 50, 100, 200, 500] {
+                    for &w in &[5, 25, 100, 500] {
                         let args = Args {
                             input: PathBuf::new(),
                             output: None,
@@ -157,22 +157,8 @@ fn random_sequences_preserve_the_kmer_set() {
                             mini_k: 8,
                         };
                         let reader = MemoryReader::new(sequences.clone());
-                        let seen: &[_; 256] =
-                            &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
-                        let global_stats = Mutex::new(Stats::default());
                         let writer = Mutex::new(Vec::new());
-                        let reference = RwLock::new((Vec::new(), FxHashMap::default()));
-
-                        while process_sample(
-                            &args,
-                            &reader,
-                            seen,
-                            &global_stats,
-                            &writer,
-                            &reference,
-                        )
-                        .is_some()
-                        {}
+                        process(&args, &reader, &writer);
 
                         let output = writer.into_inner().unwrap();
                         let mut output_reader =

@@ -67,16 +67,10 @@ struct Stats {
 fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let Args {
-        input,
-        output,
-        k,
-        w,
-        threads,
-        ..
-    } = Args::parse();
+    let input = &args.input;
+    let output = &args.output;
 
-    tracing::info!(k, w, "starting pandedup");
+    tracing::info!(k = args.k, w = args.w, "starting pandedup");
     // Open an archive
     let reader = match input.extension().unwrap().to_str().unwrap() {
         "agc" => {
@@ -97,25 +91,30 @@ fn main() {
             "Output file must have .zst extension"
         );
     }
-    let output_path = output.unwrap_or_else(|| input.with_extension("dedup.fa"));
+    let output_path = output
+        .clone()
+        .unwrap_or_else(|| input.with_extension("dedup.fa"));
     let buf_writer = BufWriter::with_capacity(1 << 20, std::fs::File::create(output_path).unwrap());
     let writer = &Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-    let global_stats = &Mutex::new(Stats::default());
+    process(&args, reader, writer);
+}
 
+fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mutex<W>) {
+    let global_stats = &Mutex::new(Stats::default());
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
+    let reference = RwLock::new((vec![], FxHashMap::default()));
 
     // Process the first/reference sample separately.
-    let reference = RwLock::new((vec![], FxHashMap::default()));
     if args.reference {
-        process_sample(&args, reader, seen, global_stats, writer, &reference);
+        process_sample(args, reader, seen, global_stats, writer, &reference);
     }
 
     std::thread::scope(|scope| {
-        let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
+        let threads = args.threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
             scope.spawn(|| {
                 loop {
-                    if process_sample(&args, reader, seen, global_stats, writer, &reference) == None
+                    if process_sample(args, reader, seen, global_stats, writer, &reference) == None
                     {
                         break;
                     };
