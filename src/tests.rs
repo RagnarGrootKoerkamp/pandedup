@@ -3,6 +3,43 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::io::Cursor;
 
+#[test]
+fn split_contigs_on_ambiguous_bases() {
+    let mut contig = Vec::from(b"NacGTnRYACGTN");
+    assert_eq!(
+        split_contig(&mut contig),
+        [b"ACGT".to_vec(), b"ACGT".to_vec()]
+    );
+    let mut contig = Vec::from(b"NNRY");
+    assert!(split_contig(&mut contig).is_empty());
+}
+
+#[test]
+fn processing_does_not_join_across_ambiguous_bases() {
+    let args = Args {
+        input: PathBuf::new(),
+        output: None,
+        k: 3,
+        w: 8,
+        threads: Some(1),
+        reference: false,
+        canonical: false,
+        mini_k: 8,
+    };
+    let reader = MemoryReader::new(vec![b"ACGNNttgc".to_vec()]);
+    let writer = Mutex::new(Vec::new());
+    process(&args, &reader, &writer);
+
+    let mut output_reader =
+        needletail::parse_fastx_reader(Cursor::new(writer.into_inner().unwrap())).unwrap();
+    let mut output = Vec::new();
+    while let Some(record) = output_reader.next() {
+        output.push(record.unwrap().seq().into_owned());
+    }
+    output.sort();
+    assert_eq!(output, [b"ACG".to_vec(), b"TTGC".to_vec()]);
+}
+
 struct MemoryReader {
     sequences: Mutex<Vec<Vec<u8>>>,
     idx: AtomicUsize,

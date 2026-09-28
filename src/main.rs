@@ -163,215 +163,219 @@ fn process_sample<W: Write>(
     let mut build_reference_map: FxHashMap<u128, usize> = FxHashMap::default();
 
     let mut input_contigs = 0;
-    for seq in contigs {
-        input_contigs += 1;
-        let i_start = std::time::Instant::now();
 
-        local_stats.input_bp += seq.len();
+    for mut contig in contigs {
+        for seq in split_contig(&mut contig) {
+            input_contigs += 1;
+            let i_start = std::time::Instant::now();
 
-        let i_read = std::time::Instant::now();
-        t_read += i_read - i_start;
+            local_stats.input_bp += seq.len();
 
-        let mut positions = vec![];
+            let i_read = std::time::Instant::now();
+            t_read += i_read - i_start;
 
-        let nthasher = AntiLexHasher::<false>::new(mini_k);
-        if canonical {
-            simd_minimizers::canonical_minimizers(mini_k, w).run(AsciiSeq(&seq), &mut positions);
-        } else {
-            // let scheme = simd_minimizers::closed_syncmers(k, w);
-            // let scheme = simd_minimizers::minimizers(k, w);
-            // Either::Right(simd_minimizers::minimizers(mini_k, w))
-            simd_minimizers::minimizers(mini_k, w)
-                .hasher(&nthasher)
-                .run(AsciiSeq(&seq), &mut positions);
-        };
+            let mut positions = vec![];
 
-        let i_minis = std::time::Instant::now();
-        t_minis += i_minis - i_read;
-
-        let rc_seq: Vec<_> = if canonical {
-            let mut rc_seq = vec![];
-            rc_seq.extend(seq.iter().rev().map(|bp| 3 - bp));
-            rc_seq
-        } else {
-            vec![]
-        };
-
-        let mut phrases = vec![];
-
-        let with_hash = |p, q| {
-            let phrase = &seq[p..q];
-            let hash = hasher(phrase);
+            let nthasher = AntiLexHasher::<false>::new(mini_k);
             if canonical {
-                let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
-                let rc_hash = hasher(rc_phrase);
-                (p, q, hash + rc_hash)
+                simd_minimizers::canonical_minimizers(mini_k, w)
+                    .run(AsciiSeq(&seq), &mut positions);
             } else {
-                (p, q, hash)
-            }
-        };
+                // let scheme = simd_minimizers::closed_syncmers(k, w);
+                // let scheme = simd_minimizers::minimizers(k, w);
+                // Either::Right(simd_minimizers::minimizers(mini_k, w))
+                simd_minimizers::minimizers(mini_k, w)
+                    .hasher(&nthasher)
+                    .run(AsciiSeq(&seq), &mut positions);
+            };
 
-        if positions.is_empty() {
-            // A short contig can have no minimizers, but it should still be
-            // represented by one phrase covering the entire sequence.
-            local_stats.total_phrases += 1;
-            phrases.push(with_hash(0, seq.len()));
-        } else {
-            // Prefix phrase.
-            if positions[0] > 0 {
-                phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
-            }
-            let mut end_of_seen = 0usize;
-            for &[p, q] in positions.array_windows::<2>() {
-                // Skip non-forward minimizer pairs.
-                if q < p {
-                    continue;
+            let i_minis = std::time::Instant::now();
+            t_minis += i_minis - i_read;
+
+            let rc_seq: Vec<_> = if canonical {
+                let mut rc_seq = vec![];
+                rc_seq.extend(seq.iter().rev().map(|bp| 3 - bp));
+                rc_seq
+            } else {
+                vec![]
+            };
+
+            let mut phrases = vec![];
+
+            let with_hash = |p, q| {
+                let phrase = &seq[p..q];
+                let hash = hasher(phrase);
+                if canonical {
+                    let rc_phrase = &rc_seq[seq.len() - q..seq.len() - p];
+                    let rc_hash = hasher(rc_phrase);
+                    (p, q, hash + rc_hash)
+                } else {
+                    (p, q, hash)
                 }
-                let p = p as usize;
-                let q = (q as usize + k).min(seq.len());
+            };
 
+            if positions.is_empty() {
+                // A short contig can have no minimizers, but it should still be
+                // represented by one phrase covering the entire sequence.
                 local_stats.total_phrases += 1;
+                phrases.push(with_hash(0, seq.len()));
+            } else {
+                // Prefix phrase.
+                if positions[0] > 0 {
+                    phrases.push(with_hash(0, (positions[0] as usize + k).min(seq.len())));
+                }
+                let mut end_of_seen = 0usize;
+                for &[p, q] in positions.array_windows::<2>() {
+                    // Skip non-forward minimizer pairs.
+                    if q < p {
+                        continue;
+                    }
+                    let p = p as usize;
+                    let q = (q as usize + k).min(seq.len());
 
-                // Add extra buffer so that coming up minimizers don't mess things up.
-                if q + w < end_of_seen {
-                    local_stats.filtered_phrases += 1;
+                    local_stats.total_phrases += 1;
+
+                    // Add extra buffer so that coming up minimizers don't mess things up.
+                    if q + w < end_of_seen {
+                        local_stats.filtered_phrases += 1;
+                        continue;
+                    }
+
+                    let (p, q, hash) = with_hash(p, q);
+
+                    // if q + w < end_of_seen {
+                    //     trace!("p {p} q {q} end_of_seen {end_of_seen}");
+                    //     assert!(reference_map.unwrap().contains_key(&hash));
+                    //     continue;
+                    // }
+
+                    if let Some(&pos) = reference_map.and_then(|map| map.get(&hash)) {
+                        let ref_seq = reference_vec.as_ref().unwrap()[pos..].as_ref();
+                        let seq = &seq[p..];
+                        // hash was seen before at given `pos` in `reference_vec`.
+                        // Linear scan to find the equal range, and skip it.
+                        assert_eq!(
+                            &seq[..q - p],
+                            &ref_seq[..q - p],
+                            "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
+                            hasher(&seq[..q - p]),
+                            hasher(&ref_seq[..q - p])
+                        );
+                        let mut i = q - p;
+                        while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
+                            i += 1;
+                        }
+                        end_of_seen = p + i;
+                        // trace!(
+                        //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
+                        //     pos + q - p
+                        // );
+                    }
+
+                    phrases.push((p, q, hash));
+                }
+                // Suffix phrase.
+                if (*positions.last().unwrap() as usize) + k < seq.len() {
+                    phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
+                }
+            }
+
+            let i_phrases = std::time::Instant::now();
+            t_phrases += i_phrases - i_minis;
+
+            let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
+            for (i, p) in phrases.iter().enumerate() {
+                let part = p.2 as u8;
+                order[part as usize].push(i as u32);
+            }
+            let i_sort = std::time::Instant::now();
+            t_sort += i_sort - i_phrases;
+
+            for part in 0..=255 {
+                if order[part as usize].is_empty() {
                     continue;
                 }
 
-                let (p, q, hash) = with_hash(p, q);
-
-                // if q + w < end_of_seen {
-                //     trace!("p {p} q {q} end_of_seen {end_of_seen}");
-                //     assert!(reference_map.unwrap().contains_key(&hash));
-                //     continue;
-                // }
-
-                if let Some(&pos) = reference_map.and_then(|map| map.get(&hash)) {
-                    let ref_seq = reference_vec.as_ref().unwrap()[pos..].as_ref();
-                    let seq = &seq[p..];
-                    // hash was seen before at given `pos` in `reference_vec`.
-                    // Linear scan to find the equal range, and skip it.
-                    assert_eq!(
-                        &seq[..q - p],
-                        &ref_seq[..q - p],
-                        "UNEQUAL RANGES with hashes {} and {} (baseline {hash})",
-                        hasher(&seq[..q - p]),
-                        hasher(&ref_seq[..q - p])
-                    );
-                    let mut i = q - p;
-                    while i < seq.len().min(ref_seq.len()) && seq[i] == ref_seq[i] {
-                        i += 1;
-                    }
-                    end_of_seen = p + i;
-                    // trace!(
-                    //     "Saw hash of {p}..{q} before at {pos}..{}; extend to {end_of_seen}",
-                    //     pos + q - p
-                    // );
-                }
-
-                phrases.push((p, q, hash));
-            }
-            // Suffix phrase.
-            if (*positions.last().unwrap() as usize) + k < seq.len() {
-                phrases.push(with_hash(*positions.last().unwrap() as usize, seq.len()));
-            }
-        }
-
-        let i_phrases = std::time::Instant::now();
-        t_phrases += i_phrases - i_minis;
-
-        let mut order = (0..256).map(|_| vec![]).collect::<Vec<_>>();
-        for (i, p) in phrases.iter().enumerate() {
-            let part = p.2 as u8;
-            order[part as usize].push(i as u32);
-        }
-        let i_sort = std::time::Instant::now();
-        t_sort += i_sort - i_phrases;
-
-        for part in 0..=255 {
-            if order[part as usize].is_empty() {
-                continue;
-            }
-
-            // Read-only filter phase
-            {
-                let seen = seen[part as usize].read().unwrap();
-                for &idx in &order[part as usize] {
-                    let (p, _q, hash) = &mut phrases[idx as usize];
-                    assert!(*hash as u8 == part);
-                    if seen.contains(hash) {
-                        *p = usize::MAX;
-                    }
-                }
-            }
-
-            // Try to write missing
-            {
-                let mut seen = seen[part as usize].write().unwrap();
-                for &idx in &order[part as usize] {
-                    let (p, _q, hash) = &mut phrases[idx as usize];
-                    if *p != usize::MAX {
-                        if !seen.insert(*hash) {
+                // Read-only filter phase
+                {
+                    let seen = seen[part as usize].read().unwrap();
+                    for &idx in &order[part as usize] {
+                        let (p, _q, hash) = &mut phrases[idx as usize];
+                        assert!(*hash as u8 == part);
+                        if seen.contains(hash) {
                             *p = usize::MAX;
                         }
                     }
                 }
-            }
-        }
-        let i_lookups = std::time::Instant::now();
-        t_lookups += i_lookups - i_sort;
 
-        phrases.retain(|(p, _q, _hash)| *p != usize::MAX);
-        local_stats.unique_phrases += phrases.len();
-
-        let i_sort2 = std::time::Instant::now();
-        t_sort2 += i_sort2 - i_lookups;
-
-        // Write new contigs.
-        let mut writer = writer.lock().unwrap();
-        let i_lock = std::time::Instant::now();
-        t_lock += i_lock - i_sort2;
-
-        // Output contigs
-
-        let mut active = 0..0;
-
-        let mut push = |range: Range<usize>| -> usize {
-            assert!(range.start >= active.start);
-            if range.start <= active.end {
-                // End can decrease for non-forward canonical minimizers.
-                active.end = active.end.max(range.end);
-            } else {
-                writer.write_all(b">\n").unwrap();
-                writer.write_all(&seq[active.clone()]).unwrap();
-                writer.write_all(b"\n").unwrap();
-
-                if build_reference {
-                    build_reference_vec.extend_from_slice(&seq[active.clone()]);
-                    build_reference_vec.push(b'\n');
+                // Try to write missing
+                {
+                    let mut seen = seen[part as usize].write().unwrap();
+                    for &idx in &order[part as usize] {
+                        let (p, _q, hash) = &mut phrases[idx as usize];
+                        if *p != usize::MAX {
+                            if !seen.insert(*hash) {
+                                *p = usize::MAX;
+                            }
+                        }
+                    }
                 }
-
-                local_stats.output_contigs += 1;
-                local_stats.output_bp += active.len();
-
-                active = range.clone();
             }
-            let ref_pos = build_reference_vec.len() + range.start - active.start;
-            ref_pos
-        };
+            let i_lookups = std::time::Instant::now();
+            t_lookups += i_lookups - i_sort;
 
-        // Emit the phrases.
-        for (p, q, hash) in phrases {
-            let pos = push(p..q);
-            if build_reference {
-                assert!(build_reference_map.insert(hash, pos).is_none());
+            phrases.retain(|(p, _q, _hash)| *p != usize::MAX);
+            local_stats.unique_phrases += phrases.len();
+
+            let i_sort2 = std::time::Instant::now();
+            t_sort2 += i_sort2 - i_lookups;
+
+            // Write new contigs.
+            let mut writer = writer.lock().unwrap();
+            let i_lock = std::time::Instant::now();
+            t_lock += i_lock - i_sort2;
+
+            // Output contigs
+
+            let mut active = 0..0;
+
+            let mut push = |range: Range<usize>| -> usize {
+                assert!(range.start >= active.start);
+                if range.start <= active.end {
+                    // End can decrease for non-forward canonical minimizers.
+                    active.end = active.end.max(range.end);
+                } else {
+                    writer.write_all(b">\n").unwrap();
+                    writer.write_all(&seq[active.clone()]).unwrap();
+                    writer.write_all(b"\n").unwrap();
+
+                    if build_reference {
+                        build_reference_vec.extend_from_slice(&seq[active.clone()]);
+                        build_reference_vec.push(b'\n');
+                    }
+
+                    local_stats.output_contigs += 1;
+                    local_stats.output_bp += active.len();
+
+                    active = range.clone();
+                }
+                let ref_pos = build_reference_vec.len() + range.start - active.start;
+                ref_pos
+            };
+
+            // Emit the phrases.
+            for (p, q, hash) in phrases {
+                let pos = push(p..q);
+                if build_reference {
+                    assert!(build_reference_map.insert(hash, pos).is_none());
+                }
             }
+            push(usize::MAX..usize::MAX);
+            assert!(active.len() == 0);
+
+            let i_output = std::time::Instant::now();
+            t_output += i_output - i_lock;
         }
-        push(usize::MAX..usize::MAX);
-        assert!(active.len() == 0);
-
-        let i_output = std::time::Instant::now();
-        t_output += i_output - i_lock;
     }
 
     if build_reference {
@@ -437,8 +441,17 @@ fn process_sample<W: Write>(
     Some(())
 }
 
+fn split_contig(seq: &mut [u8]) -> Vec<&[u8]> {
+    // uppercase
+    seq.iter_mut().for_each(|base| *base &= !(b'a' ^ b'A'));
+    // split
+    seq.split(|&base| base != b"ACTG"[(base as usize >> 1) & 3])
+        .filter(|run| !run.is_empty())
+        .collect()
+}
+
 trait InputReader: Send + Sync {
-    /// Return sample idx and iterator over unambiguous A/C/G/T runs.
+    /// Return sample idx and iterator over contigs with ASCII bases.
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)>;
 }
 
@@ -476,12 +489,11 @@ impl InputReader for AgcReader {
             return None;
         }
         let (sample, contigs) = &self.samples[idx];
-        let iter = contigs.iter().flat_map(move |contig| {
-            let seq = self.decompressor.get_contig(sample, contig).unwrap();
-            seq.split(|&base| base >= 4)
-                .filter(|run| !run.is_empty())
-                .map(|run| run.iter().map(|&base| b"ACGT"[base as usize]).collect())
-                .collect::<Vec<_>>()
+        let iter = contigs.iter().map(move |contig| {
+            let mut seq = self.decompressor.get_contig(sample, contig).unwrap();
+            seq.iter_mut()
+                .for_each(|base| *base = b"ACGT".get(*base as usize).copied().unwrap_or(b'N'));
+            seq
         });
         Some((idx, Box::new(iter)))
     }
