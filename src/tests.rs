@@ -25,10 +25,11 @@ fn processing_does_not_join_across_ambiguous_bases() {
         reference: false,
         canonical: false,
         mini_k: 8,
+        ggcat: false,
     };
     let reader = MemoryReader::new(vec![b"ACGNNttgc".to_vec()]);
     let writer = Mutex::new(Vec::new());
-    process(&args, &reader, &writer);
+    process(&args, &reader, &writer, None);
 
     let mut output_reader =
         needletail::parse_fastx_reader(Cursor::new(writer.into_inner().unwrap())).unwrap();
@@ -231,10 +232,11 @@ fn random_sequences_preserve_the_kmer_set() {
                                         reference,
                                         canonical,
                                         mini_k: 8,
+                                        ggcat: false,
                                     };
                                     let reader = MemoryReader::new(sequences.clone());
                                     let writer = Mutex::new(Vec::new());
-                                    process(&args, &reader, &writer);
+                                    process(&args, &reader, &writer, None);
 
                                     let output = writer.into_inner().unwrap();
                                     let mut output_reader =
