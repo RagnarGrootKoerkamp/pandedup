@@ -345,17 +345,19 @@ fn process_sample<W: Write>(
                     // End can decrease for non-forward canonical minimizers.
                     active.end = active.end.max(range.end);
                 } else {
-                    writer.write_all(b">\n").unwrap();
-                    writer.write_all(&seq[active.clone()]).unwrap();
-                    writer.write_all(b"\n").unwrap();
+                    if active.len() > 0 {
+                        writer.write_all(b">\n").unwrap();
+                        writer.write_all(&seq[active.clone()]).unwrap();
+                        writer.write_all(b"\n").unwrap();
 
-                    if build_reference {
-                        build_reference_vec.extend_from_slice(&seq[active.clone()]);
-                        build_reference_vec.push(b'\n');
+                        if build_reference {
+                            build_reference_vec.extend_from_slice(&seq[active.clone()]);
+                            build_reference_vec.push(b'\n');
+                        }
+
+                        local_stats.output_contigs += 1;
+                        local_stats.output_bp += active.len();
                     }
-
-                    local_stats.output_contigs += 1;
-                    local_stats.output_bp += active.len();
 
                     active = range.clone();
                 }
