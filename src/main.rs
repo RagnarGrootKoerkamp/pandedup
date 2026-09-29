@@ -45,7 +45,7 @@ struct Args {
     #[clap(long="no-reference", default_value_t = true, action = clap::ArgAction::SetFalse)]
     reference: bool,
 
-    /// Dedup across reverse-complements. Not well-tested.
+    /// Dedup across reverse-complements.
     #[clap(long)]
     canonical: bool,
 
