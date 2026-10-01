@@ -3,7 +3,7 @@ use ggcat_api::{
     DnaSequence, DnaSequencesFileType, DynamicSequencesStream, ExtraElaboration, GGCATConfig,
     GGCATInstance, GeneralSequenceBlockData, MessageLevel, SequenceInfo,
 };
-use std::{path::Path, sync::Arc};
+use std::{io::Write, path::Path, sync::Arc};
 
 struct InMemorySequences {
     blocks: Vec<Vec<Vec<u8>>>,
@@ -78,6 +78,8 @@ impl DynamicSequencesStream for InMemorySequences {
 }
 
 pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
+    let (short_sequences, sequences): (Vec<_>, Vec<_>) =
+        sequences.into_iter().partition(|sequence| sequence.len() < args.k);
     let input = Arc::new(InMemorySequences::new(sequences));
     let input_bases: u64 = input.bases.iter().sum();
     let input_contigs: usize = input.blocks.iter().map(Vec::len).sum();
@@ -125,22 +127,38 @@ pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
             })
             .collect();
         let timing = crate::timing::StageTiming::start();
-        let output = ggcat
-            .build_graph(
-                blocks,
-                output,
-                None,
-                args.k,
-                threads,
-                /* forward_only */
-                false,
-                None,
-                false,
-                1,
-                elaboration,
-                None,
-            )
-            .unwrap_or_else(|error| panic!("GGCAT {label} failed: {error:#}"));
+        let output = if input_contigs == 0 {
+            std::fs::File::create(&output).expect("failed to create GGCAT output");
+            output
+        } else {
+            ggcat
+                .build_graph(
+                    blocks,
+                    output,
+                    None,
+                    args.k,
+                    threads,
+                    /* forward_only */
+                    false,
+                    None,
+                    false,
+                    1,
+                    elaboration,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("GGCAT {label} failed: {error:#}"))
+        };
+        if !short_sequences.is_empty() {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&output)
+                .expect("failed to open GGCAT output for short contigs");
+            for (index, sequence) in short_sequences.iter().enumerate() {
+                writeln!(file, ">pandedup-short-{index}").unwrap();
+                file.write_all(sequence).unwrap();
+                file.write_all(b"\n").unwrap();
+            }
+        }
         println!(
             "ggcat {label}: {}, {} bytes ({})",
             timing.finish(),
