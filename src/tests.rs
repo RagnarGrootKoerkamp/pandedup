@@ -26,6 +26,7 @@ fn processing_does_not_join_across_ambiguous_bases() {
         canonical: false,
         mini_k: 8,
         ggcat: false,
+        skip: false,
     };
     let reader = MemoryReader::new(vec![b"ACGNNttgc".to_vec()]);
     let writer = Mutex::new(Vec::new());
@@ -233,6 +234,7 @@ fn random_sequences_preserve_the_kmer_set() {
                                         canonical,
                                         mini_k: 8,
                                         ggcat: false,
+                                        skip: false,
                                     };
                                     let reader = MemoryReader::new(sequences.clone());
                                     let writer = Mutex::new(Vec::new());

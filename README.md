@@ -41,6 +41,9 @@ RAM to hold them alongside GGCAT's working data. It writes one uncompressed
 `.fa` file per mode next to the `.fa.zst` output, named like
 `hprcv2.spss.k64.ggcat-greedy-matchtigs.fa`. The command prints elapsed time
 and byte size for the input, deduplicated output, and each GGCAT output.
+Add `--skip` to reuse the deduplicated output when it already exists. When
+combined with `--ggcat`, the existing compressed FASTA is read and passed to
+GGCAT.
 
 Decreasing `w` gives a smaller output, but requires inversely more memory.
 Reducing the number of threads helps to reduce overall memory usage, as

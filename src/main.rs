@@ -58,6 +58,9 @@ struct Args {
     /// Run GGCAT on the deduplicated contigs with every elaboration mode.
     #[clap(long)]
     ggcat: bool,
+    /// Reuse the output file if it already exists.
+    #[clap(long)]
+    skip: bool,
 }
 
 #[derive(Default, Clone, Copy, derive_more::AddAssign)]
@@ -77,19 +80,6 @@ fn main() {
     let output = &args.output;
 
     tracing::info!(k = args.k, w = args.w, "starting pandedup");
-    // Open an archive
-    let reader = match input.extension().unwrap().to_str().unwrap() {
-        "agc" => {
-            Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-        }
-        "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
-        "zst" => {
-            Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-        }
-        _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
-    };
-    let reader = reader.as_ref().get_ref();
-
     // TODO: zstd output
     if let Some(output) = &output {
         assert!(
@@ -101,12 +91,29 @@ fn main() {
         .clone()
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
     let timing = timing::StageTiming::start();
-    let ggcat_input = args.ggcat.then(|| Mutex::new(Vec::new()));
-    let buf_writer =
-        BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
-    let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-    process(&args, reader, &writer, ggcat_input.as_ref());
-    drop(writer);
+    let reused_output = args.skip && output_path.exists();
+    let ggcat_input = if reused_output {
+        args.ggcat.then(|| read_fastx_sequences(&output_path))
+    } else {
+        // Open the input archive only when generating the output.
+        let reader = match input.extension().unwrap().to_str().unwrap() {
+            "agc" => {
+                Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+            }
+            "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
+            "zst" => {
+                Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+            }
+            _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
+        };
+        let ggcat_input = args.ggcat.then(|| Mutex::new(Vec::new()));
+        let buf_writer =
+            BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
+        let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
+        process(&args, reader.as_ref().get_ref(), &writer, ggcat_input.as_ref());
+        drop(writer);
+        ggcat_input.map(|input| input.into_inner().unwrap())
+    };
     println!(
         "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
         timing.finish(),
@@ -115,8 +122,17 @@ fn main() {
         output_path.display()
     );
     if let Some(ggcat_input) = ggcat_input {
-        ggcat::run(&args, &output_path, ggcat_input.into_inner().unwrap());
+        ggcat::run(&args, &output_path, ggcat_input);
     }
+}
+
+fn read_fastx_sequences(path: &std::path::Path) -> Vec<Vec<u8>> {
+    let mut reader = needletail::parse_fastx_file(path).unwrap();
+    let mut sequences = Vec::new();
+    while let Some(record) = reader.next() {
+        sequences.push(record.unwrap().seq().into_owned());
+    }
+    sequences
 }
 
 fn process<W: Write + Send>(
