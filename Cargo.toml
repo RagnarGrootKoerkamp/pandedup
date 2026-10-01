@@ -26,6 +26,7 @@ tar = "0.4.46"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 zstd = "0.13.3"
 ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", default-features = false, features = ["hash-16bit", "hash-32bit", "hash-64bit", "hash-128bit", "hash-rkarp", "hash-forward"] }
+perfcnt = "0.8.0"
 
 
 [patch.crates-io]

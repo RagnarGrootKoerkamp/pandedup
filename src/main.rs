@@ -2,6 +2,7 @@ use clap::Parser;
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 mod ggcat;
+mod timing;
 use std::{
     io::{BufWriter, Read, Write},
     marker::PhantomPinned,
@@ -9,7 +10,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Mutex, RwLock, atomic::AtomicUsize},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -99,7 +100,7 @@ fn main() {
     let output_path = output
         .clone()
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
-    let start = Instant::now();
+    let timing = timing::StageTiming::start();
     let ggcat_input = args.ggcat.then(|| Mutex::new(Vec::new()));
     let buf_writer =
         BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
@@ -107,8 +108,8 @@ fn main() {
     process(&args, reader, &writer, ggcat_input.as_ref());
     drop(writer);
     println!(
-        "pandedup: {:.2?}, input {} bytes, deduplicated {} bytes ({})",
-        start.elapsed(),
+        "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
+        timing.finish(),
         std::fs::metadata(input).unwrap().len(),
         std::fs::metadata(&output_path).unwrap().len(),
         output_path.display()

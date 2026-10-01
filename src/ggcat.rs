@@ -3,7 +3,7 @@ use ggcat_api::{
     DnaSequence, DnaSequencesFileType, DynamicSequencesStream, ExtraElaboration, GGCATConfig,
     GGCATInstance, GeneralSequenceBlockData, MessageLevel, SequenceInfo,
 };
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc};
 
 struct InMemorySequences {
     blocks: Vec<Vec<Vec<u8>>>,
@@ -108,7 +108,7 @@ pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
 
     for (label, elaboration) in [
         ("none", ExtraElaboration::None),
-        ("unitig-links", ExtraElaboration::UnitigLinks),
+        // ("unitig-links", ExtraElaboration::UnitigLinks),
         ("simplitigs", ExtraElaboration::FastSimplitigs),
         ("eulertigs", ExtraElaboration::FastEulertigs),
         ("greedy-matchtigs", ExtraElaboration::GreedyMatchtigs),
@@ -124,7 +124,7 @@ pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
                 ))
             })
             .collect();
-        let start = Instant::now();
+        let timing = crate::timing::StageTiming::start();
         let output = ggcat
             .build_graph(
                 blocks,
@@ -142,8 +142,8 @@ pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
             )
             .unwrap_or_else(|error| panic!("GGCAT {label} failed: {error:#}"));
         println!(
-            "ggcat {label}: {:.2?}, {} bytes ({})",
-            start.elapsed(),
+            "ggcat {label}: {}, {} bytes ({})",
+            timing.finish(),
             std::fs::metadata(&output).unwrap().len(),
             output.display()
         );
