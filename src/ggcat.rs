@@ -1,3 +1,4 @@
+//! FIXME This is vibe-coded and needs cleanup and/or checking!
 use crate::Args;
 use ggcat_api::{
     DnaSequence, DnaSequencesFileType, DynamicSequencesStream, ExtraElaboration, GGCATConfig,
