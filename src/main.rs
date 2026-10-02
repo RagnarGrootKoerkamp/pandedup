@@ -110,16 +110,20 @@ fn main() {
                 Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
             }
             "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
-            "zst" => {
-                Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-            }
+            "zst" => Box::pin(FastxReader::new(&args.input.to_string_lossy()))
+                as Pin<Box<dyn InputReader>>,
             _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
         };
         let ggcat_input = args.ggcat.then(|| Mutex::new(Vec::new()));
         let buf_writer =
             BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
         let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-        process(&args, reader.as_ref().get_ref(), &writer, ggcat_input.as_ref());
+        process(
+            &args,
+            reader.as_ref().get_ref(),
+            &writer,
+            ggcat_input.as_ref(),
+        );
         drop(writer);
         ggcat_input.map(|input| input.into_inner().unwrap())
     };
