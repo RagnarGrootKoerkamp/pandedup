@@ -79,7 +79,8 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         });
     }
 
-    let mut merged = 0;
+    let mut total_merged = 0;
+    let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
 
     for overlap in (0..=k - 1).rev() {
         info!("overlap: {}", overlap);
@@ -116,6 +117,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         info!("merging..");
         let mut i = 0;
         let mut j = 0;
+        let mut merged = 0;
         while i < heads.len() && j < tails.len() {
             let head_kmer = heads[i].key;
             let head_idx = heads[i].index;
@@ -134,7 +136,13 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                 j += 1;
             }
         }
-        info!("merged {:>9} remaining {}", merged, ends.len() - merged);
+        total_merged += merged;
+        total_len -= merged * overlap;
+        info!(
+            "overlap {overlap} merged {:>9} total merged {total_merged:>9} remaining {:>9} total len {total_len:>11}",
+            total_merged,
+            ends.len() - merged
+        );
     }
     // TODO break cycles
 
