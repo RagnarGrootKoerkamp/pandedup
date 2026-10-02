@@ -219,8 +219,7 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
     }
     info!("sorting {} heads..", heads.len());
     heads.voracious_mt_sort(threads);
-    let mut head_scratch = Vec::with_capacity(heads.len());
-    let mut tail_scratch = Vec::with_capacity(tails.len());
+    let mut scratch = Vec::with_capacity(heads.len());
 
     let mut marked_heads = 0;
     let mut marked_tails = 0;
@@ -229,7 +228,7 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
         debug!("overlap: {}", overlap);
         let tail_shift = 2 * (k - overlap);
         if overlap < first_overlap {
-            resort_heads(&mut heads, &mut head_scratch, overlap, threads);
+            resort_heads(&mut heads, &mut scratch, overlap, threads);
         }
 
         debug!("merging..");
@@ -387,9 +386,9 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
         drop(shards);
         marked_heads += newly_marked_heads;
         marked_tails += newly_marked_tails;
-        for (entries, scratch, marked) in [
-            (&mut heads, &mut head_scratch, &mut marked_heads),
-            (&mut tails, &mut tail_scratch, &mut marked_tails),
+        for (entries, marked) in [
+            (&mut heads, &mut marked_heads),
+            (&mut tails, &mut marked_tails),
         ] {
             // Only filter out dead entries if that's more than half of them.
             if *marked > entries.len() / 2 {
@@ -432,7 +431,7 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
                         });
                     }
                 });
-                std::mem::swap(entries, scratch);
+                std::mem::swap(entries, &mut scratch);
                 *marked = 0;
             }
         }
