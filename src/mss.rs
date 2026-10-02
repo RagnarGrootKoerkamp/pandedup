@@ -6,33 +6,104 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
-use core::ops::Range;
+use core::ops::{BitAnd, Mul, Range, Shl, Shr, Sub};
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use std::sync::Mutex;
 use tracing::{debug, info};
-use voracious_radix_sort::{RadixSort, Radixable};
+use voracious_radix_sort::{RadixKey, RadixSort, Radixable};
+
+pub trait MssKey:
+    RadixKey
+    + Copy
+    + Ord
+    + Send
+    + Sync
+    + BitAnd<Output = Self>
+    + Mul<Output = Self>
+    + Shl<usize, Output = Self>
+    + Shr<usize, Output = Self>
+    + Sub<Output = Self>
+{
+    const BITS: usize;
+    const ZERO: Self;
+    const ONE: Self;
+    const MAX: Self;
+    fn from_usize(value: usize) -> Self;
+    fn div_ceil(self, rhs: Self) -> Self;
+    fn checked_shr(self, rhs: u32) -> Option<Self>;
+    fn read_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self;
+    fn read_revcomp_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self;
+}
+
+impl MssKey for u64 {
+    const BITS: usize = 64;
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+    const MAX: Self = u64::MAX;
+    fn from_usize(value: usize) -> Self {
+        value as u64
+    }
+    fn div_ceil(self, rhs: Self) -> Self {
+        u64::div_ceil(self, rhs)
+    }
+    fn checked_shr(self, rhs: u32) -> Option<Self> {
+        u64::checked_shr(self, rhs)
+    }
+    fn read_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
+        seq.read_kmer(k, pos)
+    }
+    fn read_revcomp_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
+        seq.read_revcomp_kmer(k, pos)
+    }
+}
+
+impl MssKey for u128 {
+    const BITS: usize = 128;
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+    const MAX: Self = u128::MAX;
+    fn from_usize(value: usize) -> Self {
+        value as u128
+    }
+    fn div_ceil(self, rhs: Self) -> Self {
+        u128::div_ceil(self, rhs)
+    }
+    fn checked_shr(self, rhs: u32) -> Option<Self> {
+        u128::checked_shr(self, rhs)
+    }
+    fn read_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
+        seq.read_kmer_u128(k, pos)
+    }
+    fn read_revcomp_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
+        seq.read_revcomp_kmer_u128(k, pos)
+    }
+}
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
-struct HeadOrTail {
-    key: u128,
+pub struct HeadOrTail<K: MssKey> {
+    key: K,
     index: u32,
     reverse: bool,
 }
 
 const _: () = {
-    assert!(std::mem::align_of::<HeadOrTail>() == 1);
-    assert!(std::mem::size_of::<HeadOrTail>() == 21);
+    assert!(std::mem::align_of::<HeadOrTail<u64>>() == 1);
+    assert!(std::mem::size_of::<HeadOrTail<u64>>() == 13);
+    assert!(std::mem::align_of::<HeadOrTail<u128>>() == 1);
+    assert!(std::mem::size_of::<HeadOrTail<u128>>() == 21);
 };
 
-impl PartialEq for HeadOrTail {
+impl<K: MssKey> PartialEq for HeadOrTail<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        let key = self.key;
+        let other_key = other.key;
+        key == other_key
     }
 }
 
-impl PartialOrd for HeadOrTail {
+impl<K: MssKey> PartialOrd for HeadOrTail<K> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let key = self.key;
         let other_key = other.key;
@@ -40,9 +111,15 @@ impl PartialOrd for HeadOrTail {
     }
 }
 
-impl Radixable<u128> for HeadOrTail {
-    type Key = u128;
+impl Radixable<u64> for HeadOrTail<u64> {
+    type Key = u64;
+    fn key(&self) -> Self::Key {
+        self.key
+    }
+}
 
+impl Radixable<u128> for HeadOrTail<u128> {
+    type Key = u128;
     fn key(&self) -> Self::Key {
         self.key
     }
@@ -56,11 +133,16 @@ struct MergePart {
 }
 
 /// Merge 4 slices of `input` into `output`, using the given `mask` to compare keys.
-fn merge_head_part(input: &[HeadOrTail], output: &mut [HeadOrTail], mask: u128, part: MergePart) {
+fn merge_head_part<K: MssKey>(
+    input: &[HeadOrTail<K>],
+    output: &mut [HeadOrTail<K>],
+    mask: K,
+    part: MergePart,
+) {
     let mut cursors = part.start;
     for slot in output {
         let mut best_base = 0;
-        let mut best_key = u128::MAX;
+        let mut best_key = K::MAX;
         for base in 0..4 {
             if cursors[base] < part.end[base] {
                 let key = input[cursors[base]].key & mask;
@@ -79,9 +161,9 @@ fn merge_head_part(input: &[HeadOrTail], output: &mut [HeadOrTail], mask: u128, 
 
 /// Drop the leading base from sorted head keys by merging the four sorted
 /// ranges sharing that base. `overlap` is the length of the new keys.
-fn resort_heads(
-    heads: &mut Vec<HeadOrTail>,
-    scratch: &mut Vec<HeadOrTail>,
+fn resort_heads<K: MssKey>(
+    heads: &mut Vec<HeadOrTail<K>>,
+    scratch: &mut Vec<HeadOrTail<K>>,
     overlap: usize,
     threads: usize,
 ) {
@@ -89,19 +171,19 @@ fn resort_heads(
         return;
     }
     let shift = 2 * overlap;
-    let mask = (1u128 << shift) - 1;
+    let mask = (K::ONE << shift) - K::ONE;
     let mut bounds = [0; 5];
     for base in 1..4 {
-        bounds[base] = heads.partition_point(|entry| entry.key >> shift < base as u128);
+        bounds[base] = heads.partition_point(|entry| entry.key >> shift < K::from_usize(base));
     }
     bounds[4] = heads.len();
 
     let chunks = threads.max(1).min(heads.len());
-    let width = (1u128 << shift).div_ceil(chunks as u128);
+    let width = (K::ONE << shift).div_ceil(K::from_usize(chunks));
     let mut cursors = [bounds[0], bounds[1], bounds[2], bounds[3]];
     let mut parts = Vec::with_capacity(chunks);
     for chunk in 1..=chunks {
-        let upper = width * chunk as u128;
+        let upper = width * K::from_usize(chunk);
         let start = cursors;
         for base in 0..4 {
             cursors[base] += heads[cursors[base]..bounds[base + 1]]
@@ -122,7 +204,7 @@ fn resort_heads(
     scratch.resize(
         heads.len(),
         HeadOrTail {
-            key: 0,
+            key: K::ZERO,
             index: 0,
             reverse: false,
         },
@@ -161,9 +243,16 @@ struct Link {
 ///
 /// If the input contains duplicate kmers, in case of (greedy) matchtigs, those
 /// will be preserved in the output.
-pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usize>>) -> Vec<u8> {
+pub fn masked_superstring<K: MssKey>(
+    k: usize,
+    seq: PackedSeqVec,
+    mut ranges: Vec<Range<usize>>,
+) -> Vec<u8>
+where
+    HeadOrTail<K>: Radixable<K, Key = K>,
+{
     info!("masked_superstring: k={}, contigs={}", k, ranges.len());
-    assert!((1..=64).contains(&k));
+    assert!(k > 0 && k <= K::BITS / 2);
 
     info!("Collect tig ends");
     let mut total_merged = 0;
@@ -177,24 +266,24 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
     assert!(num_contigs < u32::MAX as usize);
 
     let empty_entry = HeadOrTail {
-        key: 0,
+        key: K::ZERO,
         index: 0,
         reverse: false,
     };
     let mut heads = vec![empty_entry; 2 * num_contigs];
     let mut tails = vec![empty_entry; 2 * num_contigs];
     let first_overlap = k - 1;
-    let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
+    let first_head_mask = (K::ONE << (2 * first_overlap)) - K::ONE;
     ranges
         .into_par_iter()
         .zip(heads.par_chunks_mut(2))
         .zip(tails.par_chunks_mut(2))
         .enumerate()
         .for_each(|(index, ((r, head_entries), tail_entries))| {
-            let head_fw = seq.read_kmer_u128(k, r.start);
-            let head_rc = seq.read_revcomp_kmer_u128(k, r.start);
-            let tail_fw = seq.read_kmer_u128(k, r.end - k);
-            let tail_rc = seq.read_revcomp_kmer_u128(k, r.end - k);
+            let head_fw = K::read_kmer(&seq, k, r.start);
+            let head_rc = K::read_revcomp_kmer(&seq, k, r.start);
+            let tail_fw = K::read_kmer(&seq, k, r.end - k);
+            let tail_rc = K::read_revcomp_kmer(&seq, k, r.end - k);
             for reverse in [false, true] {
                 let direction = usize::from(reverse);
                 head_entries[direction] = HeadOrTail {
@@ -233,17 +322,20 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
 
         debug!("merging..");
         let chunks = threads.max(1);
-        let width = (1u128 << (2 * overlap)).div_ceil(chunks as u128);
+        let width = (K::ONE << (2 * overlap)).div_ceil(K::from_usize(chunks));
         let mut head_start = 0;
         let mut tail_start = 0;
         let mut ranges = Vec::with_capacity(chunks);
         for chunk in 1..=chunks {
-            let upper = width * chunk as u128;
-            let head_end =
-                head_start + heads[head_start..].partition_point(|head| head.key < upper);
+            let upper = width * K::from_usize(chunk);
+            let head_end = head_start
+                + heads[head_start..].partition_point(|head| {
+                    let key = head.key;
+                    key < upper
+                });
             let tail_end = tail_start
                 + tails[tail_start..].partition_point(|tail| {
-                    tail.key.checked_shr(tail_shift as u32).unwrap_or(0) < upper
+                    tail.key.checked_shr(tail_shift as u32).unwrap_or(K::ZERO) < upper
                 });
             ranges.push((head_start..head_end, tail_start..tail_end));
             head_start = head_end;
@@ -288,12 +380,13 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                             j += 1;
                             continue;
                         }
-                        let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
-                        if head.key < tail_key {
+                        let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(K::ZERO);
+                        let head_key = head.key;
+                        if head_key < tail_key {
                             i += 1;
                             continue;
                         }
-                        if head.key > tail_key {
+                        if head_key > tail_key {
                             j += 1;
                             continue;
                         }
@@ -407,7 +500,7 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                 scratch.resize(
                     retained,
                     HeadOrTail {
-                        key: 0,
+                        key: K::ZERO,
                         index: 0,
                         reverse: false,
                     },

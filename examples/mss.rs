@@ -35,7 +35,11 @@ fn main() {
     info!("Reading input..");
     let (seq, ranges) = packed_seq::PackedSeqVec::from_fastx(&args.input);
 
-    let superstring = mss::masked_superstring(args.k, seq, ranges);
+    let superstring = if args.k <= 32 {
+        mss::masked_superstring::<u64>(args.k, seq, ranges)
+    } else {
+        mss::masked_superstring::<u128>(args.k, seq, ranges)
+    };
     let output = args
         .output
         .unwrap_or_else(|| args.input.with_extension("msfa"));
