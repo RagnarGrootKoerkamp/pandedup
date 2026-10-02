@@ -81,6 +81,7 @@ fn main() {
         .init();
 
     let args = Args::parse();
+    let timing = timing::StageTiming::start();
     let input = &args.input;
     let output = &args.output;
 
@@ -95,7 +96,6 @@ fn main() {
     let output_path = output
         .clone()
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
-    let timing = timing::StageTiming::start();
     let reused_output = args.skip && output_path.exists();
     if !reused_output {
         // Open the input archive only when generating the output.
@@ -114,7 +114,7 @@ fn main() {
         process(&args, reader.as_ref().get_ref(), &writer);
         drop(writer);
     }
-    println!(
+    tracing::info!(
         "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
         timing.finish(),
         std::fs::metadata(input).unwrap().len(),

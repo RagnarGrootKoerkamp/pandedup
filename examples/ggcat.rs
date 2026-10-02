@@ -12,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tracing::info;
 
 #[derive(Parser)]
 struct Args {
@@ -64,6 +65,7 @@ fn main() {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
     let args = Args::parse();
+    let timing = timing::StageTiming::start();
     let name = args.input.to_string_lossy();
     assert!(
         name.ends_with(".fa") || name.ends_with(".fa.zst"),
@@ -74,7 +76,14 @@ fn main() {
     while let Some(record) = reader.next() {
         sequences.push(record.expect("invalid FASTA record").seq().into_owned());
     }
-    run(&args, sequences);
+    let output = run(&args, sequences);
+    info!(
+        "ggcat: {}, input {} bytes, output {} bytes ({})",
+        timing.finish(),
+        std::fs::metadata(&args.input).unwrap().len(),
+        std::fs::metadata(&output).unwrap().len(),
+        output.display()
+    );
 }
 
 fn default_output_path(input: &Path, k: usize, mode: &str) -> PathBuf {
@@ -158,14 +167,14 @@ impl DynamicSequencesStream for InMemorySequences {
     }
 }
 
-fn run(args: &Args, sequences: Vec<Vec<u8>>) {
+fn run(args: &Args, sequences: Vec<Vec<u8>>) -> PathBuf {
     let (short_sequences, sequences): (Vec<_>, Vec<_>) = sequences
         .into_iter()
         .partition(|sequence| sequence.len() < args.k);
     let input = Arc::new(InMemorySequences::new(sequences));
     let input_bases: u64 = input.bases.iter().sum();
     let input_contigs: usize = input.blocks.iter().map(Vec::len).sum();
-    println!(
+    info!(
         "ggcat input: {input_contigs} in-memory contigs, {input_bases} bases (from {})",
         args.input.display()
     );
@@ -205,7 +214,6 @@ fn run(args: &Args, sequences: Vec<Vec<u8>>) {
             ))
         })
         .collect();
-    let timing = timing::StageTiming::start();
     let output = if input_contigs == 0 {
         std::fs::File::create(&output).expect("failed to create GGCAT output");
         output
@@ -238,12 +246,7 @@ fn run(args: &Args, sequences: Vec<Vec<u8>>) {
             file.write_all(b"\n").unwrap();
         }
     }
-    println!(
-        "ggcat {label}: {}, {} bytes ({})",
-        timing.finish(),
-        std::fs::metadata(&output).unwrap().len(),
-        output.display()
-    );
+    output
 }
 
 #[cfg(test)]

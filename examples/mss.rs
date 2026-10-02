@@ -8,6 +8,8 @@ use tracing::info;
 
 #[path = "../src/mss.rs"]
 mod mss;
+#[path = "../src/timing.rs"]
+mod timing;
 
 #[derive(Parser)]
 struct Args {
@@ -32,6 +34,7 @@ fn main() {
         ))
         .init();
     let args = Args::parse();
+    let timing = timing::StageTiming::start();
     info!("Reading input..");
     let (seq, ranges) = packed_seq::PackedSeqVec::from_fastx(&args.input);
 
@@ -47,5 +50,13 @@ fn main() {
     writeln!(writer, ">masked-superstring").unwrap();
     writer.write_all(&superstring).unwrap();
     writer.write_all(b"\n").unwrap();
-    eprintln!("wrote {} bases to {}", superstring.len(), output.display());
+    drop(writer);
+    info!(
+        "mss: {}, input {} bytes, output {} bases, {} bytes ({})",
+        timing.finish(),
+        std::fs::metadata(&args.input).unwrap().len(),
+        superstring.len(),
+        std::fs::metadata(&output).unwrap().len(),
+        output.display()
+    );
 }

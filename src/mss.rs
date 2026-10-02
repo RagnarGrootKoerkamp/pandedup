@@ -597,6 +597,8 @@ where
         );
     }
     assert_eq!(total_merged, links.len());
+    return vec![];
+
     // TODO break cycles
 
     unimplemented!("break cycles");
