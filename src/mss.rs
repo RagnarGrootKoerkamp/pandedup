@@ -80,22 +80,67 @@ impl MssKey for u128 {
     }
 }
 
+pub trait MssIndex: Copy + Eq + Send + Sync + Default {
+    const MAX: Self;
+    const MAX_CONTIGS: usize;
+    fn from_parts(index: usize, reverse: bool) -> Self;
+    fn contig_index(self) -> usize;
+    fn reverse(self) -> bool;
+    fn flip(self) -> Self;
+}
+
+impl MssIndex for u32 {
+    const MAX: Self = u32::MAX;
+    const MAX_CONTIGS: usize = (u32::MAX >> 1) as usize;
+    fn from_parts(index: usize, reverse: bool) -> Self {
+        ((index as u32) << 1) | u32::from(reverse)
+    }
+    fn contig_index(self) -> usize {
+        (self >> 1) as usize
+    }
+    fn reverse(self) -> bool {
+        self & 1 != 0
+    }
+    fn flip(self) -> Self {
+        self ^ 1
+    }
+}
+
+impl MssIndex for u64 {
+    const MAX: Self = u64::MAX;
+    const MAX_CONTIGS: usize = (u64::MAX >> 1) as usize;
+    fn from_parts(index: usize, reverse: bool) -> Self {
+        ((index as u64) << 1) | u64::from(reverse)
+    }
+    fn contig_index(self) -> usize {
+        (self >> 1) as usize
+    }
+    fn reverse(self) -> bool {
+        self & 1 != 0
+    }
+    fn flip(self) -> Self {
+        self ^ 1
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
-pub struct HeadOrTail<K: MssKey> {
+pub struct HeadOrTail<K: MssKey, I: MssIndex> {
     key: K,
     /// Twice the contig index, plus one for reverse complement; MAX means used.
-    id: u32,
+    id: I,
 }
 
 const _: () = {
-    assert!(std::mem::align_of::<HeadOrTail<u64>>() == 1);
-    assert!(std::mem::size_of::<HeadOrTail<u64>>() == 12);
-    assert!(std::mem::align_of::<HeadOrTail<u128>>() == 1);
-    assert!(std::mem::size_of::<HeadOrTail<u128>>() == 20);
+    assert!(std::mem::align_of::<HeadOrTail<u64, u32>>() == 1);
+    assert!(std::mem::size_of::<HeadOrTail<u64, u32>>() == 12);
+    assert!(std::mem::size_of::<HeadOrTail<u64, u64>>() == 16);
+    assert!(std::mem::align_of::<HeadOrTail<u128, u64>>() == 1);
+    assert!(std::mem::size_of::<HeadOrTail<u128, u32>>() == 20);
+    assert!(std::mem::size_of::<HeadOrTail<u128, u64>>() == 24);
 };
 
-impl<K: MssKey> PartialEq for HeadOrTail<K> {
+impl<K: MssKey, I: MssIndex> PartialEq for HeadOrTail<K, I> {
     fn eq(&self, other: &Self) -> bool {
         let key = self.key;
         let other_key = other.key;
@@ -103,7 +148,7 @@ impl<K: MssKey> PartialEq for HeadOrTail<K> {
     }
 }
 
-impl<K: MssKey> PartialOrd for HeadOrTail<K> {
+impl<K: MssKey, I: MssIndex> PartialOrd for HeadOrTail<K, I> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let key = self.key;
         let other_key = other.key;
@@ -111,14 +156,14 @@ impl<K: MssKey> PartialOrd for HeadOrTail<K> {
     }
 }
 
-impl Radixable<u64> for HeadOrTail<u64> {
+impl<I: MssIndex> Radixable<u64> for HeadOrTail<u64, I> {
     type Key = u64;
     fn key(&self) -> Self::Key {
         self.key
     }
 }
 
-impl Radixable<u128> for HeadOrTail<u128> {
+impl<I: MssIndex> Radixable<u128> for HeadOrTail<u128, I> {
     type Key = u128;
     fn key(&self) -> Self::Key {
         self.key
@@ -133,9 +178,9 @@ struct MergePart {
 }
 
 /// Merge 4 slices of `input` into `output`, using the given `mask` to compare keys.
-fn merge_head_part<K: MssKey>(
-    input: &[HeadOrTail<K>],
-    output: &mut [HeadOrTail<K>],
+fn merge_head_part<K: MssKey, I: MssIndex>(
+    input: &[HeadOrTail<K, I>],
+    output: &mut [HeadOrTail<K, I>],
     mask: K,
     part: MergePart,
 ) {
@@ -161,9 +206,9 @@ fn merge_head_part<K: MssKey>(
 
 /// Drop the leading base from sorted head keys by merging the four sorted
 /// ranges sharing that base. `overlap` is the length of the new keys.
-fn resort_heads<K: MssKey>(
-    heads: &mut Vec<HeadOrTail<K>>,
-    scratch: &mut Vec<HeadOrTail<K>>,
+fn resort_heads<K: MssKey, I: MssIndex>(
+    heads: &mut Vec<HeadOrTail<K, I>>,
+    scratch: &mut Vec<HeadOrTail<K, I>>,
     overlap: usize,
     threads: usize,
 ) {
@@ -205,7 +250,7 @@ fn resort_heads<K: MssKey>(
         heads.len(),
         HeadOrTail {
             key: K::ZERO,
-            id: 0,
+            id: I::default(),
         },
     );
     let input = heads.as_slice();
@@ -223,16 +268,16 @@ fn resort_heads<K: MssKey>(
 }
 
 #[derive(Clone, Copy)]
-struct Links {
+struct Links<I: MssIndex> {
     /// Neighbors at the forward head (0) and forward tail (1).
-    nbs: [Option<Link>; 2],
+    nbs: [Option<Link<I>>; 2],
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
-struct Link {
+struct Link<I: MssIndex> {
     /// Twice the contig index, plus one for reverse complement.
-    id: u32,
+    id: I,
     overlap: u8,
 }
 
@@ -249,28 +294,44 @@ pub fn masked_superstring<K: MssKey>(
     mut ranges: Vec<Range<usize>>,
 ) -> Vec<u8>
 where
-    HeadOrTail<K>: Radixable<K, Key = K>,
+    HeadOrTail<K, u32>: Radixable<K, Key = K>,
+    HeadOrTail<K, u64>: Radixable<K, Key = K>,
 {
     info!("masked_superstring: k={}, contigs={}", k, ranges.len());
     assert!(k > 0 && k <= K::BITS / 2);
-
-    info!("Collect tig ends");
-    let mut total_merged = 0;
-    let mut total_len = ranges.iter().map(|c| c.len()).sum::<usize>();
-    let threads = rayon::current_num_threads();
+    let total_len = ranges.iter().map(|c| c.len()).sum::<usize>();
     // Filter first so indices in both entry vectors match `ends` even when
     // the input contains contigs shorter than k.
     ranges.retain(|c| c.len() >= k);
+    if ranges.len() < (1usize << 31) {
+        masked_superstring_with_index::<K, u32>(k, seq, ranges, total_len)
+    } else {
+        masked_superstring_with_index::<K, u64>(k, seq, ranges, total_len)
+    }
+}
+
+fn masked_superstring_with_index<K: MssKey, I: MssIndex>(
+    k: usize,
+    seq: PackedSeqVec,
+    ranges: Vec<Range<usize>>,
+    mut total_len: usize,
+) -> Vec<u8>
+where
+    HeadOrTail<K, I>: Radixable<K, Key = K>,
+{
+    info!("Collect tig ends");
+    let mut total_merged = 0;
+    let threads = rayon::current_num_threads();
     let num_contigs = ranges.len();
-    // Leave room for the orientation bit and reserve u32::MAX as the sentinel.
+    // Leave room for the orientation bit and reserve I::MAX as the sentinel.
     assert!(
-        num_contigs <= (u32::MAX >> 1) as usize,
+        num_contigs <= I::MAX_CONTIGS,
         "too many contigs for packed orientation IDs"
     );
 
     let empty_entry = HeadOrTail {
         key: K::ZERO,
-        id: 0,
+        id: I::from_parts(0, false),
     };
     let mut heads = vec![empty_entry; 2 * num_contigs];
     let mut tails = vec![empty_entry; 2 * num_contigs];
@@ -290,17 +351,17 @@ where
                 let direction = usize::from(reverse);
                 head_entries[direction] = HeadOrTail {
                     key: [head_fw, tail_rc][direction] & first_head_mask,
-                    id: ((index as u32) << 1) | u32::from(reverse),
+                    id: I::from_parts(index, reverse),
                 };
                 tail_entries[direction] = HeadOrTail {
                     key: [tail_fw, head_rc][direction],
-                    id: ((index as u32) << 1) | u32::from(reverse),
+                    id: I::from_parts(index, reverse),
                 };
             }
         });
     drop(seq);
 
-    let mut links = vec![Links { nbs: [None, None] }; num_contigs];
+    let mut links: Vec<Links<I>> = vec![Links { nbs: [None, None] }; num_contigs];
 
     // Sorting full tail k-mers also sorts every shorter prefix used below.
     info!("sorting {} heads..", heads.len());
@@ -372,11 +433,13 @@ where
                     while i < head_slice.len() && j < tail_slice.len() {
                         let head = head_slice[i];
                         let tail = tail_slice[j];
-                        if head.id == u32::MAX {
+                        let head_id = head.id;
+                        let tail_id = tail.id;
+                        if head_id == I::MAX {
                             i += 1;
                             continue;
                         }
-                        if tail.id == u32::MAX {
+                        if tail_id == I::MAX {
                             j += 1;
                             continue;
                         }
@@ -390,15 +453,15 @@ where
                             j += 1;
                             continue;
                         }
-                        if head.id == (tail.id ^ 1) {
+                        if head_id == tail_id.flip() {
                             j += 1;
                             continue;
                         }
 
-                        let head_index = (head.id >> 1) as usize;
-                        let tail_index = (tail.id >> 1) as usize;
-                        let head_slot = (head.id & 1) as usize;
-                        let tail_slot = ((tail.id ^ 1) & 1) as usize;
+                        let head_index = head_id.contig_index();
+                        let tail_index = tail_id.contig_index();
+                        let head_slot = usize::from(head_id.reverse());
+                        let tail_slot = usize::from(!tail_id.reverse());
                         let head_shard = head_index / shard_len;
                         let tail_shard = tail_index / shard_len;
                         let (head_used, tail_used) = if head_shard == tail_shard {
@@ -409,11 +472,11 @@ where
                             let tail_used = shard[tail_local].nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 shard[head_local].nbs[head_slot] = Some(Link {
-                                    id: tail.id,
+                                    id: tail_id,
                                     overlap: overlap as u8,
                                 });
                                 shard[tail_local].nbs[tail_slot] = Some(Link {
-                                    id: head.id,
+                                    id: head_id,
                                     overlap: overlap as u8,
                                 });
                             }
@@ -437,19 +500,19 @@ where
                             let tail_used = tail_end.nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 head_end.nbs[head_slot] = Some(Link {
-                                    id: tail.id,
+                                    id: tail_id,
                                     overlap: overlap as u8,
                                 });
                                 tail_end.nbs[tail_slot] = Some(Link {
-                                    id: head.id,
+                                    id: head_id,
                                     overlap: overlap as u8,
                                 });
                             }
                             (head_used, tail_used)
                         };
                         if !head_used && !tail_used {
-                            head_slice[i].id = u32::MAX;
-                            tail_slice[j].id = u32::MAX;
+                            head_slice[i].id = I::MAX;
+                            tail_slice[j].id = I::MAX;
                             marked_heads += 1;
                             marked_tails += 1;
                             merged += 1;
@@ -457,12 +520,12 @@ where
                             j += 1;
                         } else {
                             if head_used {
-                                head_slice[i].id = u32::MAX;
+                                head_slice[i].id = I::MAX;
                                 marked_heads += 1;
                                 i += 1;
                             }
                             if tail_used {
-                                tail_slice[j].id = u32::MAX;
+                                tail_slice[j].id = I::MAX;
                                 marked_tails += 1;
                                 j += 1;
                             }
@@ -488,18 +551,20 @@ where
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = entries
                     .par_chunks(chunk_len)
-                    .map(|slice| slice.iter().filter(|entry| entry.id == u32::MAX).count())
+                    .map(|slice| {
+                        slice
+                            .iter()
+                            .filter(|entry| {
+                                let id = entry.id;
+                                id == I::MAX
+                            })
+                            .count()
+                    })
                     .collect::<Vec<_>>();
                 let removed_total = removed.iter().sum::<usize>();
                 debug_assert_eq!(removed_total, *marked);
                 let retained = entries.len() - removed_total;
-                scratch.resize(
-                    retained,
-                    HeadOrTail {
-                        key: K::ZERO,
-                        id: 0,
-                    },
-                );
+                scratch.truncate(retained);
                 rayon::scope(|scope| {
                     let mut output = scratch.as_mut_slice();
                     for (input, removed) in entries.chunks(chunk_len).zip(removed) {
@@ -508,7 +573,8 @@ where
                         scope.spawn(move |_| {
                             let mut write = 0;
                             for &entry in input {
-                                if entry.id != u32::MAX {
+                                let id = entry.id;
+                                if id != I::MAX {
                                     part[write] = entry;
                                     write += 1;
                                 }
@@ -546,8 +612,8 @@ where
         loop {
             done[j] = true;
             let link = links[j].nbs[usize::from(!reverse)].as_ref().unwrap();
-            j = (link.id >> 1) as usize;
-            reverse = link.id & 1 != 0;
+            j = link.id.contig_index();
+            reverse = link.id.reverse();
             if j == i {
                 break;
             }
