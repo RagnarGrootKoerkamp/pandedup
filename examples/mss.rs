@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::Parser;
+use tracing::info;
 
 #[path = "../src/mss.rs"]
 mod mss;
@@ -38,7 +39,7 @@ fn main() {
         contigs.push(record.unwrap().seq().into_owned());
     }
 
-    let superstring = mss::masked_superstring(args.k, &contigs);
+    let superstring = mss::masked_superstring(args.k, contigs);
     let output = args
         .output
         .unwrap_or_else(|| args.input.with_extension("msfa"));

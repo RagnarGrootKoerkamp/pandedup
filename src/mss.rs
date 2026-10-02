@@ -9,7 +9,7 @@
 use rayon::prelude::*;
 use seq_hash::packed_seq::{self, Seq};
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 #[derive(Clone, Copy)]
@@ -154,7 +154,7 @@ struct Link {
 ///
 /// If the input contains duplicate kmers, in case of (greedy) matchtigs, those
 /// will be preserved in the output.
-pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
+pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
     info!("masked_superstring: k={}, contigs={}", k, contigs.len());
     assert!((1..=64).contains(&k));
 
@@ -183,6 +183,10 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
 
     let mut total_merged = 0;
     let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
+
+    info!("Drop contigs");
+    drop(contigs);
+
     let threads = rayon::current_num_threads();
 
     info!("Build tails..");
@@ -222,13 +226,13 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     let mut marked_tails = 0;
 
     for overlap in (0..=first_overlap).rev() {
-        info!("overlap: {}", overlap);
+        debug!("overlap: {}", overlap);
         let tail_shift = 2 * (k - overlap);
         if overlap < first_overlap {
             resort_heads(&mut heads, &mut head_scratch, overlap, threads);
         }
 
-        info!("merging..");
+        debug!("merging..");
         let chunks = threads.max(1);
         let width = (1u128 << (2 * overlap)).div_ceil(chunks as u128);
         let mut head_start = 0;
