@@ -52,10 +52,6 @@ pub struct Args {
     /// Minimizer length for phrases.
     #[clap(long, default_value = "8")]
     pub mini_k: usize,
-
-    /// Reuse the output file if it already exists.
-    #[clap(long)]
-    pub skip: bool,
 }
 
 #[derive(Default, Clone, Copy, derive_more::AddAssign)]
@@ -85,24 +81,21 @@ pub fn run(args: &Args) -> PathBuf {
     let output_path = output
         .clone()
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
-    let reused_output = args.skip && output_path.exists();
-    if !reused_output {
-        // Open the input archive only when generating the output.
-        let reader = match input.extension().unwrap().to_str().unwrap() {
-            "agc" => {
-                Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-            }
-            "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
-            "zst" => Box::pin(FastxReader::new(&args.input.to_string_lossy()))
-                as Pin<Box<dyn InputReader>>,
-            _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
-        };
-        let buf_writer =
-            BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
-        let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-        process(args, reader.as_ref().get_ref(), &writer);
-        drop(writer);
-    }
+    let reader = match input.extension().unwrap().to_str().unwrap() {
+        "agc" => {
+            Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+        }
+        "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
+        "zst" => {
+            Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
+        }
+        _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
+    };
+    let buf_writer =
+        BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
+    let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
+    process(args, reader.as_ref().get_ref(), &writer);
+    drop(writer);
     tracing::info!(
         "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
         timing.finish(),

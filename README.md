@@ -45,9 +45,8 @@ cargo run --release --example ggcat -- hprcv2.spss.k64.fa.zst -k 64 --mode simpl
 Use `--mode greedy-matchtigs` for greedy matchtigs, or see `--help` for all
 modes. Use `-o` to set the output path; otherwise the example writes a
 neighboring `INPUT-kK-MODE.fa` file (for example, `x-k64-simplitigs.fa` for
-`x.fa`). The example loads the input contigs into
-memory and prints elapsed time and output size. Add `--skip` to `pandedup` to
-reuse its compressed output when it already exists.
+`x.fa`). The example loads the input contigs into memory and prints elapsed
+time and output size.
 
 Add `--mss` to build a masked superstring from the deduplicated contigs and
 write it to a neighboring `.msfa` file.
