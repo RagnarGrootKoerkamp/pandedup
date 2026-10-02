@@ -7,6 +7,10 @@
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
 use seq_hash::packed_seq::{self, Seq};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
@@ -185,6 +189,12 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     let threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
+    // A physical end has an entry in each sorted vector. Keep its used bit
+    // separately so both entries can be removed without reading `ends` again.
+    let word_bits = usize::BITS as usize;
+    let used: Vec<_> = (0..(2 * ends.len()).div_ceil(word_bits))
+        .map(|_| AtomicUsize::new(0))
+        .collect();
 
     // Sorting full tail k-mers also sorts every shorter prefix used below.
     let mut tails = Vec::with_capacity(2 * ends.len());
@@ -223,75 +233,156 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
             resort_heads(&mut heads, &mut head_scratch, overlap, threads);
         }
 
-        // mergesort the two lists; make a connection whenever possible.
         info!("merging..");
-        let mut i = 0;
-        let mut j = 0;
-        let mut head_write = 0;
-        let mut tail_write = 0;
-        let mut merged = 0;
-        while i < heads.len() && j < tails.len() {
-            let head = heads[i];
-            let tail = tails[j];
-            let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
-            if head.key == tail_key {
-                if ends[head.index].nbs[head.reverse].is_some() {
-                    i += 1;
-                    continue;
-                }
-                if ends[tail.index].nbs[1 - tail.reverse].is_some() {
-                    j += 1;
-                    continue;
-                }
-                // Skip self-loops from an end into itself.
-                if head.index == tail.index && head.reverse == 1 - tail.reverse {
-                    heads[head_write] = head;
-                    head_write += 1;
-                    i += 1;
-                    continue;
-                }
+        let chunks = threads.max(1);
+        let width = (1u128 << (2 * overlap)).div_ceil(chunks as u128);
+        let mut head_start = 0;
+        let mut tail_start = 0;
+        let mut ranges = Vec::with_capacity(chunks);
+        for chunk in 1..=chunks {
+            let upper = width * chunk as u128;
+            let head_end =
+                head_start + heads[head_start..].partition_point(|head| head.key < upper);
+            let tail_end = tail_start
+                + tails[tail_start..].partition_point(|tail| {
+                    tail.key.checked_shr(tail_shift as u32).unwrap_or(0) < upper
+                });
+            ranges.push((head_start..head_end, tail_start..tail_end));
+            head_start = head_end;
+            tail_start = tail_end;
+        }
+        debug_assert_eq!(head_start, heads.len());
+        debug_assert_eq!(tail_start, tails.len());
 
-                let head_link = Link {
-                    index: head.index,
-                    reverse: head.reverse != 0,
-                    overlap: overlap as u8,
-                };
-                let tail_link = Link {
-                    index: tail.index,
-                    reverse: tail.reverse != 0,
-                    overlap: overlap as u8,
-                };
-                ends[head.index].nbs[head.reverse] = Some(tail_link);
-                ends[tail.index].nbs[1 - tail.reverse] = Some(head_link);
-                i += 1;
-                j += 1;
-                merged += 1;
-            } else if head.key < tail_key {
-                heads[head_write] = head;
-                head_write += 1;
-                i += 1;
-            } else {
-                tails[tail_write] = tail;
-                tail_write += 1;
-                j += 1;
+        // Each mutex owns a disjoint mutable slice. Lock both slices in index
+        // order when a link crosses shards, so workers cannot deadlock.
+        let shard_len = ends.len().div_ceil(chunks.saturating_mul(16)).max(1);
+        let shards: Vec<_> = ends.chunks_mut(shard_len).map(Mutex::new).collect();
+        let merged = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            let mut remaining_heads = heads.as_mut_slice();
+            let mut remaining_tails = tails.as_mut_slice();
+            for (head_range, tail_range) in ranges {
+                let (head_slice, rest) = remaining_heads.split_at_mut(head_range.len());
+                remaining_heads = rest;
+                let (tail_slice, rest) = remaining_tails.split_at_mut(tail_range.len());
+                remaining_tails = rest;
+                if head_range.is_empty() || tail_range.is_empty() {
+                    continue;
+                }
+                let shards = &shards;
+                let used = &used;
+                workers.push(scope.spawn(move || {
+                    let mut merged = 0;
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < head_slice.len() && j < tail_slice.len() {
+                        let head = head_slice[i];
+                        let tail = tail_slice[j];
+                        let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
+                        if head.key < tail_key {
+                            i += 1;
+                            continue;
+                        }
+                        if head.key > tail_key {
+                            j += 1;
+                            continue;
+                        }
+                        let tail_slot = 1 - tail.reverse;
+                        if head.index == tail.index && head.reverse == tail_slot {
+                            j += 1;
+                            continue;
+                        }
+
+                        let head_shard = head.index / shard_len;
+                        let tail_shard = tail.index / shard_len;
+                        let (head_used, tail_used) = if head_shard == tail_shard {
+                            let mut shard = shards[head_shard].lock().unwrap();
+                            let head_local = head.index % shard_len;
+                            let tail_local = tail.index % shard_len;
+                            let head_used = shard[head_local].nbs[head.reverse].is_some();
+                            let tail_used = shard[tail_local].nbs[tail_slot].is_some();
+                            if !head_used && !tail_used {
+                                shard[head_local].nbs[head.reverse] = Some(Link {
+                                    index: tail.index,
+                                    reverse: tail.reverse != 0,
+                                    overlap: overlap as u8,
+                                });
+                                shard[tail_local].nbs[tail_slot] = Some(Link {
+                                    index: head.index,
+                                    reverse: head.reverse != 0,
+                                    overlap: overlap as u8,
+                                });
+                            }
+                            (head_used, tail_used)
+                        } else {
+                            let (lower, upper) = shards.split_at(head_shard.max(tail_shard));
+                            let mut lower = lower[head_shard.min(tail_shard)].lock().unwrap();
+                            let mut upper = upper[0].lock().unwrap();
+                            let (head_end, tail_end) = if head_shard < tail_shard {
+                                (
+                                    &mut lower[head.index % shard_len],
+                                    &mut upper[tail.index % shard_len],
+                                )
+                            } else {
+                                (
+                                    &mut upper[head.index % shard_len],
+                                    &mut lower[tail.index % shard_len],
+                                )
+                            };
+                            let head_used = head_end.nbs[head.reverse].is_some();
+                            let tail_used = tail_end.nbs[tail_slot].is_some();
+                            if !head_used && !tail_used {
+                                head_end.nbs[head.reverse] = Some(Link {
+                                    index: tail.index,
+                                    reverse: tail.reverse != 0,
+                                    overlap: overlap as u8,
+                                });
+                                tail_end.nbs[tail_slot] = Some(Link {
+                                    index: head.index,
+                                    reverse: head.reverse != 0,
+                                    overlap: overlap as u8,
+                                });
+                            }
+                            (head_used, tail_used)
+                        };
+                        if !head_used && !tail_used {
+                            let head_port = 2 * head.index + head.reverse;
+                            let tail_port = 2 * tail.index + tail_slot;
+                            used[head_port / word_bits]
+                                .fetch_or(1usize << (head_port % word_bits), Ordering::Relaxed);
+                            used[tail_port / word_bits]
+                                .fetch_or(1usize << (tail_port % word_bits), Ordering::Relaxed);
+                            head_slice[i].index = usize::MAX;
+                            tail_slice[j].index = usize::MAX;
+                            merged += 1;
+                            i += 1;
+                            j += 1;
+                        } else {
+                            if head_used {
+                                head_slice[i].index = usize::MAX;
+                                i += 1;
+                            }
+                            if tail_used {
+                                tail_slice[j].index = usize::MAX;
+                                j += 1;
+                            }
+                        }
+                    }
+                    merged
+                }));
             }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .sum::<usize>()
+        });
+        drop(shards);
+        if merged != 0 {
+            eprintln!("Retain..");
+            heads.retain(|head| head.index != usize::MAX);
+            tails.retain(|tail| tail.index != usize::MAX);
         }
-        for read in i..heads.len() {
-            let head = heads[read];
-            if ends[head.index].nbs[head.reverse].is_none() {
-                heads[head_write] = head;
-                head_write += 1;
-            }
-        }
-        for read in j..tails.len() {
-            let tail = tails[read];
-            if ends[tail.index].nbs[1 - tail.reverse].is_none() {
-                tails[tail_write] = tail;
-                tail_write += 1;
-            }
-        }
-        heads.truncate(head_write);
-        tails.truncate(tail_write);
         total_merged += merged;
         total_len -= merged * overlap;
         info!(
