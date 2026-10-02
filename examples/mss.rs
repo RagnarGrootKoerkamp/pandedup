@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::Parser;
-use tracing::info;
+use tracing::{Level, info};
 
 #[path = "../src/mss.rs"]
 mod mss;
@@ -26,6 +26,7 @@ struct Args {
 fn main() {
     tracing_subscriber::fmt()
         .compact()
+        .with_max_level(Level::DEBUG)
         .with_target(false)
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())

@@ -10,7 +10,7 @@ use core::ops::{BitAnd, Mul, Range, Shl, Shr, Sub};
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use std::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use voracious_radix_sort::{RadixKey, RadixSort, Radixable};
 
 pub trait MssKey:
@@ -375,13 +375,13 @@ where
     let mut marked_tails = 0;
 
     for overlap in (0..=first_overlap).rev() {
-        debug!("overlap: {}", overlap);
+        trace!("overlap: {}", overlap);
         let tail_shift = 2 * (k - overlap);
         if overlap < first_overlap {
             resort_heads(&mut heads, &mut scratch, overlap, threads);
         }
 
-        debug!("merging..");
+        trace!("merging..");
         let chunks = threads.max(1);
         let width = (K::ONE << (2 * overlap)).div_ceil(K::from_usize(chunks));
         let mut head_start = 0;
@@ -547,7 +547,7 @@ where
         ] {
             // Only filter out dead entries if that's more than half of them.
             if *marked > entries.len() / 2 {
-                info!("Drop {} of {} entries..", *marked, entries.len());
+                debug!("Drop {} of {} entries..", *marked, entries.len());
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = entries
                     .par_chunks(chunk_len)
@@ -590,7 +590,7 @@ where
         }
         total_merged += merged;
         total_len -= merged * overlap;
-        info!(
+        debug!(
             "overlap {overlap} merged {:>9} total merged {total_merged:>9} remaining {:>9} total len {total_len:>11}",
             merged,
             links.len() - total_merged
