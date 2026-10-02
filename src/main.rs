@@ -1,7 +1,6 @@
 use clap::Parser;
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
-mod ggcat;
 mod timing;
 use std::{
     io::{BufWriter, IsTerminal, Read, Write},
@@ -55,9 +54,6 @@ struct Args {
     #[clap(long, default_value = "8")]
     mini_k: usize,
 
-    /// Run GGCAT on the deduplicated contigs with every elaboration mode.
-    #[clap(long)]
-    ggcat: bool,
     /// Reuse the output file if it already exists.
     #[clap(long)]
     skip: bool,
@@ -101,9 +97,7 @@ fn main() {
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
     let timing = timing::StageTiming::start();
     let reused_output = args.skip && output_path.exists();
-    let ggcat_input = if reused_output {
-        args.ggcat.then(|| read_fastx_sequences(&output_path))
-    } else {
+    if !reused_output {
         // Open the input archive only when generating the output.
         let reader = match input.extension().unwrap().to_str().unwrap() {
             "agc" => {
@@ -114,19 +108,12 @@ fn main() {
                 as Pin<Box<dyn InputReader>>,
             _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
         };
-        let ggcat_input = args.ggcat.then(|| Mutex::new(Vec::new()));
         let buf_writer =
             BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
         let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-        process(
-            &args,
-            reader.as_ref().get_ref(),
-            &writer,
-            ggcat_input.as_ref(),
-        );
+        process(&args, reader.as_ref().get_ref(), &writer);
         drop(writer);
-        ggcat_input.map(|input| input.into_inner().unwrap())
-    };
+    }
     println!(
         "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
         timing.finish(),
@@ -134,41 +121,16 @@ fn main() {
         std::fs::metadata(&output_path).unwrap().len(),
         output_path.display()
     );
-    if let Some(ggcat_input) = ggcat_input {
-        ggcat::run(&args, &output_path, ggcat_input);
-    }
 }
 
-fn read_fastx_sequences(path: &std::path::Path) -> Vec<Vec<u8>> {
-    let mut reader = needletail::parse_fastx_file(path).unwrap();
-    let mut sequences = Vec::new();
-    while let Some(record) = reader.next() {
-        sequences.push(record.unwrap().seq().into_owned());
-    }
-    sequences
-}
-
-fn process<W: Write + Send>(
-    args: &Args,
-    reader: &dyn InputReader,
-    writer: &Mutex<W>,
-    ggcat_input: Option<&Mutex<Vec<Vec<u8>>>>,
-) {
+fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mutex<W>) {
     let global_stats = &Mutex::new(Stats::default());
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
     let reference = RwLock::new((vec![], FxHashMap::default()));
 
     // Process the first/reference sample separately.
     if args.reference {
-        process_sample(
-            args,
-            reader,
-            seen,
-            global_stats,
-            writer,
-            &reference,
-            ggcat_input,
-        );
+        process_sample(args, reader, seen, global_stats, writer, &reference);
     }
 
     std::thread::scope(|scope| {
@@ -176,15 +138,7 @@ fn process<W: Write + Send>(
         for _t in 0..threads {
             scope.spawn(|| {
                 loop {
-                    if process_sample(
-                        args,
-                        reader,
-                        seen,
-                        global_stats,
-                        writer,
-                        &reference,
-                        ggcat_input,
-                    ) == None
+                    if process_sample(args, reader, seen, global_stats, writer, &reference) == None
                     {
                         break;
                     };
@@ -201,7 +155,6 @@ fn process_sample<W: Write>(
     global_stats: &Mutex<Stats>,
     writer: &Mutex<W>,
     reference: &RwLock<(Vec<u8>, FxHashMap<u128, usize>)>,
-    ggcat_input: Option<&Mutex<Vec<Vec<u8>>>>,
 ) -> Option<()> {
     let Args {
         k,
@@ -410,7 +363,6 @@ fn process_sample<W: Write>(
 
             // Write new contigs.
             let mut writer = writer.lock().unwrap();
-            let mut ggcat_sequences = ggcat_input.map(|input| input.lock().unwrap());
             let i_lock = std::time::Instant::now();
             t_lock += i_lock - i_sort2;
 
@@ -428,10 +380,6 @@ fn process_sample<W: Write>(
                         writer.write_all(b">\n").unwrap();
                         writer.write_all(&seq[active.clone()]).unwrap();
                         writer.write_all(b"\n").unwrap();
-
-                        if let Some(sequences) = &mut ggcat_sequences {
-                            sequences.push(seq[active.clone()].to_vec());
-                        }
 
                         if build_reference {
                             build_reference_vec.extend_from_slice(&seq[active.clone()]);

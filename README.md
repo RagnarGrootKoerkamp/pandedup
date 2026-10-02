@@ -35,15 +35,19 @@ taking 4 minutes:
 pandedup hprcv2.agc -k 64 -w 100 -o hprcv2.spss.k64.fa.zst --threads 64
 ```
 
-Add `--ggcat` to run GGCAT on the deduplicated contigs with every elaboration
-mode. The contigs are passed to GGCAT in memory, so this option needs enough
-RAM to hold them alongside GGCAT's working data. It writes one uncompressed
-`.fa` file per mode next to the `.fa.zst` output, named like
-`hprcv2.spss.k64.ggcat-greedy-matchtigs.fa`. The command prints elapsed time
-and byte size for the input, deduplicated output, and each GGCAT output.
-Add `--skip` to reuse the deduplicated output when it already exists. When
-combined with `--ggcat`, the existing compressed FASTA is read and passed to
-GGCAT.
+Run GGCAT separately on a `.fa` or `.fa.zst` file:
+
+```sh
+cargo run --release --example ggcat -- hprcv2.spss.k64.fa.zst -k 64 --mode simplitigs
+```
+
+`--mode` selects GGCAT's extra elaboration mode and defaults to `simplitigs`.
+Use `--mode greedy-matchtigs` for greedy matchtigs, or see `--help` for all
+modes. Use `-o` to set the output path; otherwise the example writes a
+neighboring `INPUT-kK-MODE.fa` file (for example, `x-k64-simplitigs.fa` for
+`x.fa`). The example loads the input contigs into
+memory and prints elapsed time and output size. Add `--skip` to `pandedup` to
+reuse its compressed output when it already exists.
 
 Add `--mss` to build a masked superstring from the deduplicated contigs and
 write it to a neighboring `.msfa` file.
