@@ -37,6 +37,43 @@ impl Radixable<u128> for SortEntry {
     }
 }
 
+/// Drop the leading base from sorted head keys by merging the four sorted
+/// ranges sharing that base. `overlap` is the length of the new keys.
+fn resort_heads(heads: &mut Vec<SortEntry>, scratch: &mut Vec<SortEntry>, overlap: usize) {
+    let shift = 2 * overlap;
+    let mask = (1u128 << shift) - 1;
+    let mut bounds = [0; 5];
+    let mut end = 0;
+    for base in 0..4 {
+        while end < heads.len() && (heads[end].key >> shift) == base as u128 {
+            end += 1;
+        }
+        bounds[base + 1] = end;
+    }
+    debug_assert_eq!(end, heads.len());
+
+    let mut cursors = [bounds[0], bounds[1], bounds[2], bounds[3]];
+    scratch.clear();
+    for _ in 0..heads.len() {
+        let mut best_base = 4;
+        let mut best_key = u128::MAX;
+        for base in 0..4 {
+            if cursors[base] < bounds[base + 1] {
+                let key = heads[cursors[base]].key & mask;
+                if best_base == 4 || key < best_key {
+                    best_base = base;
+                    best_key = key;
+                }
+            }
+        }
+        let mut entry = heads[cursors[best_base]];
+        entry.key = best_key;
+        scratch.push(entry);
+        cursors[best_base] += 1;
+    }
+    std::mem::swap(heads, scratch);
+}
+
 struct Contig {
     /// The head of the contig, in fwd and rc direction
     kmer_in: [u128; 2],
@@ -103,25 +140,29 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     info!("sorting {} tails..", tails.len());
     tails.voracious_mt_sort(threads);
 
-    for overlap in (0..=k - 1).rev() {
-        info!("overlap: {}", overlap);
-        let head_mask = (1u128 << (2 * overlap)) - 1;
-        let tail_shift = 2 * (k - overlap);
-        let mut heads = Vec::with_capacity(2 * ends.len());
-        for (index, contig) in ends.iter().enumerate() {
-            for reverse in 0..2 {
-                // An RC head uses the physical forward tail, and vice versa.
-                if contig.nbs[reverse].is_none() {
-                    heads.push(SortEntry {
-                        key: contig.kmer_in[reverse] & head_mask,
-                        index,
-                        reverse,
-                    });
-                }
-            }
+    let first_overlap = k - 1;
+    let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
+    let mut heads = Vec::with_capacity(2 * ends.len());
+    for (index, contig) in ends.iter().enumerate() {
+        for reverse in 0..2 {
+            heads.push(SortEntry {
+                key: contig.kmer_in[reverse] & first_head_mask,
+                index,
+                reverse,
+            });
         }
-        info!("sorting {} heads..", heads.len());
-        heads.voracious_mt_sort(threads);
+    }
+    info!("sorting {} heads..", heads.len());
+    heads.voracious_mt_sort(threads);
+    let mut head_scratch = Vec::with_capacity(heads.len());
+
+    for overlap in (0..=first_overlap).rev() {
+        info!("overlap: {}", overlap);
+        let tail_shift = 2 * (k - overlap);
+        if overlap < first_overlap {
+            // heads.retain(|head| ends[head.index].nbs[head.reverse].is_none());
+            resort_heads(&mut heads, &mut head_scratch, overlap);
+        }
 
         // mergesort the two lists; make a connection whenever possible.
         info!("merging..");
