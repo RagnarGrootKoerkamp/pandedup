@@ -132,15 +132,13 @@ fn resort_heads(
     std::mem::swap(heads, scratch);
 }
 
-struct Contig {
-    /// The head of the contig, in fwd and rc direction
-    kmer_in: [u128; 2],
-    /// The tail of the contig, in fwd and rc direction
-    kmer_out: [u128; 2],
+#[derive(Clone, Copy)]
+struct Links {
     /// Neighbors at the forward head (0) and forward tail (1).
     nbs: [Option<Link>; 2],
 }
 
+#[derive(Clone, Copy)]
 struct Link {
     index: usize,
     reverse: bool,
@@ -154,69 +152,58 @@ struct Link {
 ///
 /// If the input contains duplicate kmers, in case of (greedy) matchtigs, those
 /// will be preserved in the output.
-pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
+pub fn masked_superstring(k: usize, mut contigs: Vec<Vec<u8>>) -> Vec<u8> {
     info!("masked_superstring: k={}, contigs={}", k, contigs.len());
     assert!((1..=64).contains(&k));
 
-    // Each contig is stored as a fwd and rc kmer for the head, and one for the tail.
-    // [[fwd in, fwd out], [rc in, rc out]]
     info!("Collect contig ends");
-    let mut ends: Vec<Contig> = contigs
+    let mut total_merged = 0;
+    let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
+    let threads = rayon::current_num_threads();
+    // Filter first so indices in both entry vectors match `ends` even when
+    // the input contains contigs shorter than k.
+    contigs.retain(|c| c.len() >= k);
+    let num_contigs = contigs.len();
+    let empty_entry = SortEntry {
+        key: 0,
+        index: 0,
+        reverse: 0,
+    };
+    let mut heads = vec![empty_entry; 2 * contigs.len()];
+    let mut tails = vec![empty_entry; 2 * contigs.len()];
+    let first_overlap = k - 1;
+    let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
+    contigs
         .par_iter()
-        .filter_map(|c| {
-            // TODO handle short contigs
-            if c.len() < k {
-                return None;
-            }
-            let seq = packed_seq::AsciiSeq(c);
+        .zip(heads.par_chunks_mut(2))
+        .zip(tails.par_chunks_mut(2))
+        .enumerate()
+        .for_each(|(index, ((c, head_entries), tail_entries))| {
+            let seq = packed_seq::AsciiSeq(c.as_slice());
             let head_fw = seq.read_kmer_u128(k, 0);
             let head_rc = seq.read_revcomp_kmer_u128(k, 0);
             let tail_fw = seq.read_kmer_u128(k, c.len() - k);
             let tail_rc = seq.read_revcomp_kmer_u128(k, c.len() - k);
-            Some(Contig {
-                kmer_in: [head_fw, tail_rc],
-                kmer_out: [tail_fw, head_rc],
-                nbs: [None, None],
-            })
-        })
-        .collect();
-
-    let mut total_merged = 0;
-    let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
-
-    info!("Drop contigs");
+            for reverse in 0..2 {
+                head_entries[reverse] = SortEntry {
+                    key: [head_fw, tail_rc][reverse] & first_head_mask,
+                    index,
+                    reverse,
+                };
+                tail_entries[reverse] = SortEntry {
+                    key: [tail_fw, head_rc][reverse],
+                    index,
+                    reverse,
+                };
+            }
+        });
     drop(contigs);
 
-    let threads = rayon::current_num_threads();
+    let mut links = vec![Links { nbs: [None, None] }; num_contigs];
 
-    info!("Build tails..");
     // Sorting full tail k-mers also sorts every shorter prefix used below.
-    let mut tails = Vec::with_capacity(2 * ends.len());
-    for (index, contig) in ends.iter().enumerate() {
-        for reverse in 0..2 {
-            tails.push(SortEntry {
-                key: contig.kmer_out[reverse],
-                index,
-                reverse,
-            });
-        }
-    }
     info!("sorting {} tails..", tails.len());
     tails.voracious_mt_sort(threads);
-
-    info!("build head..");
-    let first_overlap = k - 1;
-    let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
-    let mut heads = Vec::with_capacity(2 * ends.len());
-    for (index, contig) in ends.iter().enumerate() {
-        for reverse in 0..2 {
-            heads.push(SortEntry {
-                key: contig.kmer_in[reverse] & first_head_mask,
-                index,
-                reverse,
-            });
-        }
-    }
     info!("sorting {} heads..", heads.len());
     heads.voracious_mt_sort(threads);
     let mut scratch = Vec::with_capacity(heads.len());
@@ -254,8 +241,8 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
 
         // Each mutex owns a disjoint mutable slice. Lock both slices in index
         // order when a link crosses shards, so workers cannot deadlock.
-        let shard_len = ends.len().div_ceil(chunks.saturating_mul(16)).max(1);
-        let shards: Vec<_> = ends.chunks_mut(shard_len).map(Mutex::new).collect();
+        let shard_len = links.len().div_ceil(chunks.saturating_mul(16)).max(1);
+        let shards: Vec<_> = links.chunks_mut(shard_len).map(Mutex::new).collect();
         let (merged, newly_marked_heads, newly_marked_tails) = {
             let mut jobs = Vec::new();
             let mut remaining_heads = heads.as_mut_slice();
@@ -440,17 +427,17 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
         info!(
             "overlap {overlap} merged {:>9} total merged {total_merged:>9} remaining {:>9} total len {total_len:>11}",
             merged,
-            ends.len() - total_merged
+            links.len() - total_merged
         );
     }
-    assert_eq!(total_merged, ends.len());
+    assert_eq!(total_merged, links.len());
     // TODO break cycles
 
     unimplemented!("break cycles");
 
     let mut num_cycles = 0;
-    let mut done = vec![false; ends.len()];
-    for i in 0..ends.len() {
+    let mut done = vec![false; links.len()];
+    for i in 0..links.len() {
         if done[i] {
             continue;
         }
@@ -458,7 +445,7 @@ pub fn masked_superstring(k: usize, contigs: Vec<Vec<u8>>) -> Vec<u8> {
         let mut reverse = false;
         loop {
             done[j] = true;
-            let link = ends[j].nbs[!reverse as usize].as_ref().unwrap();
+            let link = links[j].nbs[!reverse as usize].as_ref().unwrap();
             j = link.index;
             reverse = link.reverse;
             if j == i {
