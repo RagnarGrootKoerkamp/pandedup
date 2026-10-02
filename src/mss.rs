@@ -177,5 +177,26 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     assert_eq!(total_merged, ends.len());
     // TODO break cycles
 
+    let mut num_cycles = 0;
+    let mut done = vec![false; ends.len()];
+    for i in 0..ends.len() {
+        if done[i] {
+            continue;
+        }
+        let mut j = i;
+        let mut reverse = false;
+        loop {
+            done[j] = true;
+            let link = ends[j].nbs[!reverse as usize].as_ref().unwrap();
+            j = link.index;
+            reverse = link.reverse;
+            if j == i {
+                break;
+            }
+        }
+        num_cycles += 1;
+    }
+    eprintln!("Number of cycles: {num_cycles}");
+
     todo!()
 }
