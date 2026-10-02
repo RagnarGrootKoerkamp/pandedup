@@ -33,13 +33,9 @@ fn main() {
         .init();
     let args = Args::parse();
     info!("Reading input..");
-    let mut reader = needletail::parse_fastx_file(&args.input).unwrap();
-    let mut contigs = Vec::new();
-    while let Some(record) = reader.next() {
-        contigs.push(record.unwrap().seq().into_owned());
-    }
+    let (seq, ranges) = packed_seq::PackedSeqVec::from_fastx(&args.input);
 
-    let superstring = mss::masked_superstring(args.k, contigs);
+    let superstring = mss::masked_superstring(args.k, seq, ranges);
     let output = args
         .output
         .unwrap_or_else(|| args.input.with_extension("msfa"));

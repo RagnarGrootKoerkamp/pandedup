@@ -2240,12 +2240,11 @@ dependencies = [
 [[package]]
 name = "packed-seq"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a3a89b413dff56614047583dad3cc5c4a61ad16a436a578dfaf8c214e98734a"
 dependencies = [
  "cfg-if",
  "ensure_simd",
  "mem_dbg",
+ "needletail",
  "rand 0.10.2",
  "wide 1.5.0",
 ]
@@ -2272,6 +2271,7 @@ dependencies = [
  "gxhash",
  "needletail",
  "num_cpus",
+ "packed-seq",
  "perfcnt",
  "ragc-core",
  "rand 0.10.2",

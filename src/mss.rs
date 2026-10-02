@@ -6,6 +6,8 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
+use core::ops::Range;
+use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use seq_hash::packed_seq::{self, Seq};
 use std::sync::Mutex;
@@ -152,38 +154,38 @@ struct Link {
 ///
 /// If the input contains duplicate kmers, in case of (greedy) matchtigs, those
 /// will be preserved in the output.
-pub fn masked_superstring(k: usize, mut contigs: Vec<Vec<u8>>) -> Vec<u8> {
-    info!("masked_superstring: k={}, contigs={}", k, contigs.len());
+pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usize>>) -> Vec<u8> {
+    info!("masked_superstring: k={}, contigs={}", k, ranges.len());
     assert!((1..=64).contains(&k));
 
-    info!("Collect contig ends");
+    info!("Collect tig ends");
     let mut total_merged = 0;
-    let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
+    let mut total_len = ranges.iter().map(|c| c.len()).sum::<usize>();
     let threads = rayon::current_num_threads();
     // Filter first so indices in both entry vectors match `ends` even when
     // the input contains contigs shorter than k.
-    contigs.retain(|c| c.len() >= k);
-    let num_contigs = contigs.len();
+    ranges.retain(|c| c.len() >= k);
+    let num_contigs = ranges.len();
+
     let empty_entry = SortEntry {
         key: 0,
         index: 0,
         reverse: 0,
     };
-    let mut heads = vec![empty_entry; 2 * contigs.len()];
-    let mut tails = vec![empty_entry; 2 * contigs.len()];
+    let mut heads = vec![empty_entry; 2 * num_contigs];
+    let mut tails = vec![empty_entry; 2 * num_contigs];
     let first_overlap = k - 1;
     let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
-    contigs
-        .par_iter()
+    ranges
+        .into_par_iter()
         .zip(heads.par_chunks_mut(2))
         .zip(tails.par_chunks_mut(2))
         .enumerate()
-        .for_each(|(index, ((c, head_entries), tail_entries))| {
-            let seq = packed_seq::AsciiSeq(c.as_slice());
-            let head_fw = seq.read_kmer_u128(k, 0);
-            let head_rc = seq.read_revcomp_kmer_u128(k, 0);
-            let tail_fw = seq.read_kmer_u128(k, c.len() - k);
-            let tail_rc = seq.read_revcomp_kmer_u128(k, c.len() - k);
+        .for_each(|(index, ((r, head_entries), tail_entries))| {
+            let head_fw = seq.read_kmer_u128(k, r.start);
+            let head_rc = seq.read_revcomp_kmer_u128(k, r.start);
+            let tail_fw = seq.read_kmer_u128(k, r.end - k);
+            let tail_rc = seq.read_revcomp_kmer_u128(k, r.end - k);
             for reverse in 0..2 {
                 head_entries[reverse] = SortEntry {
                     key: [head_fw, tail_rc][reverse] & first_head_mask,
@@ -197,15 +199,16 @@ pub fn masked_superstring(k: usize, mut contigs: Vec<Vec<u8>>) -> Vec<u8> {
                 };
             }
         });
-    drop(contigs);
+    drop(seq);
 
     let mut links = vec![Links { nbs: [None, None] }; num_contigs];
 
     // Sorting full tail k-mers also sorts every shorter prefix used below.
-    info!("sorting {} tails..", tails.len());
-    tails.voracious_mt_sort(threads);
     info!("sorting {} heads..", heads.len());
     heads.voracious_mt_sort(threads);
+    info!("sorting {} tails..", tails.len());
+    tails.voracious_mt_sort(threads);
+    info!("Reserve scratch");
     let mut scratch = Vec::with_capacity(heads.len());
 
     let mut marked_heads = 0;
@@ -379,7 +382,7 @@ pub fn masked_superstring(k: usize, mut contigs: Vec<Vec<u8>>) -> Vec<u8> {
         ] {
             // Only filter out dead entries if that's more than half of them.
             if *marked > entries.len() / 2 {
-                info!("Retain {} of {} entries..", *marked, entries.len());
+                info!("Drop {} of {} entries..", *marked, entries.len());
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = entries
                     .par_chunks(chunk_len)
@@ -419,6 +422,7 @@ pub fn masked_superstring(k: usize, mut contigs: Vec<Vec<u8>>) -> Vec<u8> {
                     }
                 });
                 std::mem::swap(entries, &mut scratch);
+                info!("Final size: {} entries", entries.len());
                 *marked = 0;
             }
         }
