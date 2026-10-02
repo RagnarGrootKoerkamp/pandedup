@@ -14,11 +14,17 @@ use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 #[derive(Clone, Copy)]
+#[repr(C, packed(1))]
 struct HeadOrTail {
     key: u128,
     index: u32,
     reverse: bool,
 }
+
+const _: () = {
+    assert!(std::mem::align_of::<HeadOrTail>() == 1);
+    assert!(std::mem::size_of::<HeadOrTail>() == 21);
+};
 
 impl PartialEq for HeadOrTail {
     fn eq(&self, other: &Self) -> bool {
@@ -28,7 +34,9 @@ impl PartialEq for HeadOrTail {
 
 impl PartialOrd for HeadOrTail {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.key.cmp(&other.key))
+        let key = self.key;
+        let other_key = other.key;
+        Some(key.cmp(&other_key))
     }
 }
 
