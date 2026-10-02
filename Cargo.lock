@@ -1929,15 +1929,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e88c3cbe8288f77f293e48a28b3232e3defd203a6d839fa7f68ea4329e83464"
 
 [[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
-]
-
-[[package]]
 name = "matchtigs"
 version = "2.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3495,14 +3486,11 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
- "matchers",
+ "chrono",
  "nu-ansi-term",
- "once_cell",
- "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
- "tracing",
  "tracing-core",
  "tracing-log",
 ]

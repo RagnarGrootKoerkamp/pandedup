@@ -19,7 +19,7 @@ num_cpus = "1.17.0"
 ragc-core.git = "https://github.com/ragnargrootkoerkamp/ragc"
 rand = "0.10.2"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
 seq-hash = "0.2.0"
 simd-minimizers = "3.0.0"
 tar = "0.4.46"

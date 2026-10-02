@@ -4,7 +4,7 @@ use ragc_core::{Decompressor, DecompressorConfig};
 mod ggcat;
 mod timing;
 use std::{
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, IsTerminal, Read, Write},
     marker::PhantomPinned,
     ops::Range,
     path::PathBuf,
@@ -74,7 +74,16 @@ struct Stats {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .compact()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%H:%M:%S".to_string(),
+        ))
+        .init();
+
     let args = Args::parse();
     let input = &args.input;
     let output = &args.output;
