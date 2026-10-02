@@ -7,7 +7,7 @@
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
 use core::ops::{BitAnd, Mul, Range, Shl, Shr, Sub};
-use packed_seq::{PackedSeqVec, SeqVec};
+use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use rayon::prelude::*;
 use std::sync::Mutex;
 use tracing::{debug, info, trace};
@@ -276,9 +276,88 @@ struct Links<I: MssIndex> {
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
 struct Link<I: MssIndex> {
-    /// Twice the contig index, plus one for reverse complement.
+    /// Oriented contig to traverse after crossing this link.
     id: I,
     overlap: u8,
+}
+
+fn append_contig(
+    output: &mut Vec<u8>,
+    seq: &PackedSeqVec,
+    range: &Range<usize>,
+    reverse: bool,
+    overlap: usize,
+    k: usize,
+) {
+    // FIXME: Use packed_seq utils for this somehow
+    let mut bases = seq.slice(range.clone()).unpack();
+    if reverse {
+        bases.reverse();
+        for base in &mut bases {
+            *base = complement_char(*base);
+        }
+    }
+    assert!(overlap <= bases.len() && overlap <= output.len());
+    if !output.is_empty() {
+        let end = output.len();
+        debug_assert!(
+            output[end - overlap..]
+                .iter()
+                .zip(&bases[..overlap])
+                .all(|(left, right)| left.to_ascii_uppercase() == *right)
+        );
+        // Starts in this interval cross the join but do not belong to either contig.
+        for base in &mut output[end.saturating_sub(k - 1)..end - overlap] {
+            *base = base.to_ascii_lowercase();
+        }
+    }
+    output.extend_from_slice(&bases[overlap..]);
+}
+
+fn reconstruct_cycles<I: MssIndex>(
+    k: usize,
+    seq: &PackedSeqVec,
+    ranges: &[Range<usize>],
+    short_ranges: &[Range<usize>],
+    links: &[Links<I>],
+    capacity: usize,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(capacity);
+    let mut done = vec![false; links.len()];
+    let mut num_cycles = 0;
+    for start in 0..links.len() {
+        if done[start] {
+            continue;
+        }
+        let mut id = I::from_parts(start, false);
+        let mut overlap = 0;
+        loop {
+            let index = id.contig_index();
+            assert!(!done[index], "cycle revisits contig {index} before closing");
+            done[index] = true;
+            append_contig(&mut output, seq, &ranges[index], id.reverse(), overlap, k);
+            let link =
+                links[index].nbs[usize::from(!id.reverse())].expect("missing link at contig tail");
+            let next = link.id;
+            if next.contig_index() == start {
+                break;
+            }
+            id = next;
+            overlap = link.overlap as usize;
+        }
+        num_cycles += 1;
+    }
+    // Short contigs contain no input k-mers, but retain their sequences.
+    for range in short_ranges {
+        if !range.is_empty() {
+            append_contig(&mut output, seq, range, false, 0, k);
+        }
+    }
+    info!(
+        "Number of cycles: {num_cycles}; output length: {}",
+        output.len()
+    );
+    output
 }
 
 /// Input: unitigs, simplitigs=pathtigs, eulertigs (or (greedy) matchtigs).
@@ -291,7 +370,7 @@ struct Link<I: MssIndex> {
 pub fn masked_superstring<K: MssKey>(
     k: usize,
     seq: PackedSeqVec,
-    mut ranges: Vec<Range<usize>>,
+    ranges: Vec<Range<usize>>,
 ) -> Vec<u8>
 where
     HeadOrTail<K, u32>: Radixable<K, Key = K>,
@@ -302,11 +381,11 @@ where
     let total_len = ranges.iter().map(|c| c.len()).sum::<usize>();
     // Filter first so indices in both entry vectors match `ends` even when
     // the input contains contigs shorter than k.
-    ranges.retain(|c| c.len() >= k);
+    let (ranges, short_ranges): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|c| c.len() >= k);
     if ranges.len() < (1usize << 31) {
-        masked_superstring_with_index::<K, u32>(k, seq, ranges, total_len)
+        masked_superstring_with_index::<K, u32>(k, seq, ranges, short_ranges, total_len)
     } else {
-        masked_superstring_with_index::<K, u64>(k, seq, ranges, total_len)
+        masked_superstring_with_index::<K, u64>(k, seq, ranges, short_ranges, total_len)
     }
 }
 
@@ -314,6 +393,7 @@ fn masked_superstring_with_index<K: MssKey, I: MssIndex>(
     k: usize,
     seq: PackedSeqVec,
     ranges: Vec<Range<usize>>,
+    short_ranges: Vec<Range<usize>>,
     mut total_len: usize,
 ) -> Vec<u8>
 where
@@ -338,7 +418,7 @@ where
     let first_overlap = k - 1;
     let first_head_mask = (K::ONE << (2 * first_overlap)) - K::ONE;
     ranges
-        .into_par_iter()
+        .par_iter()
         .zip(heads.par_chunks_mut(2))
         .zip(tails.par_chunks_mut(2))
         .enumerate()
@@ -359,7 +439,6 @@ where
                 };
             }
         });
-    drop(seq);
 
     let mut links: Vec<Links<I>> = vec![Links { nbs: [None, None] }; num_contigs];
 
@@ -472,7 +551,7 @@ where
                             let tail_used = shard[tail_local].nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 shard[head_local].nbs[head_slot] = Some(Link {
-                                    id: tail_id,
+                                    id: tail_id.flip(),
                                     overlap: overlap as u8,
                                 });
                                 shard[tail_local].nbs[tail_slot] = Some(Link {
@@ -500,7 +579,7 @@ where
                             let tail_used = tail_end.nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 head_end.nbs[head_slot] = Some(Link {
-                                    id: tail_id,
+                                    id: tail_id.flip(),
                                     overlap: overlap as u8,
                                 });
                                 tail_end.nbs[tail_slot] = Some(Link {
@@ -597,32 +676,7 @@ where
         );
     }
     assert_eq!(total_merged, links.len());
-    return vec![];
 
-    // TODO break cycles
-
-    unimplemented!("break cycles");
-
-    let mut num_cycles = 0;
-    let mut done = vec![false; links.len()];
-    for i in 0..links.len() {
-        if done[i] {
-            continue;
-        }
-        let mut j = i;
-        let mut reverse = false;
-        loop {
-            done[j] = true;
-            let link = links[j].nbs[usize::from(!reverse)].as_ref().unwrap();
-            j = link.id.contig_index();
-            reverse = link.id.reverse();
-            if j == i {
-                break;
-            }
-        }
-        num_cycles += 1;
-    }
-    eprintln!("Number of cycles: {num_cycles}");
-
-    todo!()
+    info!("Reconstructing cycles..");
+    reconstruct_cycles(k, &seq, &ranges, &short_ranges, &links, total_len)
 }
