@@ -9,31 +9,30 @@
 use core::ops::Range;
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
-use seq_hash::packed_seq::{self, Seq};
 use std::sync::Mutex;
 use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 #[derive(Clone, Copy)]
-struct SortEntry {
+struct HeadOrTail {
     key: u128,
-    index: usize,
-    reverse: usize,
+    index: u32,
+    reverse: bool,
 }
 
-impl PartialEq for SortEntry {
+impl PartialEq for HeadOrTail {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl PartialOrd for SortEntry {
+impl PartialOrd for HeadOrTail {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.key.cmp(&other.key))
     }
 }
 
-impl Radixable<u128> for SortEntry {
+impl Radixable<u128> for HeadOrTail {
     type Key = u128;
 
     fn key(&self) -> Self::Key {
@@ -49,7 +48,7 @@ struct MergePart {
 }
 
 /// Merge 4 slices of `input` into `output`, using the given `mask` to compare keys.
-fn merge_head_part(input: &[SortEntry], output: &mut [SortEntry], mask: u128, part: MergePart) {
+fn merge_head_part(input: &[HeadOrTail], output: &mut [HeadOrTail], mask: u128, part: MergePart) {
     let mut cursors = part.start;
     for slot in output {
         let mut best_base = 0;
@@ -73,8 +72,8 @@ fn merge_head_part(input: &[SortEntry], output: &mut [SortEntry], mask: u128, pa
 /// Drop the leading base from sorted head keys by merging the four sorted
 /// ranges sharing that base. `overlap` is the length of the new keys.
 fn resort_heads(
-    heads: &mut Vec<SortEntry>,
-    scratch: &mut Vec<SortEntry>,
+    heads: &mut Vec<HeadOrTail>,
+    scratch: &mut Vec<HeadOrTail>,
     overlap: usize,
     threads: usize,
 ) {
@@ -114,10 +113,10 @@ fn resort_heads(
 
     scratch.resize(
         heads.len(),
-        SortEntry {
+        HeadOrTail {
             key: 0,
             index: 0,
-            reverse: 0,
+            reverse: false,
         },
     );
     let input = heads.as_slice();
@@ -142,7 +141,7 @@ struct Links {
 
 #[derive(Clone, Copy)]
 struct Link {
-    index: usize,
+    index: u32,
     reverse: bool,
     overlap: u8,
 }
@@ -166,11 +165,13 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
     // the input contains contigs shorter than k.
     ranges.retain(|c| c.len() >= k);
     let num_contigs = ranges.len();
+    // reserve u32::MAX itself as sentinel.
+    assert!(num_contigs < u32::MAX as usize);
 
-    let empty_entry = SortEntry {
+    let empty_entry = HeadOrTail {
         key: 0,
         index: 0,
-        reverse: 0,
+        reverse: false,
     };
     let mut heads = vec![empty_entry; 2 * num_contigs];
     let mut tails = vec![empty_entry; 2 * num_contigs];
@@ -186,15 +187,16 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
             let head_rc = seq.read_revcomp_kmer_u128(k, r.start);
             let tail_fw = seq.read_kmer_u128(k, r.end - k);
             let tail_rc = seq.read_revcomp_kmer_u128(k, r.end - k);
-            for reverse in 0..2 {
-                head_entries[reverse] = SortEntry {
-                    key: [head_fw, tail_rc][reverse] & first_head_mask,
-                    index,
+            for reverse in [false, true] {
+                let direction = usize::from(reverse);
+                head_entries[direction] = HeadOrTail {
+                    key: [head_fw, tail_rc][direction] & first_head_mask,
+                    index: index as u32,
                     reverse,
                 };
-                tail_entries[reverse] = SortEntry {
-                    key: [tail_fw, head_rc][reverse],
-                    index,
+                tail_entries[direction] = HeadOrTail {
+                    key: [tail_fw, head_rc][direction],
+                    index: index as u32,
                     reverse,
                 };
             }
@@ -209,7 +211,7 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
     info!("sorting {} tails..", tails.len());
     tails.voracious_mt_sort(threads);
     info!("Reserve scratch");
-    let mut scratch = Vec::with_capacity(heads.len());
+    let mut scratch = vec![];
 
     let mut marked_heads = 0;
     let mut marked_tails = 0;
@@ -270,11 +272,11 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                     while i < head_slice.len() && j < tail_slice.len() {
                         let head = head_slice[i];
                         let tail = tail_slice[j];
-                        if head.index == usize::MAX {
+                        if head.index == u32::MAX {
                             i += 1;
                             continue;
                         }
-                        if tail.index == usize::MAX {
+                        if tail.index == u32::MAX {
                             j += 1;
                             continue;
                         }
@@ -287,29 +289,32 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                             j += 1;
                             continue;
                         }
-                        let tail_slot = 1 - tail.reverse;
-                        if head.index == tail.index && head.reverse == tail_slot {
+                        if head.index == tail.index && head.reverse == !tail.reverse {
                             j += 1;
                             continue;
                         }
 
-                        let head_shard = head.index / shard_len;
-                        let tail_shard = tail.index / shard_len;
+                        let head_index = head.index as usize;
+                        let tail_index = tail.index as usize;
+                        let head_slot = usize::from(head.reverse);
+                        let tail_slot = usize::from(!tail.reverse);
+                        let head_shard = head_index / shard_len;
+                        let tail_shard = tail_index / shard_len;
                         let (head_used, tail_used) = if head_shard == tail_shard {
                             let mut shard = shards[head_shard].lock().unwrap();
-                            let head_local = head.index % shard_len;
-                            let tail_local = tail.index % shard_len;
-                            let head_used = shard[head_local].nbs[head.reverse].is_some();
+                            let head_local = head_index % shard_len;
+                            let tail_local = tail_index % shard_len;
+                            let head_used = shard[head_local].nbs[head_slot].is_some();
                             let tail_used = shard[tail_local].nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
-                                shard[head_local].nbs[head.reverse] = Some(Link {
+                                shard[head_local].nbs[head_slot] = Some(Link {
                                     index: tail.index,
-                                    reverse: tail.reverse != 0,
+                                    reverse: tail.reverse,
                                     overlap: overlap as u8,
                                 });
                                 shard[tail_local].nbs[tail_slot] = Some(Link {
                                     index: head.index,
-                                    reverse: head.reverse != 0,
+                                    reverse: head.reverse,
                                     overlap: overlap as u8,
                                 });
                             }
@@ -320,34 +325,34 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                             let mut upper = upper[0].lock().unwrap();
                             let (head_end, tail_end) = if head_shard < tail_shard {
                                 (
-                                    &mut lower[head.index % shard_len],
-                                    &mut upper[tail.index % shard_len],
+                                    &mut lower[head_index % shard_len],
+                                    &mut upper[tail_index % shard_len],
                                 )
                             } else {
                                 (
-                                    &mut upper[head.index % shard_len],
-                                    &mut lower[tail.index % shard_len],
+                                    &mut upper[head_index % shard_len],
+                                    &mut lower[tail_index % shard_len],
                                 )
                             };
-                            let head_used = head_end.nbs[head.reverse].is_some();
+                            let head_used = head_end.nbs[head_slot].is_some();
                             let tail_used = tail_end.nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
-                                head_end.nbs[head.reverse] = Some(Link {
+                                head_end.nbs[head_slot] = Some(Link {
                                     index: tail.index,
-                                    reverse: tail.reverse != 0,
+                                    reverse: tail.reverse,
                                     overlap: overlap as u8,
                                 });
                                 tail_end.nbs[tail_slot] = Some(Link {
                                     index: head.index,
-                                    reverse: head.reverse != 0,
+                                    reverse: head.reverse,
                                     overlap: overlap as u8,
                                 });
                             }
                             (head_used, tail_used)
                         };
                         if !head_used && !tail_used {
-                            head_slice[i].index = usize::MAX;
-                            tail_slice[j].index = usize::MAX;
+                            head_slice[i].index = u32::MAX;
+                            tail_slice[j].index = u32::MAX;
                             marked_heads += 1;
                             marked_tails += 1;
                             merged += 1;
@@ -355,12 +360,12 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                             j += 1;
                         } else {
                             if head_used {
-                                head_slice[i].index = usize::MAX;
+                                head_slice[i].index = u32::MAX;
                                 marked_heads += 1;
                                 i += 1;
                             }
                             if tail_used {
-                                tail_slice[j].index = usize::MAX;
+                                tail_slice[j].index = u32::MAX;
                                 marked_tails += 1;
                                 j += 1;
                             }
@@ -386,22 +391,17 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = entries
                     .par_chunks(chunk_len)
-                    .map(|slice| {
-                        slice
-                            .iter()
-                            .filter(|entry| entry.index == usize::MAX)
-                            .count()
-                    })
+                    .map(|slice| slice.iter().filter(|entry| entry.index == u32::MAX).count())
                     .collect::<Vec<_>>();
                 let removed_total = removed.iter().sum::<usize>();
                 debug_assert_eq!(removed_total, *marked);
                 let retained = entries.len() - removed_total;
                 scratch.resize(
                     retained,
-                    SortEntry {
+                    HeadOrTail {
                         key: 0,
                         index: 0,
-                        reverse: 0,
+                        reverse: false,
                     },
                 );
                 rayon::scope(|scope| {
@@ -412,7 +412,7 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
                         scope.spawn(move |_| {
                             let mut write = 0;
                             for &entry in input {
-                                if entry.index != usize::MAX {
+                                if entry.index != u32::MAX {
                                     part[write] = entry;
                                     write += 1;
                                 }
@@ -449,8 +449,8 @@ pub fn masked_superstring(k: usize, seq: PackedSeqVec, mut ranges: Vec<Range<usi
         let mut reverse = false;
         loop {
             done[j] = true;
-            let link = links[j].nbs[!reverse as usize].as_ref().unwrap();
-            j = link.index;
+            let link = links[j].nbs[usize::from(!reverse)].as_ref().unwrap();
+            j = link.index as usize;
             reverse = link.reverse;
             if j == i {
                 break;
