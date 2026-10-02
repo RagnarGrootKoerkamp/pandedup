@@ -2275,6 +2275,7 @@ dependencies = [
  "perfcnt",
  "ragc-core",
  "rand 0.10.2",
+ "rayon",
  "seq-hash",
  "simd-minimizers",
  "tar",

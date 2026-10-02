@@ -6,11 +6,9 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use seq_hash::packed_seq::{self, Seq};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Mutex;
 use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
@@ -84,14 +82,10 @@ fn resort_heads(
     let shift = 2 * overlap;
     let mask = (1u128 << shift) - 1;
     let mut bounds = [0; 5];
-    let mut end = 0;
-    for base in 0..4 {
-        while end < heads.len() && (heads[end].key >> shift) == base as u128 {
-            end += 1;
-        }
-        bounds[base + 1] = end;
+    for base in 1..4 {
+        bounds[base] = heads.partition_point(|entry| entry.key >> shift < base as u128);
     }
-    debug_assert_eq!(end, heads.len());
+    bounds[4] = heads.len();
 
     let chunks = threads.max(1).min(heads.len());
     let width = (1u128 << shift).div_ceil(chunks as u128);
@@ -166,23 +160,26 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
 
     // Each contig is stored as a fwd and rc kmer for the head, and one for the tail.
     // [[fwd in, fwd out], [rc in, rc out]]
-    let mut ends: Vec<Contig> = vec![];
-    for c in contigs {
-        // TODO handle short contigs
-        if c.len() < k {
-            continue;
-        }
-        let seq = packed_seq::AsciiSeq(c);
-        let head_fw = seq.read_kmer_u128(k, 0);
-        let head_rc = seq.read_revcomp_kmer_u128(k, 0);
-        let tail_fw = seq.read_kmer_u128(k, c.len() - k);
-        let tail_rc = seq.read_revcomp_kmer_u128(k, c.len() - k);
-        ends.push(Contig {
-            kmer_in: [head_fw, tail_rc],
-            kmer_out: [tail_fw, head_rc],
-            nbs: [None, None],
-        });
-    }
+    info!("Collect contig ends");
+    let mut ends: Vec<Contig> = contigs
+        .par_iter()
+        .filter_map(|c| {
+            // TODO handle short contigs
+            if c.len() < k {
+                return None;
+            }
+            let seq = packed_seq::AsciiSeq(c);
+            let head_fw = seq.read_kmer_u128(k, 0);
+            let head_rc = seq.read_revcomp_kmer_u128(k, 0);
+            let tail_fw = seq.read_kmer_u128(k, c.len() - k);
+            let tail_rc = seq.read_revcomp_kmer_u128(k, c.len() - k);
+            Some(Contig {
+                kmer_in: [head_fw, tail_rc],
+                kmer_out: [tail_fw, head_rc],
+                nbs: [None, None],
+            })
+        })
+        .collect();
 
     let mut total_merged = 0;
     let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
@@ -190,6 +187,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         .map(usize::from)
         .unwrap_or(1);
 
+    info!("Build tails..");
     // Sorting full tail k-mers also sorts every shorter prefix used below.
     let mut tails = Vec::with_capacity(2 * ends.len());
     for (index, contig) in ends.iter().enumerate() {
@@ -204,6 +202,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     info!("sorting {} tails..", tails.len());
     tails.voracious_mt_sort(threads);
 
+    info!("build head..");
     let first_overlap = k - 1;
     let first_head_mask = (1u128 << (2 * first_overlap)) - 1;
     let mut heads = Vec::with_capacity(2 * ends.len());
@@ -220,6 +219,9 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     heads.voracious_mt_sort(threads);
     let mut head_scratch = Vec::with_capacity(heads.len());
     let mut tail_scratch = Vec::with_capacity(tails.len());
+
+    let mut marked_heads = 0;
+    let mut marked_tails = 0;
 
     for overlap in (0..=first_overlap).rev() {
         info!("overlap: {}", overlap);
@@ -253,7 +255,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         // order when a link crosses shards, so workers cannot deadlock.
         let shard_len = ends.len().div_ceil(chunks.saturating_mul(16)).max(1);
         let shards: Vec<_> = ends.chunks_mut(shard_len).map(Mutex::new).collect();
-        let merged = std::thread::scope(|scope| {
+        let (merged, newly_marked_heads, newly_marked_tails) = std::thread::scope(|scope| {
             let mut workers = Vec::new();
             let mut remaining_heads = heads.as_mut_slice();
             let mut remaining_tails = tails.as_mut_slice();
@@ -268,11 +270,21 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                 let shards = &shards;
                 workers.push(scope.spawn(move || {
                     let mut merged = 0;
+                    let mut marked_heads = 0;
+                    let mut marked_tails = 0;
                     let mut i = 0;
                     let mut j = 0;
                     while i < head_slice.len() && j < tail_slice.len() {
                         let head = head_slice[i];
                         let tail = tail_slice[j];
+                        if head.index == usize::MAX {
+                            i += 1;
+                            continue;
+                        }
+                        if tail.index == usize::MAX {
+                            j += 1;
+                            continue;
+                        }
                         let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
                         if head.key < tail_key {
                             i += 1;
@@ -341,39 +353,46 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                             (head_used, tail_used)
                         };
                         if !head_used && !tail_used {
-                            let head_port = 2 * head.index + head.reverse;
-                            let tail_port = 2 * tail.index + tail_slot;
                             head_slice[i].index = usize::MAX;
                             tail_slice[j].index = usize::MAX;
+                            marked_heads += 1;
+                            marked_tails += 1;
                             merged += 1;
                             i += 1;
                             j += 1;
                         } else {
                             if head_used {
                                 head_slice[i].index = usize::MAX;
+                                marked_heads += 1;
                                 i += 1;
                             }
                             if tail_used {
                                 tail_slice[j].index = usize::MAX;
+                                marked_tails += 1;
                                 j += 1;
                             }
                         }
                     }
-                    merged
+                    (merged, marked_heads, marked_tails)
                 }));
             }
             workers
                 .into_iter()
                 .map(|worker| worker.join().unwrap())
-                .sum::<usize>()
+                .fold((0, 0, 0), |(m, h, t), (dm, dh, dt)| {
+                    (m + dm, h + dh, t + dt)
+                })
         });
         drop(shards);
-        if merged != 0 {
-            info!("Retain..");
-            for (entries, scratch, tail) in [
-                (&mut heads, &mut head_scratch, false),
-                (&mut tails, &mut tail_scratch, true),
-            ] {
+        marked_heads += newly_marked_heads;
+        marked_tails += newly_marked_tails;
+        for (entries, scratch, marked) in [
+            (&mut heads, &mut head_scratch, &mut marked_heads),
+            (&mut tails, &mut tail_scratch, &mut marked_tails),
+        ] {
+            // Only filter out dead entries if that's more than half of them.
+            if *marked > entries.len() / 2 {
+                info!("Retain {} of {} entries..", *marked, entries.len());
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = std::thread::scope(|scope| {
                     let workers = entries
@@ -393,7 +412,9 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         .map(|worker| worker.join().unwrap())
                         .collect::<Vec<_>>()
                 });
-                let retained = entries.len() - removed.iter().sum::<usize>();
+                let removed_total = removed.iter().sum::<usize>();
+                debug_assert_eq!(removed_total, *marked);
+                let retained = entries.len() - removed_total;
                 scratch.resize(
                     retained,
                     SortEntry {
@@ -420,6 +441,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                     }
                 });
                 std::mem::swap(entries, scratch);
+                *marked = 0;
             }
         }
         total_merged += merged;
