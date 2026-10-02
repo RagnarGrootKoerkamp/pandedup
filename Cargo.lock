@@ -2280,6 +2280,7 @@ dependencies = [
  "tar",
  "tracing",
  "tracing-subscriber",
+ "voracious_radix_sort",
  "xxhash-rust",
  "zstd",
 ]

@@ -78,8 +78,9 @@ impl DynamicSequencesStream for InMemorySequences {
 }
 
 pub fn run(args: &Args, dedup_path: &Path, sequences: Vec<Vec<u8>>) {
-    let (short_sequences, sequences): (Vec<_>, Vec<_>) =
-        sequences.into_iter().partition(|sequence| sequence.len() < args.k);
+    let (short_sequences, sequences): (Vec<_>, Vec<_>) = sequences
+        .into_iter()
+        .partition(|sequence| sequence.len() < args.k);
     let input = Arc::new(InMemorySequences::new(sequences));
     let input_bases: u64 = input.bases.iter().sum();
     let input_contigs: usize = input.blocks.iter().map(Vec::len).sum();

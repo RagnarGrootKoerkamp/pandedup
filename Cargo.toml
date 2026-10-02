@@ -28,6 +28,7 @@ zstd = "0.13.3"
 # ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", default-features = false, features = ["hash-16bit", "hash-32bit", "hash-64bit", "hash-128bit", "hash-rkarp", "hash-forward"] }
 ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", default-features = false, features = ["hash-64bit", "hash-128bit"] }
 perfcnt = "0.8.0"
+voracious_radix_sort = { version = "1.2.0", features = ["voracious_multithread"] }
 
 
 [patch.crates-io]

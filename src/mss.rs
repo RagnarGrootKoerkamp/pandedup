@@ -8,6 +8,33 @@
 
 use seq_hash::packed_seq::{self, Seq};
 use tracing::info;
+use voracious_radix_sort::{RadixSort, Radixable};
+
+#[derive(Clone, Copy)]
+struct SortEntry {
+    key: u128,
+    index: usize,
+}
+
+impl PartialEq for SortEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl PartialOrd for SortEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.key.cmp(&other.key))
+    }
+}
+
+impl Radixable<u128> for SortEntry {
+    type Key = u128;
+
+    fn key(&self) -> Self::Key {
+        self.key
+    }
+}
 
 struct Contig {
     /// The head of the contig, in fwd and rc direction
@@ -63,25 +90,37 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
             .iter()
             .enumerate()
             .filter(|(_, e)| e.prev.is_none())
-            .map(|(i, e)| (e.kmer_in[0] & head_mask, i))
+            .map(|(i, e)| SortEntry {
+                key: e.kmer_in[0] & head_mask,
+                index: i,
+            })
             .collect::<Vec<_>>();
         let mut tails = ends
             .iter()
             .enumerate()
             .filter(|(_, e)| e.next.is_none())
-            .map(|(i, e)| (e.kmer_out[0] >> tail_shift, i))
+            .map(|(i, e)| SortEntry {
+                key: e.kmer_out[0] >> tail_shift,
+                index: i,
+            })
             .collect::<Vec<_>>();
-        info!("sorting..");
-        heads.sort_unstable();
-        tails.sort_unstable();
+        let threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        info!("sorting head..");
+        heads.voracious_mt_sort(threads);
+        info!("sorting tail..");
+        tails.voracious_mt_sort(threads);
 
         // mergesort the two lists; make a connection whenever possible.
         info!("merging..");
         let mut i = 0;
         let mut j = 0;
         while i < heads.len() && j < tails.len() {
-            let (head_kmer, head_idx) = heads[i];
-            let (tail_kmer, tail_idx) = tails[j];
+            let head_kmer = heads[i].key;
+            let head_idx = heads[i].index;
+            let tail_kmer = tails[j].key;
+            let tail_idx = tails[j].index;
             if head_kmer == tail_kmer {
                 // connect the two contigs
                 ends[head_idx].prev = Some((tail_idx, overlap as u8));
