@@ -189,12 +189,6 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     let threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    // A physical end has an entry in each sorted vector. Keep its used bit
-    // separately so both entries can be removed without reading `ends` again.
-    let word_bits = usize::BITS as usize;
-    let used: Vec<_> = (0..(2 * ends.len()).div_ceil(word_bits))
-        .map(|_| AtomicUsize::new(0))
-        .collect();
 
     // Sorting full tail k-mers also sorts every shorter prefix used below.
     let mut tails = Vec::with_capacity(2 * ends.len());
@@ -271,7 +265,6 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                     continue;
                 }
                 let shards = &shards;
-                let used = &used;
                 workers.push(scope.spawn(move || {
                     let mut merged = 0;
                     let mut i = 0;
@@ -349,10 +342,6 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         if !head_used && !tail_used {
                             let head_port = 2 * head.index + head.reverse;
                             let tail_port = 2 * tail.index + tail_slot;
-                            used[head_port / word_bits]
-                                .fetch_or(1usize << (head_port % word_bits), Ordering::Relaxed);
-                            used[tail_port / word_bits]
-                                .fetch_or(1usize << (tail_port % word_bits), Ordering::Relaxed);
                             head_slice[i].index = usize::MAX;
                             tail_slice[j].index = usize::MAX;
                             merged += 1;
@@ -379,32 +368,18 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         });
         drop(shards);
         if merged != 0 {
-            eprintln!("Retain..");
+            info!("Retain..");
             for (entries, tail) in [(&mut heads, false), (&mut tails, true)] {
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let lengths = std::thread::scope(|scope| {
                     let workers = entries
                         .chunks_mut(chunk_len)
                         .map(|slice| {
-                            let used = &used;
                             scope.spawn(move || {
                                 let mut write = 0;
                                 for read in 0..slice.len() {
                                     let entry = slice[read];
                                     if entry.index == usize::MAX {
-                                        continue;
-                                    }
-                                    let port = 2 * entry.index
-                                        + if tail {
-                                            1 - entry.reverse
-                                        } else {
-                                            entry.reverse
-                                        };
-                                    if used[port / word_bits].load(Ordering::Relaxed)
-                                        & (1usize << (port % word_bits))
-                                        != 0
-                                    {
-                                        slice[read].index = usize::MAX;
                                         continue;
                                     }
                                     slice[write] = entry;
