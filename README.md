@@ -45,6 +45,16 @@ Add `--skip` to reuse the deduplicated output when it already exists. When
 combined with `--ggcat`, the existing compressed FASTA is read and passed to
 GGCAT.
 
+Add `--mss` to build a masked superstring from the deduplicated contigs and
+write it to a neighboring `.msfa` file.
+
+The standalone MSS example can read any FASTA/FASTQ format supported by
+needletail, including compressed files:
+
+```sh
+cargo run --release --example mss -- input.fa.zst -k 64 -o output.msfa
+```
+
 Decreasing `w` gives a smaller output, but requires inversely more memory.
 Reducing the number of threads helps to reduce overall memory usage, as
 each thread has a 3GB human genome in memory.
