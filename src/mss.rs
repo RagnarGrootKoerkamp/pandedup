@@ -220,7 +220,6 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         info!("overlap: {}", overlap);
         let tail_shift = 2 * (k - overlap);
         if overlap < first_overlap {
-            // heads.retain(|head| ends[head.index].nbs[head.reverse].is_none());
             resort_heads(&mut heads, &mut head_scratch, overlap, threads);
         }
 
@@ -228,13 +227,14 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         info!("merging..");
         let mut i = 0;
         let mut j = 0;
+        let mut head_write = 0;
+        let mut tail_write = 0;
         let mut merged = 0;
         while i < heads.len() && j < tails.len() {
             let head = heads[i];
             let tail = tails[j];
             let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
             if head.key == tail_key {
-                // The tail list includes ends filled in earlier overlap rounds.
                 if ends[head.index].nbs[head.reverse].is_some() {
                     i += 1;
                     continue;
@@ -243,9 +243,10 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                     j += 1;
                     continue;
                 }
-
                 // Skip self-loops from an end into itself.
                 if head.index == tail.index && head.reverse == 1 - tail.reverse {
+                    heads[head_write] = head;
+                    head_write += 1;
                     i += 1;
                     continue;
                 }
@@ -266,11 +267,31 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                 j += 1;
                 merged += 1;
             } else if head.key < tail_key {
+                heads[head_write] = head;
+                head_write += 1;
                 i += 1;
             } else {
+                tails[tail_write] = tail;
+                tail_write += 1;
                 j += 1;
             }
         }
+        for read in i..heads.len() {
+            let head = heads[read];
+            if ends[head.index].nbs[head.reverse].is_none() {
+                heads[head_write] = head;
+                head_write += 1;
+            }
+        }
+        for read in j..tails.len() {
+            let tail = tails[read];
+            if ends[tail.index].nbs[1 - tail.reverse].is_none() {
+                tails[tail_write] = tail;
+                tail_write += 1;
+            }
+        }
+        heads.truncate(head_write);
+        tails.truncate(tail_write);
         total_merged += merged;
         total_len -= merged * overlap;
         info!(
