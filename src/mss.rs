@@ -37,9 +37,46 @@ impl Radixable<u128> for SortEntry {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MergePart {
+    start: [usize; 4],
+    end: [usize; 4],
+    len: usize,
+}
+
+/// Merge 4 slices of `input` into `output`, using the given `mask` to compare keys.
+fn merge_head_part(input: &[SortEntry], output: &mut [SortEntry], mask: u128, part: MergePart) {
+    let mut cursors = part.start;
+    for slot in output {
+        let mut best_base = 0;
+        let mut best_key = u128::MAX;
+        for base in 0..4 {
+            if cursors[base] < part.end[base] {
+                let key = input[cursors[base]].key & mask;
+                if key <= best_key {
+                    best_base = base;
+                    best_key = key;
+                }
+            }
+        }
+        let mut entry = input[cursors[best_base]];
+        entry.key = best_key;
+        *slot = entry;
+        cursors[best_base] += 1;
+    }
+}
+
 /// Drop the leading base from sorted head keys by merging the four sorted
 /// ranges sharing that base. `overlap` is the length of the new keys.
-fn resort_heads(heads: &mut Vec<SortEntry>, scratch: &mut Vec<SortEntry>, overlap: usize) {
+fn resort_heads(
+    heads: &mut Vec<SortEntry>,
+    scratch: &mut Vec<SortEntry>,
+    overlap: usize,
+    threads: usize,
+) {
+    if heads.is_empty() {
+        return;
+    }
     let shift = 2 * overlap;
     let mask = (1u128 << shift) - 1;
     let mut bounds = [0; 5];
@@ -52,25 +89,48 @@ fn resort_heads(heads: &mut Vec<SortEntry>, scratch: &mut Vec<SortEntry>, overla
     }
     debug_assert_eq!(end, heads.len());
 
+    let chunks = threads.max(1).min(heads.len());
+    let width = (1u128 << shift).div_ceil(chunks as u128);
     let mut cursors = [bounds[0], bounds[1], bounds[2], bounds[3]];
-    scratch.clear();
-    for _ in 0..heads.len() {
-        let mut best_base = 4;
-        let mut best_key = u128::MAX;
+    let mut parts = Vec::with_capacity(chunks);
+    for chunk in 1..=chunks {
+        let upper = width * chunk as u128;
+        let start = cursors;
         for base in 0..4 {
-            if cursors[base] < bounds[base + 1] {
-                let key = heads[cursors[base]].key & mask;
-                if best_base == 4 || key < best_key {
-                    best_base = base;
-                    best_key = key;
-                }
+            cursors[base] += heads[cursors[base]..bounds[base + 1]]
+                .partition_point(|entry| entry.key & mask < upper);
+        }
+        let len = (0..4).map(|base| cursors[base] - start[base]).sum();
+        parts.push(MergePart {
+            start,
+            end: cursors,
+            len,
+        });
+    }
+    debug_assert_eq!(
+        parts.iter().map(|part| part.len).sum::<usize>(),
+        heads.len()
+    );
+
+    scratch.resize(
+        heads.len(),
+        SortEntry {
+            key: 0,
+            index: 0,
+            reverse: 0,
+        },
+    );
+    let input = heads.as_slice();
+    std::thread::scope(|scope| {
+        let mut remaining = scratch.as_mut_slice();
+        for part in parts {
+            let (output, rest) = remaining.split_at_mut(part.len);
+            remaining = rest;
+            if !output.is_empty() {
+                scope.spawn(move || merge_head_part(input, output, mask, part));
             }
         }
-        let mut entry = heads[cursors[best_base]];
-        entry.key = best_key;
-        scratch.push(entry);
-        cursors[best_base] += 1;
-    }
+    });
     std::mem::swap(heads, scratch);
 }
 
@@ -161,7 +221,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         let tail_shift = 2 * (k - overlap);
         if overlap < first_overlap {
             // heads.retain(|head| ends[head.index].nbs[head.reverse].is_none());
-            resort_heads(&mut heads, &mut head_scratch, overlap);
+            resort_heads(&mut heads, &mut head_scratch, overlap, threads);
         }
 
         // mergesort the two lists; make a connection whenever possible.
@@ -221,6 +281,8 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     }
     assert_eq!(total_merged, ends.len());
     // TODO break cycles
+
+    unimplemented!("break cycles");
 
     let mut num_cycles = 0;
     let mut done = vec![false; ends.len()];
