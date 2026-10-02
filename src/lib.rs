@@ -2,10 +2,10 @@ use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 mod timing;
 use std::{
-    io::{BufWriter, Read, Write},
+    io::{self, BufWriter, Read, Write},
     marker::PhantomPinned,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Mutex, RwLock, atomic::AtomicUsize},
     time::Duration,
@@ -56,12 +56,36 @@ pub struct Args {
 
 #[derive(Default, Clone, Copy, derive_more::AddAssign)]
 struct Stats {
+    input_records: usize,
     input_bp: usize,
     total_phrases: usize,
     filtered_phrases: usize,
     output_bp: usize,
     unique_phrases: usize,
     output_contigs: usize,
+}
+
+/// Log the on-disk size and any sequence counts available without rereading a file.
+pub fn log_file_stats(action: &str, path: &Path, counts: Option<(usize, usize)>) -> io::Result<()> {
+    let size = std::fs::metadata(path)?.len();
+    match counts {
+        Some((records, bases)) => {
+            let bases_per_record = if records == 0 {
+                0.0
+            } else {
+                bases as f64 / records as f64
+            };
+            tracing::info!(
+                "{action} {}: {size} bytes, {records} records, {bases} bases, {bases_per_record:.1} bases/record",
+                path.display()
+            );
+        }
+        None => tracing::info!(
+            "{action} {}: {size} bytes, records unknown, bases unknown, bases/record unknown",
+            path.display()
+        ),
+    }
+    Ok(())
 }
 
 /// Deduplicate the input and return the output path.
@@ -94,8 +118,15 @@ pub fn run(args: &Args) -> PathBuf {
     let buf_writer =
         BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
     let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-    process(args, reader.as_ref().get_ref(), &writer);
+    let stats = process(args, reader.as_ref().get_ref(), &writer);
     drop(writer);
+    log_file_stats("Read", input, Some((stats.input_records, stats.input_bp))).unwrap();
+    log_file_stats(
+        "Wrote",
+        &output_path,
+        Some((stats.output_contigs, stats.output_bp)),
+    )
+    .unwrap();
     tracing::info!(
         "pandedup: {}, input {} bytes, deduplicated {} bytes ({})",
         timing.finish(),
@@ -106,7 +137,7 @@ pub fn run(args: &Args) -> PathBuf {
     output_path
 }
 
-fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mutex<W>) {
+fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mutex<W>) -> Stats {
     let global_stats = &Mutex::new(Stats::default());
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
     let reference = RwLock::new((vec![], FxHashMap::default()));
@@ -129,6 +160,7 @@ fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mute
             });
         }
     });
+    *global_stats.lock().unwrap()
 }
 
 fn process_sample<W: Write>(
@@ -177,6 +209,7 @@ fn process_sample<W: Write>(
             input_contigs += 1;
             let i_start = std::time::Instant::now();
 
+            local_stats.input_records += 1;
             local_stats.input_bp += seq.len();
 
             let i_read = std::time::Instant::now();

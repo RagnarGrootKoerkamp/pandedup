@@ -37,6 +37,8 @@ fn main() {
     let timing = timing::StageTiming::start();
     info!("Reading input..");
     let (seq, ranges) = packed_seq::PackedSeqVec::from_fastx(&args.input);
+    let input_bases = ranges.iter().map(|range| range.len()).sum();
+    pandedup::log_file_stats("Read", &args.input, Some((ranges.len(), input_bases))).unwrap();
 
     let superstring = if args.k <= 32 {
         mss::masked_superstring::<u64>(args.k, seq, ranges)
@@ -51,6 +53,7 @@ fn main() {
     writer.write_all(&superstring).unwrap();
     writer.write_all(b"\n").unwrap();
     drop(writer);
+    pandedup::log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
     info!(
         "mss: {}, input {} bytes, output {} bases, {} bytes ({})",
         timing.finish(),

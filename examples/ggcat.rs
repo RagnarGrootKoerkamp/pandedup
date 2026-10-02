@@ -76,7 +76,10 @@ fn main() {
     while let Some(record) = reader.next() {
         sequences.push(record.expect("invalid FASTA record").seq().into_owned());
     }
+    let input_bases = sequences.iter().map(Vec::len).sum();
+    pandedup::log_file_stats("Read", &args.input, Some((sequences.len(), input_bases))).unwrap();
     let output = run(&args, sequences);
+    pandedup::log_file_stats("Wrote", &output, None).unwrap();
     info!(
         "ggcat: {}, input {} bytes, output {} bytes ({})",
         timing.finish(),
