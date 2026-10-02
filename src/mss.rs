@@ -219,6 +219,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
     info!("sorting {} heads..", heads.len());
     heads.voracious_mt_sort(threads);
     let mut head_scratch = Vec::with_capacity(heads.len());
+    let mut tail_scratch = Vec::with_capacity(tails.len());
 
     for overlap in (0..=first_overlap).rev() {
         info!("overlap: {}", overlap);
@@ -369,23 +370,21 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         drop(shards);
         if merged != 0 {
             info!("Retain..");
-            for (entries, tail) in [(&mut heads, false), (&mut tails, true)] {
+            for (entries, scratch, tail) in [
+                (&mut heads, &mut head_scratch, false),
+                (&mut tails, &mut tail_scratch, true),
+            ] {
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
-                let lengths = std::thread::scope(|scope| {
+                let removed = std::thread::scope(|scope| {
                     let workers = entries
                         .chunks_mut(chunk_len)
                         .map(|slice| {
                             scope.spawn(move || {
-                                let mut write = 0;
-                                for read in 0..slice.len() {
-                                    let entry = slice[read];
-                                    if entry.index == usize::MAX {
-                                        continue;
-                                    }
-                                    slice[write] = entry;
-                                    write += 1;
+                                let mut removed = 0;
+                                for entry in slice {
+                                    removed += usize::from(entry.index == usize::MAX);
                                 }
-                                (slice.len(), write)
+                                removed
                             })
                         })
                         .collect::<Vec<_>>();
@@ -394,14 +393,33 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         .map(|worker| worker.join().unwrap())
                         .collect::<Vec<_>>()
                 });
-                let mut read = 0;
-                let mut write = 0;
-                for (chunk_len, kept) in lengths {
-                    entries.copy_within(read..read + kept, write);
-                    read += chunk_len;
-                    write += kept;
-                }
-                entries.truncate(write);
+                let retained = entries.len() - removed.iter().sum::<usize>();
+                scratch.resize(
+                    retained,
+                    SortEntry {
+                        key: 0,
+                        index: 0,
+                        reverse: 0,
+                    },
+                );
+                std::thread::scope(|scope| {
+                    let mut output = scratch.as_mut_slice();
+                    for (input, removed) in entries.chunks(chunk_len).zip(removed) {
+                        let (part, rest) = output.split_at_mut(input.len() - removed);
+                        output = rest;
+                        scope.spawn(move || {
+                            let mut write = 0;
+                            for &entry in input {
+                                if entry.index != usize::MAX {
+                                    part[write] = entry;
+                                    write += 1;
+                                }
+                            }
+                            debug_assert_eq!(write, part.len());
+                        });
+                    }
+                });
+                std::mem::swap(entries, scratch);
             }
         }
         total_merged += merged;
