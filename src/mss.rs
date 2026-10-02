@@ -84,15 +84,15 @@ impl MssKey for u128 {
 #[repr(C, packed(1))]
 pub struct HeadOrTail<K: MssKey> {
     key: K,
-    index: u32,
-    reverse: bool,
+    /// Twice the contig index, plus one for reverse complement; MAX means used.
+    id: u32,
 }
 
 const _: () = {
     assert!(std::mem::align_of::<HeadOrTail<u64>>() == 1);
-    assert!(std::mem::size_of::<HeadOrTail<u64>>() == 13);
+    assert!(std::mem::size_of::<HeadOrTail<u64>>() == 12);
     assert!(std::mem::align_of::<HeadOrTail<u128>>() == 1);
-    assert!(std::mem::size_of::<HeadOrTail<u128>>() == 21);
+    assert!(std::mem::size_of::<HeadOrTail<u128>>() == 20);
 };
 
 impl<K: MssKey> PartialEq for HeadOrTail<K> {
@@ -205,8 +205,7 @@ fn resort_heads<K: MssKey>(
         heads.len(),
         HeadOrTail {
             key: K::ZERO,
-            index: 0,
-            reverse: false,
+            id: 0,
         },
     );
     let input = heads.as_slice();
@@ -230,9 +229,10 @@ struct Links {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C, packed(1))]
 struct Link {
-    index: u32,
-    reverse: bool,
+    /// Twice the contig index, plus one for reverse complement.
+    id: u32,
     overlap: u8,
 }
 
@@ -262,13 +262,15 @@ where
     // the input contains contigs shorter than k.
     ranges.retain(|c| c.len() >= k);
     let num_contigs = ranges.len();
-    // reserve u32::MAX itself as sentinel.
-    assert!(num_contigs < u32::MAX as usize);
+    // Leave room for the orientation bit and reserve u32::MAX as the sentinel.
+    assert!(
+        num_contigs <= (u32::MAX >> 1) as usize,
+        "too many contigs for packed orientation IDs"
+    );
 
     let empty_entry = HeadOrTail {
         key: K::ZERO,
-        index: 0,
-        reverse: false,
+        id: 0,
     };
     let mut heads = vec![empty_entry; 2 * num_contigs];
     let mut tails = vec![empty_entry; 2 * num_contigs];
@@ -288,13 +290,11 @@ where
                 let direction = usize::from(reverse);
                 head_entries[direction] = HeadOrTail {
                     key: [head_fw, tail_rc][direction] & first_head_mask,
-                    index: index as u32,
-                    reverse,
+                    id: ((index as u32) << 1) | u32::from(reverse),
                 };
                 tail_entries[direction] = HeadOrTail {
                     key: [tail_fw, head_rc][direction],
-                    index: index as u32,
-                    reverse,
+                    id: ((index as u32) << 1) | u32::from(reverse),
                 };
             }
         });
@@ -372,11 +372,11 @@ where
                     while i < head_slice.len() && j < tail_slice.len() {
                         let head = head_slice[i];
                         let tail = tail_slice[j];
-                        if head.index == u32::MAX {
+                        if head.id == u32::MAX {
                             i += 1;
                             continue;
                         }
-                        if tail.index == u32::MAX {
+                        if tail.id == u32::MAX {
                             j += 1;
                             continue;
                         }
@@ -390,15 +390,15 @@ where
                             j += 1;
                             continue;
                         }
-                        if head.index == tail.index && head.reverse == !tail.reverse {
+                        if head.id == (tail.id ^ 1) {
                             j += 1;
                             continue;
                         }
 
-                        let head_index = head.index as usize;
-                        let tail_index = tail.index as usize;
-                        let head_slot = usize::from(head.reverse);
-                        let tail_slot = usize::from(!tail.reverse);
+                        let head_index = (head.id >> 1) as usize;
+                        let tail_index = (tail.id >> 1) as usize;
+                        let head_slot = (head.id & 1) as usize;
+                        let tail_slot = ((tail.id ^ 1) & 1) as usize;
                         let head_shard = head_index / shard_len;
                         let tail_shard = tail_index / shard_len;
                         let (head_used, tail_used) = if head_shard == tail_shard {
@@ -409,13 +409,11 @@ where
                             let tail_used = shard[tail_local].nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 shard[head_local].nbs[head_slot] = Some(Link {
-                                    index: tail.index,
-                                    reverse: tail.reverse,
+                                    id: tail.id,
                                     overlap: overlap as u8,
                                 });
                                 shard[tail_local].nbs[tail_slot] = Some(Link {
-                                    index: head.index,
-                                    reverse: head.reverse,
+                                    id: head.id,
                                     overlap: overlap as u8,
                                 });
                             }
@@ -439,21 +437,19 @@ where
                             let tail_used = tail_end.nbs[tail_slot].is_some();
                             if !head_used && !tail_used {
                                 head_end.nbs[head_slot] = Some(Link {
-                                    index: tail.index,
-                                    reverse: tail.reverse,
+                                    id: tail.id,
                                     overlap: overlap as u8,
                                 });
                                 tail_end.nbs[tail_slot] = Some(Link {
-                                    index: head.index,
-                                    reverse: head.reverse,
+                                    id: head.id,
                                     overlap: overlap as u8,
                                 });
                             }
                             (head_used, tail_used)
                         };
                         if !head_used && !tail_used {
-                            head_slice[i].index = u32::MAX;
-                            tail_slice[j].index = u32::MAX;
+                            head_slice[i].id = u32::MAX;
+                            tail_slice[j].id = u32::MAX;
                             marked_heads += 1;
                             marked_tails += 1;
                             merged += 1;
@@ -461,12 +457,12 @@ where
                             j += 1;
                         } else {
                             if head_used {
-                                head_slice[i].index = u32::MAX;
+                                head_slice[i].id = u32::MAX;
                                 marked_heads += 1;
                                 i += 1;
                             }
                             if tail_used {
-                                tail_slice[j].index = u32::MAX;
+                                tail_slice[j].id = u32::MAX;
                                 marked_tails += 1;
                                 j += 1;
                             }
@@ -492,7 +488,7 @@ where
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
                 let removed = entries
                     .par_chunks(chunk_len)
-                    .map(|slice| slice.iter().filter(|entry| entry.index == u32::MAX).count())
+                    .map(|slice| slice.iter().filter(|entry| entry.id == u32::MAX).count())
                     .collect::<Vec<_>>();
                 let removed_total = removed.iter().sum::<usize>();
                 debug_assert_eq!(removed_total, *marked);
@@ -501,8 +497,7 @@ where
                     retained,
                     HeadOrTail {
                         key: K::ZERO,
-                        index: 0,
-                        reverse: false,
+                        id: 0,
                     },
                 );
                 rayon::scope(|scope| {
@@ -513,7 +508,7 @@ where
                         scope.spawn(move |_| {
                             let mut write = 0;
                             for &entry in input {
-                                if entry.index != u32::MAX {
+                                if entry.id != u32::MAX {
                                     part[write] = entry;
                                     write += 1;
                                 }
@@ -551,8 +546,8 @@ where
         loop {
             done[j] = true;
             let link = links[j].nbs[usize::from(!reverse)].as_ref().unwrap();
-            j = link.index as usize;
-            reverse = link.reverse;
+            j = (link.id >> 1) as usize;
+            reverse = link.id & 1 != 0;
             if j == i {
                 break;
             }
