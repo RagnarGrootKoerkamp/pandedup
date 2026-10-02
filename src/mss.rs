@@ -380,8 +380,54 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         drop(shards);
         if merged != 0 {
             eprintln!("Retain..");
-            heads.retain(|head| head.index != usize::MAX);
-            tails.retain(|tail| tail.index != usize::MAX);
+            for (entries, tail) in [(&mut heads, false), (&mut tails, true)] {
+                let chunk_len = entries.len().div_ceil(chunks).max(1);
+                let lengths = std::thread::scope(|scope| {
+                    let workers = entries
+                        .chunks_mut(chunk_len)
+                        .map(|slice| {
+                            let used = &used;
+                            scope.spawn(move || {
+                                let mut write = 0;
+                                for read in 0..slice.len() {
+                                    let entry = slice[read];
+                                    if entry.index == usize::MAX {
+                                        continue;
+                                    }
+                                    let port = 2 * entry.index
+                                        + if tail {
+                                            1 - entry.reverse
+                                        } else {
+                                            entry.reverse
+                                        };
+                                    if used[port / word_bits].load(Ordering::Relaxed)
+                                        & (1usize << (port % word_bits))
+                                        != 0
+                                    {
+                                        slice[read].index = usize::MAX;
+                                        continue;
+                                    }
+                                    slice[write] = entry;
+                                    write += 1;
+                                }
+                                (slice.len(), write)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+                let mut read = 0;
+                let mut write = 0;
+                for (chunk_len, kept) in lengths {
+                    entries.copy_within(read..read + kept, write);
+                    read += chunk_len;
+                    write += kept;
+                }
+                entries.truncate(write);
+            }
         }
         total_merged += merged;
         total_len -= merged * overlap;
