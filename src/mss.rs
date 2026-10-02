@@ -85,13 +85,29 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
 
     let mut total_merged = 0;
     let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+
+    // Sorting full tail k-mers also sorts every shorter prefix used below.
+    let mut tails = Vec::with_capacity(2 * ends.len());
+    for (index, contig) in ends.iter().enumerate() {
+        for reverse in 0..2 {
+            tails.push(SortEntry {
+                key: contig.kmer_out[reverse],
+                index,
+                reverse,
+            });
+        }
+    }
+    info!("sorting {} tails..", tails.len());
+    tails.voracious_mt_sort(threads);
 
     for overlap in (0..=k - 1).rev() {
         info!("overlap: {}", overlap);
         let head_mask = (1u128 << (2 * overlap)) - 1;
         let tail_shift = 2 * (k - overlap);
         let mut heads = Vec::with_capacity(2 * ends.len());
-        let mut tails = Vec::with_capacity(2 * ends.len());
         for (index, contig) in ends.iter().enumerate() {
             for reverse in 0..2 {
                 // An RC head uses the physical forward tail, and vice versa.
@@ -102,24 +118,10 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         reverse,
                     });
                 }
-                if contig.nbs[1 - reverse].is_none() {
-                    tails.push(SortEntry {
-                        key: contig.kmer_out[reverse]
-                            .checked_shr(tail_shift as u32)
-                            .unwrap_or(0),
-                        index,
-                        reverse,
-                    });
-                }
             }
         }
-        let threads = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
         info!("sorting {} heads..", heads.len());
         heads.voracious_mt_sort(threads);
-        info!("sorting {} tails..", tails.len());
-        tails.voracious_mt_sort(threads);
 
         // mergesort the two lists; make a connection whenever possible.
         info!("merging..");
@@ -129,8 +131,9 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         while i < heads.len() && j < tails.len() {
             let head = heads[i];
             let tail = tails[j];
-            if head.key == tail.key {
-                // Skip if one of the free ends was already filled in the rc direction.
+            let tail_key = tail.key.checked_shr(tail_shift as u32).unwrap_or(0);
+            if head.key == tail_key {
+                // The tail list includes ends filled in earlier overlap rounds.
                 if ends[head.index].nbs[head.reverse].is_some() {
                     i += 1;
                     continue;
@@ -139,6 +142,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                     j += 1;
                     continue;
                 }
+
                 // Skip self-loops from an end into itself.
                 if head.index == tail.index && head.reverse == 1 - tail.reverse {
                     i += 1;
@@ -160,7 +164,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                 i += 1;
                 j += 1;
                 merged += 1;
-            } else if head.key < tail.key {
+            } else if head.key < tail_key {
                 i += 1;
             } else {
                 j += 1;
