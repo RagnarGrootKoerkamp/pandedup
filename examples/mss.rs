@@ -31,6 +31,7 @@ fn main() {
         ))
         .init();
     let args = Args::parse();
+    info!("Reading input..");
     let mut reader = needletail::parse_fastx_file(&args.input).unwrap();
     let mut contigs = Vec::new();
     while let Some(record) = reader.next() {

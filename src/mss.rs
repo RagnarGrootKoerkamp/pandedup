@@ -6,7 +6,7 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::*;
 use seq_hash::packed_seq::{self, Seq};
 use std::sync::Mutex;
 use tracing::info;
@@ -119,13 +119,13 @@ fn resort_heads(
         },
     );
     let input = heads.as_slice();
-    std::thread::scope(|scope| {
+    rayon::scope(|scope| {
         let mut remaining = scratch.as_mut_slice();
         for part in parts {
             let (output, rest) = remaining.split_at_mut(part.len);
             remaining = rest;
             if !output.is_empty() {
-                scope.spawn(move || merge_head_part(input, output, mask, part));
+                scope.spawn(move |_| merge_head_part(input, output, mask, part));
             }
         }
     });
@@ -183,9 +183,7 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
 
     let mut total_merged = 0;
     let mut total_len = contigs.iter().map(|c| c.len()).sum::<usize>();
-    let threads = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
+    let threads = rayon::current_num_threads();
 
     info!("Build tails..");
     // Sorting full tail k-mers also sorts every shorter prefix used below.
@@ -255,8 +253,8 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
         // order when a link crosses shards, so workers cannot deadlock.
         let shard_len = ends.len().div_ceil(chunks.saturating_mul(16)).max(1);
         let shards: Vec<_> = ends.chunks_mut(shard_len).map(Mutex::new).collect();
-        let (merged, newly_marked_heads, newly_marked_tails) = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
+        let (merged, newly_marked_heads, newly_marked_tails) = {
+            let mut jobs = Vec::new();
             let mut remaining_heads = heads.as_mut_slice();
             let mut remaining_tails = tails.as_mut_slice();
             for (head_range, tail_range) in ranges {
@@ -267,8 +265,10 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                 if head_range.is_empty() || tail_range.is_empty() {
                     continue;
                 }
-                let shards = &shards;
-                workers.push(scope.spawn(move || {
+                jobs.push((head_slice, tail_slice));
+            }
+            jobs.into_par_iter()
+                .map(|(head_slice, tail_slice)| {
                     let mut merged = 0;
                     let mut marked_heads = 0;
                     let mut marked_tails = 0;
@@ -374,15 +374,12 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         }
                     }
                     (merged, marked_heads, marked_tails)
-                }));
-            }
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .fold((0, 0, 0), |(m, h, t), (dm, dh, dt)| {
-                    (m + dm, h + dh, t + dt)
                 })
-        });
+                .reduce(
+                    || (0, 0, 0),
+                    |(m, h, t), (dm, dh, dt)| (m + dm, h + dh, t + dt),
+                )
+        };
         drop(shards);
         marked_heads += newly_marked_heads;
         marked_tails += newly_marked_tails;
@@ -394,24 +391,15 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
             if *marked > entries.len() / 2 {
                 info!("Retain {} of {} entries..", *marked, entries.len());
                 let chunk_len = entries.len().div_ceil(chunks).max(1);
-                let removed = std::thread::scope(|scope| {
-                    let workers = entries
-                        .chunks_mut(chunk_len)
-                        .map(|slice| {
-                            scope.spawn(move || {
-                                let mut removed = 0;
-                                for entry in slice {
-                                    removed += usize::from(entry.index == usize::MAX);
-                                }
-                                removed
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    workers
-                        .into_iter()
-                        .map(|worker| worker.join().unwrap())
-                        .collect::<Vec<_>>()
-                });
+                let removed = entries
+                    .par_chunks(chunk_len)
+                    .map(|slice| {
+                        slice
+                            .iter()
+                            .filter(|entry| entry.index == usize::MAX)
+                            .count()
+                    })
+                    .collect::<Vec<_>>();
                 let removed_total = removed.iter().sum::<usize>();
                 debug_assert_eq!(removed_total, *marked);
                 let retained = entries.len() - removed_total;
@@ -423,12 +411,12 @@ pub fn masked_superstring(k: usize, contigs: &Vec<Vec<u8>>) -> Vec<u8> {
                         reverse: 0,
                     },
                 );
-                std::thread::scope(|scope| {
+                rayon::scope(|scope| {
                     let mut output = scratch.as_mut_slice();
                     for (input, removed) in entries.chunks(chunk_len).zip(removed) {
                         let (part, rest) = output.split_at_mut(input.len() - removed);
                         output = rest;
-                        scope.spawn(move || {
+                        scope.spawn(move |_| {
                             let mut write = 0;
                             for &entry in input {
                                 if entry.index != usize::MAX {
