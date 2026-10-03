@@ -395,18 +395,25 @@ where
 }
 
 /// Read contigs, construct a masked superstring, and write it as FASTA.
-pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
+pub fn run(input: &Path, output: Option<&Path>, k: usize, threads: Option<usize>) -> PathBuf {
+    let mut pool_builder = rayon::ThreadPoolBuilder::new();
+    if let Some(threads) = threads {
+        pool_builder = pool_builder.num_threads(threads);
+    }
+    let pool = pool_builder.build().unwrap();
     let timing = StageTiming::start();
     info!("Reading input..");
     let (seq, ranges) = PackedSeqVec::from_fastx(input);
     let input_bases = ranges.iter().map(|range| range.len()).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
 
-    let superstring = if k <= 32 {
-        masked_superstring::<u64>(k, seq, ranges)
-    } else {
-        masked_superstring::<u128>(k, seq, ranges)
-    };
+    let superstring = pool.install(|| {
+        if k <= 32 {
+            masked_superstring::<u64>(k, seq, ranges)
+        } else {
+            masked_superstring::<u128>(k, seq, ranges)
+        }
+    });
     let output = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| input.with_extension("msfa"));

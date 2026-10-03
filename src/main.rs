@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ggcat_api::ExtraElaboration;
-use std::{io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal, num::NonZeroUsize, path::PathBuf};
 use tracing::Level;
 
 #[derive(Parser)]
@@ -101,6 +101,9 @@ struct MssArgs {
     /// K-mer size.
     #[arg(short, long, default_value_t = 64)]
     k: usize,
+    /// Number of threads. Defaults to Rayon's worker count.
+    #[arg(short = 'j', long)]
+    threads: Option<NonZeroUsize>,
 }
 
 fn main() {
@@ -139,7 +142,12 @@ fn main() {
             });
         }
         Command::Mss(args) => {
-            pandedup::mss::run(&args.input, args.output.as_deref(), args.k);
+            pandedup::mss::run(
+                &args.input,
+                args.output.as_deref(),
+                args.k,
+                args.threads.map(NonZeroUsize::get),
+            );
         }
         Command::Matchtigs(args) => {
             pandedup::matchtigs::run(&args.input, args.output.as_deref(), args.k);
