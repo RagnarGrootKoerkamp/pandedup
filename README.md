@@ -48,13 +48,6 @@ neighboring `INPUT-kK-MODE.fa` file (for example, `x-k64-simplitigs.fa` for
 `x.fa`). The command loads the input contigs into memory and prints elapsed
 time and output size.
 
-The `mss` subcommand builds a masked superstring. It can read any FASTA/FASTQ format supported by
-needletail, including compressed files:
-
-```sh
-pandedup mss input.fa.zst -k 64 -o output.msfa
-```
-
 Decreasing `w` gives a smaller output, but requires inversely more memory.
 Reducing the number of threads helps to reduce overall memory usage, as
 each thread has a 3GB human genome in memory.
@@ -62,6 +55,21 @@ The command also works on my 64GB-memory laptop when using 6 threads.
 
 If you run the output through ggcat anyway, using `w` much smaller than `100`
 probably won't help the overall time.
+
+### Masked superstring output
+
+The `mss` subcommand builds a masked superstring. It can read any FASTA/FASTQ format supported by
+needletail, including compressed files:
+
+```sh
+pandedup mss input.fa.zst -k 64 -j 6 -o output.msfa
+```
+
+### Greedy matchtig output (*very much* WIP)
+
+```sh
+pandedup matchtig input.fa.zst -k 64 -j 6 -o output.msfa
+```
 
 ### Ambiguous bases
 Input sequences are _split_ on ambiguous IUPAC bases such as `N`, `Y`, and `R`.
