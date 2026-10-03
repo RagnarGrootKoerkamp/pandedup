@@ -2202,6 +2202,7 @@ dependencies = [
 [[package]]
 name = "packed-seq"
 version = "5.0.0"
+source = "git+https://github.com/rust-seq/packed-seq#e961641e4e5ef87c7170d469f6dffc2ac015dbf1"
 dependencies = [
  "cfg-if",
  "ensure_simd",

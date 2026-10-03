@@ -34,6 +34,7 @@ packed-seq = { version = "5.0.0", features = ["file_io"] }
 
 
 [patch.crates-io]
-packed-seq = { path = "../packed-seq" }
+# packed-seq = { path = "../packed-seq" }
+packed-seq.git = "https://github.com/rust-seq/packed-seq"
 # seq-hash = { path = "../seq-hash" }
 seq-hash.git = "https://github.com/rust-seq/seq-hash"
