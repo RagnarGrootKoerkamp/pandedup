@@ -17,6 +17,8 @@ enum Command {
     Ggcat(GgcatArgs),
     /// Build a masked superstring from contigs.
     Mss(MssArgs),
+    /// Build a masked superstring by matching unitigs through their graph.
+    Matchtigs(MssArgs),
 }
 
 #[derive(Args)]
@@ -103,17 +105,12 @@ struct MssArgs {
 
 fn main() {
     let cli = Cli::parse();
-    let level = if matches!(cli.command, Command::Mss(_)) {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    };
     tracing_subscriber::fmt()
         .compact()
         .with_target(false)
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_max_level(level)
+        .with_max_level(Level::DEBUG)
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
             "%H:%M:%S".to_string(),
         ))
@@ -143,6 +140,9 @@ fn main() {
         }
         Command::Mss(args) => {
             pandedup::mss::run(&args.input, args.output.as_deref(), args.k);
+        }
+        Command::Matchtigs(args) => {
+            pandedup::matchtigs::run(&args.input, args.output.as_deref(), args.k);
         }
     }
 }

@@ -1,6 +1,7 @@
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
 pub mod ggcat;
+pub mod matchtigs;
 pub mod mss;
 mod timing;
 use std::{
