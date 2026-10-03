@@ -297,7 +297,7 @@ fn append_contig(
             *base = complement_char(*base);
         }
     }
-    assert!(overlap <= bases.len() && overlap <= output.len());
+    assert!(overlap < k && overlap <= bases.len() && overlap <= output.len());
     if !output.is_empty() {
         let end = output.len();
         debug_assert!(
@@ -306,8 +306,10 @@ fn append_contig(
                 .zip(&bases[..overlap])
                 .all(|(left, right)| left.to_ascii_uppercase() == *right)
         );
-        // Starts in this interval cross the join but do not belong to either contig.
-        for base in &mut output[end.saturating_sub(k - 1)..end - overlap] {
+        // The first k-1-overlap appended bases end the new crossing k-mers.
+        // Leave the existing output, including the cycle's first contig, intact.
+        let mask_len = (k - 1 - overlap).min(bases.len() - overlap);
+        for base in &mut bases[overlap..overlap + mask_len] {
             *base = base.to_ascii_lowercase();
         }
     }
@@ -663,7 +665,6 @@ where
                     }
                 });
                 std::mem::swap(entries, &mut scratch);
-                info!("Final size: {} entries", entries.len());
                 *marked = 0;
             }
         }
