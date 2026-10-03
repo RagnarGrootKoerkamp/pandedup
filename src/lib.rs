@@ -1,5 +1,7 @@
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
+pub mod ggcat;
+pub mod mss;
 mod timing;
 use std::{
     io::{self, BufWriter, Read, Write},
@@ -22,37 +24,6 @@ fn hasher(seq: &[u8]) -> u128 {
 
 use seq_hash::AntiLexHasher;
 use simd_minimizers::packed_seq::AsciiSeq;
-
-/// Build a non-minimal SPSS (spectrum-preserving string set, or k-mer spectrum) from an .agc file.
-#[derive(clap::Parser)]
-pub struct Args {
-    /// Input .agc file.
-    pub input: PathBuf,
-    /// Output path. Defaults to `input.dedup.fa.zst`.
-    #[clap(short)]
-    pub output: Option<PathBuf>,
-    /// Build a k-mer spectrum.
-    #[clap(short, default_value = "64")]
-    pub k: usize,
-    /// Window-size for minimizer-phrases. Small w shrink the output but need more memory.
-    #[clap(short, default_value = "100")]
-    pub w: usize,
-    /// Number of threads to use. Defaults to the number of logical cores.
-    #[clap(short = 'j', long)]
-    pub threads: Option<usize>,
-
-    /// Skip using the first input as a reference.
-    #[clap(long="no-reference", default_value_t = true, action = clap::ArgAction::SetFalse)]
-    pub reference: bool,
-
-    /// Dedup across reverse-complements.
-    #[clap(long)]
-    pub canonical: bool,
-
-    /// Minimizer length for phrases.
-    #[clap(long, default_value = "8")]
-    pub mini_k: usize,
-}
 
 #[derive(Default, Clone, Copy, derive_more::AddAssign)]
 struct Stats {
@@ -89,36 +60,48 @@ pub fn log_file_stats(action: &str, path: &Path, counts: Option<(usize, usize)>)
 }
 
 /// Deduplicate the input and return the output path.
-pub fn run(args: &Args) -> PathBuf {
+pub fn dedup(
+    input: &Path,
+    output: Option<&Path>,
+    k: usize,
+    w: usize,
+    threads: Option<usize>,
+    reference: bool,
+    canonical: bool,
+    mini_k: usize,
+) -> PathBuf {
     let timing = timing::StageTiming::start();
-    let input = &args.input;
-    let output = &args.output;
 
-    tracing::info!(k = args.k, w = args.w, "starting pandedup");
+    tracing::info!(k, w, "starting pandedup");
     // TODO: zstd output
-    if let Some(output) = &output {
+    if let Some(output) = output {
         assert!(
             output.extension().unwrap() == "zst",
             "Output file must have .zst extension"
         );
     }
     let output_path = output
-        .clone()
+        .map(Path::to_path_buf)
         .unwrap_or_else(|| input.with_extension("dedup.fa.zst"));
     let reader = match input.extension().unwrap().to_str().unwrap() {
-        "agc" => {
-            Box::pin(AgcReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-        }
-        "gz" => TarGzReader::new(&args.input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
-        "zst" => {
-            Box::pin(FastxReader::new(&args.input.to_string_lossy())) as Pin<Box<dyn InputReader>>
-        }
+        "agc" => Box::pin(AgcReader::new(&input.to_string_lossy())) as Pin<Box<dyn InputReader>>,
+        "gz" => TarGzReader::new(&input.to_string_lossy()) as Pin<Box<dyn InputReader>>,
+        "zst" => Box::pin(FastxReader::new(&input.to_string_lossy())) as Pin<Box<dyn InputReader>>,
         _ => panic!("Input file must be .agc, .tar.gz, or .fa.zst"),
     };
     let buf_writer =
         BufWriter::with_capacity(1 << 20, std::fs::File::create(&output_path).unwrap());
     let writer = Mutex::new(zstd::Encoder::new(buf_writer, 0).unwrap().auto_finish());
-    let stats = process(args, reader.as_ref().get_ref(), &writer);
+    let stats = process(
+        reader.as_ref().get_ref(),
+        &writer,
+        k,
+        w,
+        threads,
+        reference,
+        canonical,
+        mini_k,
+    );
     drop(writer);
     log_file_stats("Read", input, Some((stats.input_records, stats.input_bp))).unwrap();
     log_file_stats(
@@ -137,22 +120,53 @@ pub fn run(args: &Args) -> PathBuf {
     output_path
 }
 
-fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mutex<W>) -> Stats {
+fn process<W: Write + Send>(
+    reader: &dyn InputReader,
+    writer: &Mutex<W>,
+    k: usize,
+    w: usize,
+    threads: Option<usize>,
+    reference_enabled: bool,
+    canonical: bool,
+    mini_k: usize,
+) -> Stats {
     let global_stats = &Mutex::new(Stats::default());
     let seen: &[_; 256] = &std::array::from_fn(|_i| RwLock::new(FxHashSet::default()));
     let reference = RwLock::new((vec![], FxHashMap::default()));
 
     // Process the first/reference sample separately.
-    if args.reference {
-        process_sample(args, reader, seen, global_stats, writer, &reference);
+    if reference_enabled {
+        process_sample(
+            reader,
+            seen,
+            global_stats,
+            writer,
+            &reference,
+            k,
+            w,
+            reference_enabled,
+            canonical,
+            mini_k,
+        );
     }
 
     std::thread::scope(|scope| {
-        let threads = args.threads.unwrap_or_else(|| num_cpus::get_physical());
+        let threads = threads.unwrap_or_else(|| num_cpus::get_physical());
         for _t in 0..threads {
             scope.spawn(|| {
                 loop {
-                    if process_sample(args, reader, seen, global_stats, writer, &reference) == None
+                    if process_sample(
+                        reader,
+                        seen,
+                        global_stats,
+                        writer,
+                        &reference,
+                        k,
+                        w,
+                        reference_enabled,
+                        canonical,
+                        mini_k,
+                    ) == None
                     {
                         break;
                     };
@@ -164,21 +178,17 @@ fn process<W: Write + Send>(args: &Args, reader: &dyn InputReader, writer: &Mute
 }
 
 fn process_sample<W: Write>(
-    args: &Args,
     reader: &dyn InputReader,
     seen: &[RwLock<FxHashSet<u128>>; 256],
     global_stats: &Mutex<Stats>,
     writer: &Mutex<W>,
     reference: &RwLock<(Vec<u8>, FxHashMap<u128, usize>)>,
+    k: usize,
+    w: usize,
+    reference_enabled: bool,
+    canonical: bool,
+    mini_k: usize,
 ) -> Option<()> {
-    let Args {
-        k,
-        mini_k,
-        canonical,
-        w,
-        ..
-    } = *args;
-
     let mut local_stats = Stats::default();
     let mut t_read = Duration::ZERO;
     let mut t_minis = Duration::ZERO;
@@ -192,8 +202,8 @@ fn process_sample<W: Write>(
     let (idx, contigs) = reader.next_sample()?;
 
     // The reference extension assumes forward-oriented phrase matches.
-    let build_reference = args.reference && idx == 0 && !canonical;
-    let use_reference = args.reference && idx > 0 && !canonical;
+    let build_reference = reference_enabled && idx == 0 && !canonical;
+    let use_reference = reference_enabled && idx > 0 && !canonical;
 
     let reference_guard = use_reference.then(|| reference.read().unwrap());
     let reference_vec = reference_guard.as_ref().map(|x| &x.0);

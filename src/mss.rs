@@ -6,9 +6,12 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
+use crate::{log_file_stats, timing::StageTiming};
 use core::ops::{BitAnd, Mul, Range, Shl, Shr, Sub};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use rayon::prelude::*;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{debug, info, trace};
 use voracious_radix_sort::{RadixKey, RadixSort, Radixable};
@@ -389,6 +392,39 @@ where
     } else {
         masked_superstring_with_index::<K, u64>(k, seq, ranges, short_ranges, total_len)
     }
+}
+
+/// Read contigs, construct a masked superstring, and write it as FASTA.
+pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
+    let timing = StageTiming::start();
+    info!("Reading input..");
+    let (seq, ranges) = PackedSeqVec::from_fastx(input);
+    let input_bases = ranges.iter().map(|range| range.len()).sum();
+    log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
+
+    let superstring = if k <= 32 {
+        masked_superstring::<u64>(k, seq, ranges)
+    } else {
+        masked_superstring::<u128>(k, seq, ranges)
+    };
+    let output = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| input.with_extension("msfa"));
+    let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
+    writeln!(writer, ">masked-superstring").unwrap();
+    writer.write_all(&superstring).unwrap();
+    writer.write_all(b"\n").unwrap();
+    drop(writer);
+    log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
+    info!(
+        "mss: {}, input {} bytes, output {} bases, {} bytes ({})",
+        timing.finish(),
+        std::fs::metadata(input).unwrap().len(),
+        superstring.len(),
+        std::fs::metadata(&output).unwrap().len(),
+        output.display()
+    );
+    output
 }
 
 fn masked_superstring_with_index<K: MssKey, I: MssIndex>(

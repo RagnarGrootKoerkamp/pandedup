@@ -1,71 +1,38 @@
 //! Run GGCAT on a FASTA file, optionally compressed with zstd.
-#[path = "../src/timing.rs"]
-mod timing;
-
-use clap::{Parser, ValueEnum};
+use crate::{log_file_stats, timing::StageTiming};
 use ggcat_api::{
     DnaSequence, DnaSequencesFileType, DynamicSequencesStream, ExtraElaboration, GGCATConfig,
     GGCATInstance, GeneralSequenceBlockData, MessageLevel, SequenceInfo,
 };
 use std::{
-    io::{IsTerminal, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tracing::info;
 
-#[derive(Parser)]
-struct Args {
-    /// Input .fa or .fa.zst file.
-    input: PathBuf,
-    /// Output FASTA file. Defaults to INPUT-kK-MODE.fa.
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-    /// K-mer size.
-    #[arg(short, long, default_value_t = 64)]
-    k: usize,
-    /// Number of threads. Defaults to the number of physical cores.
-    #[arg(short = 'j', long)]
-    threads: Option<usize>,
-    /// GGCAT extra elaboration mode.
-    #[arg(long, value_enum, default_value_t = Mode::Simplitigs)]
-    mode: Mode,
+pub struct GgcatConfig {
+    pub input: PathBuf,
+    pub output: Option<PathBuf>,
+    pub k: usize,
+    pub threads: Option<usize>,
+    pub mode: ExtraElaboration,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Mode {
-    None,
-    UnitigLinks,
-    GreedyMatchtigs,
-    Eulertigs,
-    Pathtigs,
-    Simplitigs,
-    FastEulertigs,
-}
-
-impl Mode {
-    fn elaboration(self) -> ExtraElaboration {
-        match self {
-            Self::None => ExtraElaboration::None,
-            Self::UnitigLinks => ExtraElaboration::UnitigLinks,
-            Self::GreedyMatchtigs => ExtraElaboration::GreedyMatchtigs,
-            Self::Eulertigs => ExtraElaboration::Eulertigs,
-            Self::Pathtigs => ExtraElaboration::Pathtigs,
-            Self::Simplitigs => ExtraElaboration::FastSimplitigs,
-            Self::FastEulertigs => ExtraElaboration::FastEulertigs,
-        }
+fn mode_label(mode: ExtraElaboration) -> &'static str {
+    match mode {
+        ExtraElaboration::None => "none",
+        ExtraElaboration::UnitigLinks => "unitig-links",
+        ExtraElaboration::GreedyMatchtigs => "greedy-matchtigs",
+        ExtraElaboration::Eulertigs => "eulertigs",
+        ExtraElaboration::Pathtigs => "pathtigs",
+        ExtraElaboration::FastSimplitigs => "simplitigs",
+        ExtraElaboration::FastEulertigs => "fast-eulertigs",
     }
 }
 
-fn main() {
-    tracing_subscriber::fmt()
-        .compact()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
-    let args = Args::parse();
-    let timing = timing::StageTiming::start();
+pub fn run(args: &GgcatConfig) -> PathBuf {
+    let timing = StageTiming::start();
     let name = args.input.to_string_lossy();
     assert!(
         name.ends_with(".fa") || name.ends_with(".fa.zst"),
@@ -77,9 +44,9 @@ fn main() {
         sequences.push(record.expect("invalid FASTA record").seq().into_owned());
     }
     let input_bases = sequences.iter().map(Vec::len).sum();
-    pandedup::log_file_stats("Read", &args.input, Some((sequences.len(), input_bases))).unwrap();
-    let output = run(&args, sequences);
-    pandedup::log_file_stats("Wrote", &output, None).unwrap();
+    log_file_stats("Read", &args.input, Some((sequences.len(), input_bases))).unwrap();
+    let output = build_graph(args, sequences);
+    log_file_stats("Wrote", &output, None).unwrap();
     info!(
         "ggcat: {}, input {} bytes, output {} bytes ({})",
         timing.finish(),
@@ -87,6 +54,7 @@ fn main() {
         std::fs::metadata(&output).unwrap().len(),
         output.display()
     );
+    output
 }
 
 fn default_output_path(input: &Path, k: usize, mode: &str) -> PathBuf {
@@ -170,7 +138,7 @@ impl DynamicSequencesStream for InMemorySequences {
     }
 }
 
-fn run(args: &Args, sequences: Vec<Vec<u8>>) -> PathBuf {
+fn build_graph(args: &GgcatConfig, sequences: Vec<Vec<u8>>) -> PathBuf {
     let (short_sequences, sequences): (Vec<_>, Vec<_>) = sequences
         .into_iter()
         .partition(|sequence| sequence.len() < args.k);
@@ -203,8 +171,7 @@ fn run(args: &Args, sequences: Vec<Vec<u8>>) -> PathBuf {
     })
     .expect("failed to initialize GGCAT");
 
-    let label = args.mode.to_possible_value().unwrap().get_name().to_owned();
-    let elaboration = args.mode.elaboration();
+    let label = mode_label(args.mode);
     let output = args
         .output
         .clone()
@@ -223,18 +190,8 @@ fn run(args: &Args, sequences: Vec<Vec<u8>>) -> PathBuf {
     } else {
         ggcat
             .build_graph(
-                blocks,
-                output,
-                None,
-                args.k,
-                threads,
-                /* forward_only */
-                false,
-                None,
-                false,
-                1,
-                elaboration,
-                None,
+                blocks, output, None, args.k, threads, /* forward_only */
+                false, None, false, 1, args.mode, None,
             )
             .unwrap_or_else(|error| panic!("GGCAT {label} failed: {error:#}"))
     };

@@ -32,30 +32,27 @@ Typical usage example on a server machine (64 cores; using 50-100GB of memory),
 taking 4 minutes:
 
 ``` sh
-pandedup hprcv2.agc -k 64 -w 100 -o hprcv2.spss.k64.fa.zst --threads 64
+pandedup dedup hprcv2.agc -k 64 -w 100 -o hprcv2.spss.k64.fa.zst --threads 64
 ```
 
-Run GGCAT separately on a `.fa` or `.fa.zst` file:
+Run GGCAT on a `.fa` or `.fa.zst` file:
 
 ```sh
-cargo run --release --example ggcat -- hprcv2.spss.k64.fa.zst -k 64 --mode simplitigs
+pandedup ggcat hprcv2.spss.k64.fa.zst -k 64 --mode simplitigs
 ```
 
 `--mode` selects GGCAT's extra elaboration mode and defaults to `simplitigs`.
 Use `--mode greedy-matchtigs` for greedy matchtigs, or see `--help` for all
-modes. Use `-o` to set the output path; otherwise the example writes a
+modes. Use `-o` to set the output path; otherwise the command writes a
 neighboring `INPUT-kK-MODE.fa` file (for example, `x-k64-simplitigs.fa` for
-`x.fa`). The example loads the input contigs into memory and prints elapsed
+`x.fa`). The command loads the input contigs into memory and prints elapsed
 time and output size.
 
-Add `--mss` to build a masked superstring from the deduplicated contigs and
-write it to a neighboring `.msfa` file.
-
-The standalone MSS example can read any FASTA/FASTQ format supported by
+The `mss` subcommand builds a masked superstring. It can read any FASTA/FASTQ format supported by
 needletail, including compressed files:
 
 ```sh
-cargo run --release --example mss -- input.fa.zst -k 64 -o output.msfa
+pandedup mss input.fa.zst -k 64 -o output.msfa
 ```
 
 Decreasing `w` gives a smaller output, but requires inversely more memory.

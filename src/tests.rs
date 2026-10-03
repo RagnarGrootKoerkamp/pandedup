@@ -16,20 +16,10 @@ fn split_contigs_on_ambiguous_bases() {
 
 #[test]
 fn processing_does_not_join_across_ambiguous_bases() {
-    let args = Args {
-        input: PathBuf::new(),
-        output: None,
-        k: 3,
-        w: 8,
-        threads: Some(1),
-        reference: false,
-        canonical: false,
-        mini_k: 8,
-    };
     let reader = MemoryReader::new(vec![b"ACGNNttgc".to_vec()]);
     let writer = Mutex::new(Vec::new());
-    let stats = process(&args, &reader, &writer);
-    assert_eq!((stats.input_records, stats.input_bp), (1, 9));
+    let stats = process(&reader, &writer, 3, 8, Some(1), false, false, 8);
+    assert_eq!((stats.input_records, stats.input_bp), (2, 7));
     assert_eq!((stats.output_contigs, stats.output_bp), (2, 7));
 
     let mut output_reader =
@@ -224,19 +214,18 @@ fn random_sequences_preserve_the_kmer_set() {
                         for &w in &[8, 24, 100, 500] {
                             for reference in [false, true] {
                                 for threads in [1, 3] {
-                                    let args = Args {
-                                        input: PathBuf::new(),
-                                        output: None,
-                                        k,
-                                        w,
-                                        threads: Some(threads),
-                                        reference,
-                                        canonical,
-                                        mini_k: 8,
-                                    };
                                     let reader = MemoryReader::new(sequences.clone());
                                     let writer = Mutex::new(Vec::new());
-                                    process(&args, &reader, &writer);
+                                    process(
+                                        &reader,
+                                        &writer,
+                                        k,
+                                        w,
+                                        Some(threads),
+                                        reference,
+                                        canonical,
+                                        8,
+                                    );
 
                                     let output = writer.into_inner().unwrap();
                                     let mut output_reader =
