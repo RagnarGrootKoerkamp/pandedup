@@ -2,7 +2,6 @@
 
 use crate::{log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
-use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -11,10 +10,16 @@ use tracing::info;
 const DEAD: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
+#[repr(C, packed(1))]
 struct End<K> {
     kmer: K,
     id: u32,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<End<u64>>() == 12);
+    assert!(std::mem::size_of::<End<u128>>() == 20);
+};
 
 /// CSR adjacency indexed by an oriented outgoing tail. An edge's destination
 /// is the oriented unitig entered at its head; its low bit is the orientation.
@@ -33,18 +38,15 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
     let overlap = k - 1;
     let mut heads = Vec::with_capacity(2 * ranges.len());
     let mut tails = Vec::with_capacity(2 * ranges.len());
+    info!("Building graph of {} unitigs..", ranges.len());
     for (index, range) in ranges.iter().enumerate() {
         let id = (index as u32) * 2;
-        let (head, tail, rc_head, rc_tail) = if overlap == 0 {
-            (K::ZERO, K::ZERO, K::ZERO, K::ZERO)
-        } else {
-            (
-                K::read_kmer(seq, overlap, range.start),
-                K::read_kmer(seq, overlap, range.end - overlap),
-                K::read_revcomp_kmer(seq, overlap, range.start),
-                K::read_revcomp_kmer(seq, overlap, range.end - overlap),
-            )
-        };
+        let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
+            K::read_kmer(seq, overlap, range.start),
+            K::read_kmer(seq, overlap, range.end - overlap),
+            K::read_revcomp_kmer(seq, overlap, range.start),
+            K::read_revcomp_kmer(seq, overlap, range.end - overlap),
+        );
         heads.push(End { kmer: head, id });
         heads.push(End {
             kmer: rc_tail,
@@ -56,23 +58,37 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
             id: id + 1,
         });
     }
+    info!("Sorting heads");
     heads.sort_unstable_by_key(|end| end.kmer);
+    info!("Sorting tails");
     tails.sort_unstable_by_key(|end| end.kmer);
 
+    info!("Matching unitig ends");
     let mut pairs = Vec::new();
     let (mut h, mut t) = (0, 0);
     while h < heads.len() && t < tails.len() {
-        match heads[h].kmer.cmp(&tails[t].kmer) {
+        // Copy keys out of packed entries before borrowing them for comparison.
+        let head_key = heads[h].kmer;
+        let tail_key = tails[t].kmer;
+        match head_key.cmp(&tail_key) {
             std::cmp::Ordering::Less => h += 1,
             std::cmp::Ordering::Greater => t += 1,
             std::cmp::Ordering::Equal => {
                 let key = heads[h].kmer;
                 let mut he = h;
                 let mut te = t;
-                while he < heads.len() && heads[he].kmer == key {
+                while he < heads.len() {
+                    let next = heads[he].kmer;
+                    if next != key {
+                        break;
+                    }
                     he += 1;
                 }
-                while te < tails.len() && tails[te].kmer == key {
+                while te < tails.len() {
+                    let next = tails[te].kmer;
+                    if next != key {
+                        break;
+                    }
                     te += 1;
                 }
                 for tail in &tails[t..te] {
@@ -89,41 +105,56 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
             }
         }
     }
+    info!("Sorting {} edges", pairs.len());
     pairs.sort_unstable();
-    pairs.dedup();
+    // let old_len = pairs.len();
+    // info!("Dedup edges");
+    // pairs.dedup();
+    // info!("Dedup edges => {} left", pairs.len());
+    // assert_eq!(old_len, pairs.len(), "duplicate graph edges");
     assert!(pairs.len() < u32::MAX as usize, "too many graph edges");
+    info!("Building CSR adjacency");
     let mut offsets = vec![0; 2 * ranges.len() + 1];
+    info!(
+        "Filling offsets: {} MB",
+        std::mem::size_of_val(offsets.as_slice()) / (1024 * 1024)
+    );
     for &(from, _) in &pairs {
         offsets[from as usize + 1] += 1;
     }
     for i in 1..offsets.len() {
         offsets[i] += offsets[i - 1];
     }
+    info!("Mapping pairs");
     Graph {
         edges: pairs.into_iter().map(|(_, to)| to).collect(),
         offsets,
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+#[repr(C, packed(1))]
 struct Link {
     target: u32,
-    /// Unitigs traversed between the linked endpoints, in traversal order.
-    bridge: Vec<u32>,
-    overlap: usize,
+    overlap: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<Link>() == 5);
+
+impl Link {
+    const EMPTY: Self = Self {
+        target: DEAD,
+        overlap: 0,
+    };
+    fn is_empty(self) -> bool {
+        self.target == DEAD
+    }
 }
 
 #[derive(Clone, Copy)]
 struct ActivePath {
     start: u32,
     current: u32,
-    parent: Option<usize>,
-}
-
-#[derive(Clone, Copy)]
-struct PathNode {
-    id: u32,
-    parent: Option<usize>,
 }
 
 fn tail_slot(id: u32) -> usize {
@@ -133,61 +164,60 @@ fn head_slot(id: u32) -> usize {
     (id as usize & !1) + usize::from(id & 1 != 0)
 }
 
-fn connect(links: &mut [Option<Link>], from: u32, to: u32, bridge: Vec<u32>, overlap: usize) {
-    let back_bridge = bridge.iter().rev().map(|id| id ^ 1).collect();
-    links[tail_slot(from)] = Some(Link {
+fn connect(links: &mut [Link], from: u32, to: u32, overlap: usize) {
+    let overlap = overlap as u8;
+    links[tail_slot(from)] = Link {
         target: to,
-        bridge,
         overlap,
-    });
-    links[head_slot(to)] = Some(Link {
+    };
+    links[head_slot(to)] = Link {
         target: from ^ 1,
-        bridge: back_bridge,
         overlap,
-    });
-}
-
-fn bridge_nodes(arena: &[PathNode], mut parent: Option<usize>) -> Vec<u32> {
-    let mut nodes = Vec::new();
-    while let Some(index) = parent {
-        nodes.push(arena[index].id);
-        parent = arena[index].parent;
-    }
-    nodes.reverse();
-    nodes
+    };
 }
 
 /// Link every unitig end, preferring paths through the graph whose added
 /// sequence is shorter than a zero-overlap join.
-fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Option<Link>> {
+fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
     let n = ranges.len();
-    let mut links = vec![None; 2 * n];
+    info!(
+        "Allocating {} links: {} MB",
+        2 * n,
+        std::mem::size_of::<Link>() * 2 * n / (1024 * 1024)
+    );
+    let mut links = vec![Link::EMPTY; 2 * n];
+    info!(
+        "Allocating {} receiving ids: {} MB",
+        2 * n,
+        std::mem::size_of::<u32>() * 2 * n / (1024 * 1024)
+    );
     let mut receiving: Vec<u32> = (0..2 * n as u32).collect();
     let mut buckets: Vec<Vec<ActivePath>> = vec![Vec::new(); k];
-    let mut arena = Vec::<PathNode>::new();
-    let mut best = HashMap::<(u32, u32), usize>::new();
+    eprintln!("Pushing to initial bucket");
     for id in 0..2 * n as u32 {
         buckets[0].push(ActivePath {
             start: id,
             current: id,
-            parent: None,
         });
-        best.insert((id, id), 0);
     }
 
+    // At distance k there is no shared base left, so a graph path cannot
+    // improve on the zero-overlap fallback.
     for distance in 0..k {
+        info!(
+            "Distance {distance}: {} active paths, {} receiving ends",
+            buckets[distance].len(),
+            receiving.len()
+        );
         let mut candidates = Vec::<ActivePath>::new();
         for path in std::mem::take(&mut buckets[distance]) {
-            if links[tail_slot(path.start)].is_some()
-                || best[&(path.start, path.current)] < distance
-            {
+            if !links[tail_slot(path.start)].is_empty() {
                 continue;
             }
             for &next in graph.outgoing(path.current) {
                 candidates.push(ActivePath {
                     start: path.start,
                     current: next,
-                    parent: path.parent,
                 });
             }
         }
@@ -203,21 +233,19 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Option<Li
             if r == receiving.len() || receiving[r] != candidate.current {
                 continue;
             }
-            if links[tail_slot(candidate.start)].is_some() {
+            if !links[tail_slot(candidate.start)].is_empty() {
                 candidate.start = DEAD;
                 continue;
             }
             if tail_slot(candidate.start) == head_slot(candidate.current) {
                 continue;
             }
-            if links[head_slot(candidate.current)].is_none() {
-                let bridge = bridge_nodes(&arena, candidate.parent);
+            if links[head_slot(candidate.current)].is_empty() {
                 connect(
                     &mut links,
                     candidate.start,
                     candidate.current,
-                    bridge,
-                    k - 1,
+                    k - 1 - distance,
                 );
                 receiving[r] = DEAD;
                 candidate.start = DEAD;
@@ -225,10 +253,10 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Option<Li
                 receiving[r] = DEAD;
             }
         }
-        receiving.retain(|&id| id != DEAD && links[head_slot(id)].is_none());
+        receiving.retain(|&id| id != DEAD && links[head_slot(id)].is_empty());
 
         for candidate in candidates {
-            if candidate.start == DEAD || links[tail_slot(candidate.start)].is_some() {
+            if candidate.start == DEAD || !links[tail_slot(candidate.start)].is_empty() {
                 continue;
             }
             let weight = ranges[(candidate.current / 2) as usize].len() - (k - 1);
@@ -236,34 +264,27 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Option<Li
             if next_distance >= k {
                 continue;
             }
-            let key = (candidate.start, candidate.current);
-            if best.get(&key).is_some_and(|&old| old <= next_distance) {
-                continue;
-            }
-            best.insert(key, next_distance);
-            let index = arena.len();
-            arena.push(PathNode {
-                id: candidate.current,
-                parent: candidate.parent,
-            });
             buckets[next_distance].push(ActivePath {
                 start: candidate.start,
                 current: candidate.current,
-                parent: Some(index),
             });
         }
+        info!(
+            "After distance {distance}, bucket queue sizes: {:?}",
+            buckets.iter().map(Vec::len).collect::<Vec<_>>()
+        );
     }
 
     // Every free outgoing end and free receiving end must be paired so that
     // reconstruction consists entirely of cycles.
     let outgoing: Vec<_> = (0..2 * n as u32)
-        .filter(|&id| links[tail_slot(id)].is_none())
+        .filter(|&id| links[tail_slot(id)].is_empty())
         .collect();
     // Each free physical end also has a receiving orientation (id ^ 1).
     // Pair physical ends once each, then enter the second in that orientation.
     assert_eq!(outgoing.len() % 2, 0, "odd number of unmatched ends");
     for pair in outgoing.chunks_exact(2) {
-        connect(&mut links, pair[0], pair[1] ^ 1, Vec::new(), 0);
+        connect(&mut links, pair[0], pair[1] ^ 1, 0);
     }
     links
 }
@@ -303,7 +324,10 @@ pub fn masked_superstring<K: MssKey>(
     let (ranges, short): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|r| r.len() >= k);
     assert!(ranges.len() <= (u32::MAX as usize / 2), "too many unitigs");
     let graph = graph::<K>(k, &seq, &ranges);
+
     let links = match_ends(k, &ranges, &graph);
+
+    info!("Reconstruct output");
     let mut output = Vec::new();
     let mut done = vec![false; ranges.len()];
     for start in 0..ranges.len() {
@@ -317,16 +341,13 @@ pub fn masked_superstring<K: MssKey>(
             assert!(!done[index], "link cycle revisits unitig before closing");
             done[index] = true;
             append(&mut output, &seq, &ranges[index], id & 1 != 0, overlap, k);
-            let link = links[tail_slot(id)].as_ref().expect("unmatched unitig end");
-            for &bridge in &link.bridge {
-                let index = (bridge / 2) as usize;
-                append(&mut output, &seq, &ranges[index], bridge & 1 != 0, k - 1, k);
-            }
+            let link = links[tail_slot(id)];
+            assert!(!link.is_empty(), "unmatched unitig end");
             if (link.target / 2) as usize == start {
                 break;
             }
             id = link.target;
-            overlap = link.overlap;
+            overlap = link.overlap as usize;
         }
     }
     for range in &short {
