@@ -465,8 +465,8 @@ fn connect(
     };
 }
 
-/// Cheapest bridge through one oriented unitig. The left and right minima
-/// can be chosen independently because a path may return to its own end.
+/// Cheapest bridge through one oriented unitig. Returns its cost and the two
+/// oriented tails from which to trace its free source and receiving end.
 fn bridge_candidate(
     node: u32,
     field: &DistanceField,
@@ -478,6 +478,15 @@ fn bridge_candidate(
     let weight = traversal_weight(ranges, node, k);
     if weight >= k - 1 {
         return None;
+    }
+    let forward = field.distance[node as usize];
+    let backward = field.distance[(node ^ 1) as usize];
+    // A positive label includes this unitig's traversal. If both labels are
+    // present, subtract one copy of its weight to count the traversal once.
+    if forward != 0 && forward != UNREACHABLE && backward != 0 && backward != UNREACHABLE {
+        debug_assert!(forward as usize >= weight && backward as usize >= weight);
+        let cost = forward as usize + backward as usize - weight;
+        return (cost < k - 1).then_some((cost, node, node ^ 1));
     }
     let successors = graph.outgoing(node);
     *visited += 1 + successors.len() as u64;
@@ -497,7 +506,7 @@ fn bridge_candidate(
         })
         .min_by_key(|&(_, distance)| distance)?;
     let cost = left + weight + right;
-    (cost < k - 1).then_some((cost, predecessor, successor))
+    (cost < k - 1).then_some((cost, predecessor, successor ^ 1))
 }
 
 /// Greedy distance-ordered matching through central unitig traversals.
@@ -619,7 +628,7 @@ fn match_ends(
         let mut made = 0usize;
         while let Some(node) = buckets[distance].pop() {
             examined += 1;
-            let Some((cost, predecessor, successor)) =
+            let Some((cost, left_tail, right_tail)) =
                 bridge_candidate(node, &field, graph, ranges, k, &mut visits.meet)
             else {
                 continue;
@@ -629,8 +638,8 @@ fn match_ends(
                 continue;
             }
             debug_assert_eq!(cost, distance);
-            let source = field.source(predecessor, graph, ranges, k, &mut visits.meet);
-            let receiver_end = field.source(successor ^ 1, graph, ranges, k, &mut visits.meet);
+            let source = field.source(left_tail, graph, ranges, k, &mut visits.meet);
+            let receiver_end = field.source(right_tail, graph, ranges, k, &mut visits.meet);
             let target = receiver_end ^ 1;
             // The same traversal may connect another pair at this distance.
             buckets[distance].push(node);
