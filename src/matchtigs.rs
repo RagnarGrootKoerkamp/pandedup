@@ -2,6 +2,7 @@
 
 use crate::{log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
+use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,65 @@ use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
+
+/// Decimal SI units with three significant digits for counts of at least 1k.
+struct Compact(u128);
+
+fn compact(value: impl TryInto<u64>) -> Compact {
+    Compact(value.try_into().ok().expect("count exceeds u64") as u128)
+}
+
+impl Display for Compact {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        const SUFFIXES: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
+        let value = self.0;
+        let mut unit = 0;
+        let mut divisor = 1u128;
+        while unit + 1 < SUFFIXES.len() && value >= divisor * 1_000 {
+            unit += 1;
+            divisor *= 1_000;
+        }
+        if unit == 0 {
+            return write!(f, "{value}");
+        }
+        loop {
+            let whole = value / divisor;
+            let mut decimals = if whole < 10 {
+                2
+            } else if whole < 100 {
+                1
+            } else {
+                0
+            };
+            loop {
+                let factor = 10u128.pow(decimals);
+                let rounded = (value * factor + divisor / 2) / divisor;
+                if rounded >= 1_000 {
+                    if decimals > 0 {
+                        decimals -= 1;
+                        continue;
+                    }
+                    if unit + 1 < SUFFIXES.len() {
+                        unit += 1;
+                        divisor *= 1_000;
+                        break;
+                    }
+                }
+                return match decimals {
+                    2 => write!(
+                        f,
+                        "{}.{:02}{}",
+                        rounded / 100,
+                        rounded % 100,
+                        SUFFIXES[unit]
+                    ),
+                    1 => write!(f, "{}.{}{}", rounded / 10, rounded % 10, SUFFIXES[unit]),
+                    _ => write!(f, "{}{}", rounded, SUFFIXES[unit]),
+                };
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct VisitStats {
@@ -94,7 +154,7 @@ where
     let overlap = k - 1;
     let mut heads = Vec::with_capacity(2 * ranges.len());
     let mut tails = Vec::with_capacity(2 * ranges.len());
-    info!("Building graph of {:>12} unitigs..", ranges.len());
+    info!("Building graph of {} unitigs..", compact(ranges.len()));
     for (index, range) in ranges.iter().enumerate() {
         let id = (index as u32) * 2;
         let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
@@ -164,7 +224,7 @@ where
             }
         }
     }
-    info!("Sorting {:>12} edges", pairs.len());
+    info!("Sorting {} edges", compact(pairs.len()));
     pairs.voracious_mt_sort(rayon::current_num_threads());
     // let old_len = pairs.len();
     // info!("Dedup edges");
@@ -175,8 +235,8 @@ where
     info!("Building CSR adjacency");
     let mut offsets = vec![0; 2 * ranges.len() + 1];
     info!(
-        "Filling offsets: {:>12} MB",
-        std::mem::size_of_val(offsets.as_slice()) / (1024 * 1024)
+        "Filling offsets: {}B",
+        compact(std::mem::size_of_val(offsets.as_slice()))
     );
     for edge in &pairs {
         offsets[edge.from as usize + 1] += 1;
@@ -517,14 +577,19 @@ fn match_ends(
     let mut visits = VisitStats::default();
     let mut estimated_bases = initial_bases;
     info!(
-        "Matching {:>12} unitigs, {:>12} ends, k {:>12}: two ends per unitig; overlap = k minus one minus distance; examined = receiver checks; links made = connections; receiving ends remain = unlinked ends scheduled below k; free ends = initial ends minus twice cumulative links",
-        ranges.len(),
-        nodes,
-        k,
+        "Matching {} unitigs, {} ends, k {}: two ends per unitig; overlap = k minus one minus distance; examined = receiver checks; links made = connections; receiving ends remain = unlinked ends scheduled below k; free ends = initial ends minus twice cumulative links",
+        compact(ranges.len()),
+        compact(nodes),
+        compact(k),
     );
     info!(
-        "Before distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
-        0, 0, 0, remaining_receivers, nodes, initial_bases,
+        "Before distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
+        compact(0u64),
+        compact(0u64),
+        compact(0u64),
+        compact(remaining_receivers),
+        compact(nodes),
+        compact(initial_bases),
     );
     info!(
         "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source includes tree, boundary, and repair scans"
@@ -581,25 +646,25 @@ fn match_ends(
         }
     }
     info!(
-        "After distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
-        0,
-        direct_examined,
-        direct_made,
-        remaining_receivers,
-        nodes - 2 * linked,
-        estimated_bases,
+        "After distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
+        compact(0u64),
+        compact(direct_examined),
+        compact(direct_made),
+        compact(remaining_receivers),
+        compact(nodes - 2 * linked),
+        compact(estimated_bases),
     );
     info!(
-        "After distance {:>12} node visits: direct_overlap {:>12} (total {:>12}), nearest_receiver {:>12} (total {:>12}), connect {:>12} (total {:>12}), remove_source {:>12} (total {:>12})",
-        0,
-        visits.direct_overlap,
-        visits.direct_overlap,
-        0,
-        0,
-        visits.connect,
-        visits.connect,
-        visits.remove_source,
-        visits.remove_source,
+        "After distance {} node visits: direct_overlap {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
+        compact(0u64),
+        compact(visits.direct_overlap),
+        compact(visits.direct_overlap),
+        compact(0u64),
+        compact(0u64),
+        compact(visits.connect),
+        compact(visits.connect),
+        compact(visits.remove_source),
+        compact(visits.remove_source),
     );
 
     for distance in 1..k {
@@ -657,25 +722,25 @@ fn match_ends(
             field.remove_source(target ^ 1, graph, ranges, k, &mut visits.remove_source);
         }
         info!(
-            "After distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
-            distance,
-            examined,
-            made,
-            remaining_receivers,
-            nodes - 2 * linked,
-            estimated_bases,
+            "After distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
+            compact(distance),
+            compact(examined),
+            compact(made),
+            compact(remaining_receivers),
+            compact(nodes - 2 * linked),
+            compact(estimated_bases),
         );
         info!(
-            "After distance {:>12} node visits: direct_overlap {:>12} (total {:>12}), nearest_receiver {:>12} (total {:>12}), connect {:>12} (total {:>12}), remove_source {:>12} (total {:>12})",
-            distance,
-            0,
-            visits.direct_overlap,
-            visits.nearest_receiver - before.nearest_receiver,
-            visits.nearest_receiver,
-            visits.connect - before.connect,
-            visits.connect,
-            visits.remove_source - before.remove_source,
-            visits.remove_source,
+            "After distance {} node visits: direct_overlap {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
+            compact(distance),
+            compact(0u64),
+            compact(visits.direct_overlap),
+            compact(visits.nearest_receiver - before.nearest_receiver),
+            compact(visits.nearest_receiver),
+            compact(visits.connect - before.connect),
+            compact(visits.connect),
+            compact(visits.remove_source - before.remove_source),
+            compact(visits.remove_source),
         );
     }
 
@@ -695,8 +760,11 @@ fn match_ends(
         );
     }
     info!(
-        "Final node visits (including closure links): direct_overlap {:>12}, nearest_receiver {:>12}, connect {:>12}, remove_source {:>12}",
-        visits.direct_overlap, visits.nearest_receiver, visits.connect, visits.remove_source,
+        "Final node visits (including closure links): direct_overlap {}, nearest_receiver {}, connect {}, remove_source {}",
+        compact(visits.direct_overlap),
+        compact(visits.nearest_receiver),
+        compact(visits.connect),
+        compact(visits.remove_source),
     );
     (links, estimated_bases)
 }
@@ -772,9 +840,9 @@ where
         }
     }
     info!(
-        "Length summary: {:>12} estimated bases after links, {:>12} output bases",
-        estimated_bases,
-        output.len(),
+        "Length summary: {} estimated bases after links, {} output bases",
+        compact(estimated_bases),
+        compact(output.len()),
     );
     output
 }
@@ -801,9 +869,9 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
     drop(writer);
     log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
     info!(
-        "matchtigs: {}, output {:>12} bases ({})",
+        "matchtigs: {}, output {} bases ({})",
         timing.finish(),
-        superstring.len(),
+        compact(superstring.len()),
         output.display()
     );
     output
