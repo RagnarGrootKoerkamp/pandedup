@@ -103,6 +103,7 @@ impl Display for Compact {
 #[derive(Clone, Copy, Default)]
 struct VisitStats {
     direct_overlap: u64,
+    build_distances: u64,
     meet: u64,
     connect: u64,
     remove_source: u64,
@@ -322,10 +323,80 @@ struct DistanceField {
 }
 
 impl DistanceField {
-    fn new(nodes: usize) -> Self {
-        Self {
-            distance: vec![0; nodes],
+    /// Build all labels below `radius` from the ends left free by direct
+    /// matching. The cost of an edge depends only on its destination, so the
+    /// first settled predecessor to reach a node gives its final label.
+    fn new(
+        links: &[Link],
+        graph: &Graph,
+        ranges: &[Range<usize>],
+        k: usize,
+        radius: usize,
+        visited: &mut u64,
+    ) -> Self {
+        let mut field = Self {
+            distance: vec![UNREACHABLE; links.len()],
             worklist: Vec::new(),
+        };
+        // Set distances of open ends to 0.
+        let mut buckets = vec![Vec::<u32>::new(); radius];
+        for node in 0..links.len() as u32 {
+            if links[tail_slot(node)].is_empty() {
+                field.distance[node as usize] = 0;
+            }
+        }
+        // First round of relaxing edges; to avoid pushing them on the queue.
+        *visited += links.len() as u64;
+        for node in 0..links.len() as u32 {
+            if field.distance[node as usize] == 0 {
+                field.relax_from(node, 0, graph, ranges, k, radius, &mut buckets, visited);
+            }
+        }
+        // Multi-source dijkstra with bucket queue to set remaining distances
+        *visited += links.len() as u64;
+        for distance in 1..radius {
+            while let Some(node) = buckets[distance].pop() {
+                field.relax_from(
+                    node,
+                    distance,
+                    graph,
+                    ranges,
+                    k,
+                    radius,
+                    &mut buckets,
+                    visited,
+                );
+            }
+        }
+        field
+    }
+
+    fn relax_from(
+        &mut self,
+        node: u32,
+        distance: usize,
+        graph: &Graph,
+        ranges: &[Range<usize>],
+        k: usize,
+        radius: usize,
+        buckets: &mut [Vec<u32>],
+        visited: &mut u64,
+    ) {
+        let successors = graph.outgoing(node);
+        *visited += 1 + successors.len() as u64;
+        for &next in successors {
+            if self.distance[next as usize] != UNREACHABLE {
+                continue;
+            }
+            let weight = traversal_weight(ranges, next, k);
+            if weight >= radius {
+                continue;
+            }
+            let next_distance = distance + weight;
+            self.distance[next as usize] = next_distance as u8;
+            if next_distance < radius {
+                buckets[next_distance].push(next);
+            }
         }
     }
 
@@ -467,6 +538,11 @@ fn connect(
 
 /// Cheapest bridge through one oriented unitig. Returns its cost and the two
 /// oriented tails from which to trace its free source and receiving end.
+///
+/// In the usual case, this is dist[head] + traversal_weight + dist[tail], ie
+/// dist[node] + dist[node^1] + traversal_weight.
+/// However, the start and end cost already *include* the traversal cost, so we
+/// should subtract rather than add it to compensate double-counting.
 fn bridge_candidate(
     node: u32,
     field: &DistanceField,
@@ -519,7 +595,6 @@ fn match_ends(
     let nodes = 2 * ranges.len();
     let radius = k / 2;
     let mut links = vec![Link::EMPTY; nodes];
-    let mut field = DistanceField::new(nodes);
     let mut free_ends = nodes;
     let mut visits = VisitStats::default();
     let mut estimated_bases = initial_bases;
@@ -543,7 +618,7 @@ fn match_ends(
         compact(initial_bases),
     );
     info!(
-        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; meet checks and schedules central unitig traversals and traces endpoints; connect touches link slots; remove_source repairs both bounded fronts"
+        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; build_distances initializes bounded shortest paths; meet checks and schedules central unitig traversals and traces endpoints; connect touches link slots; remove_source repairs both bounded fronts"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
@@ -574,20 +649,17 @@ fn match_ends(
             );
             free_ends -= if source == target ^ 1 { 1 } else { 2 };
             direct_made += 1;
-            field.remove_source(source, graph, ranges, k, radius, &mut visits.remove_source);
-            if source != target ^ 1 {
-                field.remove_source(
-                    target ^ 1,
-                    graph,
-                    ranges,
-                    k,
-                    radius,
-                    &mut visits.remove_source,
-                );
-            }
             break;
         }
     }
+    let mut field = DistanceField::new(
+        &links,
+        graph,
+        ranges,
+        k,
+        radius,
+        &mut visits.build_distances,
+    );
     info!(
         "After distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
         compact(0u64),
@@ -598,10 +670,11 @@ fn match_ends(
         compact(estimated_bases),
     );
     info!(
-        "After distance {} node visits: direct_overlap {} (total {}), meet {} (total {}), connect {} (total {}), remove_source {} (total {})",
+        "After distance {} node visits: direct_overlap {} (total {}), build_distances {}, meet {} (total {}), connect {} (total {}), remove_source {} (total {})",
         compact(0u64),
         compact(visits.direct_overlap),
         compact(visits.direct_overlap),
+        compact(visits.build_distances),
         compact(0u64),
         compact(0u64),
         compact(visits.connect),
@@ -610,10 +683,9 @@ fn match_ends(
         compact(visits.remove_source),
     );
 
-    // Every oriented end starts as a distance-zero source. After the direct
-    // links, remove_source has already repaired the bounded distance field.
-    // Seed each internal traversal once; later deletions only increase its
-    // bridge cost, so we recheck and move its single entry when popped.
+    // The bounded field now contains distances from all free ends. Seed each
+    // internal traversal once; later deletions only increase its bridge cost,
+    // so we recheck and move its single entry when popped.
     let mut buckets = vec![Vec::<u32>::new(); k];
     for node in 0..nodes as u32 {
         if let Some((cost, _, _)) =
@@ -716,8 +788,9 @@ fn match_ends(
         );
     }
     info!(
-        "Final node visits (including closure links): direct_overlap {}, meet {}, connect {}, remove_source {}",
+        "Final node visits (including closure links): direct_overlap {}, build_distances {}, meet {}, connect {}, remove_source {}",
         compact(visits.direct_overlap),
+        compact(visits.build_distances),
         compact(visits.meet),
         compact(visits.connect),
         compact(visits.remove_source),
