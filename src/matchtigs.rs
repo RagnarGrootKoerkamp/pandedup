@@ -396,6 +396,8 @@ impl DistanceField {
 
     /// Follow tight incoming edges to a free source. Positive traversal
     /// weights make the distance decrease at every step.
+    ///
+    /// Note that now this is just a linear scan to follow a path backwards, not a DFS anymore.
     fn source(
         &self,
         mut node: u32,
@@ -435,6 +437,7 @@ fn head_slot(id: u32) -> usize {
     id as usize
 }
 
+/// Connect unmatched unitigs ends `from` to `to`.
 fn connect(
     links: &mut [Link],
     from: u32,
@@ -443,6 +446,8 @@ fn connect(
     total_bases: &mut usize,
     visited: &mut u64,
 ) {
+    debug_assert!(links[tail_slot(from)].is_empty());
+    debug_assert!(links[head_slot(to)].is_empty());
     debug_assert!(overlap <= u8::MAX as usize);
     links[tail_slot(from)] = Link {
         target: to,
@@ -594,6 +599,7 @@ fn match_ends(
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
     // those edges without querying shortest-path labels.
+    // TODO / HOT: This is slow
     let mut direct_examined = 0usize;
     let mut direct_made = 0usize;
     for target in 0..nodes as u32 {
@@ -685,8 +691,6 @@ fn match_ends(
                     .expect("bridge cost has no meeting path");
             // The same traversal may connect another pair at this distance.
             buckets[distance].push(node);
-            debug_assert!(links[tail_slot(source)].is_empty());
-            debug_assert!(links[head_slot(target)].is_empty());
             connect(
                 &mut links,
                 source,
@@ -732,6 +736,7 @@ fn match_ends(
         );
     }
 
+    // Link up (concatenate) remaining seqs.
     let outgoing: Vec<_> = (0..nodes as u32)
         .filter(|&id| links[tail_slot(id)].is_empty())
         .collect();
@@ -747,6 +752,7 @@ fn match_ends(
             &mut visits.connect,
         );
     }
+    // A self-link without overlap is fine.
     if let [source] = pairs.remainder() {
         connect(
             &mut links,
