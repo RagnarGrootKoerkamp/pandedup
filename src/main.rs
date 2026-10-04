@@ -95,7 +95,7 @@ impl From<GgcatMode> for ExtraElaboration {
 struct MssArgs {
     /// Input FASTA/FASTQ file (plain or compressed).
     input: PathBuf,
-    /// Output FASTA file. Defaults to input with an .msfa extension.
+    /// Output FASTA file. Defaults to input stem plus -mss.msfa or -greedytigs.msfa.
     #[arg(short, long)]
     output: Option<PathBuf>,
     /// K-mer size.

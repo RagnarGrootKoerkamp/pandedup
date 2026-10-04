@@ -30,7 +30,7 @@
 //! Finally, remaining ends are paired with zero overlap, and the links are
 //! written as a masked superstring.
 
-use crate::{log_file_stats, mss::MssKey, timing::StageTiming};
+use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
@@ -904,7 +904,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
     };
     let output = output
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| input.with_extension("matchtigs.msfa"));
+        .unwrap_or_else(|| default_msfa_output(input, "greedytigs"));
     let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
     writeln!(writer, ">matchtigs-masked-superstring").unwrap();
     writer.write_all(&superstring).unwrap();

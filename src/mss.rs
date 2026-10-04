@@ -6,7 +6,7 @@
 //! Masked superstrings as a unified framework for textual k-mer set representations.
 //! bioRxiv 2023.02.01.526717, 2023. https://doi.org/10.1101/2023.02.01.526717
 
-use crate::{log_file_stats, timing::StageTiming};
+use crate::{default_msfa_output, log_file_stats, timing::StageTiming};
 use core::ops::{BitAnd, Mul, Range, Shl, Shr, Sub};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use rayon::prelude::*;
@@ -416,7 +416,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, threads: Option<usize>
     });
     let output = output
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| input.with_extension("msfa"));
+        .unwrap_or_else(|| default_msfa_output(input, "mss"));
     let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
     writeln!(writer, ">masked-superstring").unwrap();
     writer.write_all(&superstring).unwrap();

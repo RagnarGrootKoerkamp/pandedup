@@ -60,6 +60,30 @@ pub fn log_file_stats(action: &str, path: &Path, counts: Option<(usize, usize)>)
     Ok(())
 }
 
+/// Name a masked superstring output after the input sequence file.
+pub(crate) fn default_msfa_output(input: &Path, method: &str) -> PathBuf {
+    let mut path = input.to_path_buf();
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("gz" | "zst" | "bz2")
+    ) {
+        path.set_extension("");
+    }
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("fa" | "fasta" | "fq" | "fastq")
+    ) {
+        path.set_extension("");
+    }
+    let mut name = path
+        .file_name()
+        .expect("input has no file name")
+        .to_os_string();
+    name.push(format!("-{method}.msfa"));
+    path.set_file_name(name);
+    path
+}
+
 /// Deduplicate the input and return the output path.
 pub fn dedup(
     input: &Path,
