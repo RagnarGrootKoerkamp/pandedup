@@ -5,7 +5,7 @@ use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
@@ -228,10 +228,10 @@ impl Radixable<u32> for ActivePath {
 }
 
 fn tail_slot(id: u32) -> usize {
-    (id as usize & !1) + usize::from(id & 1 == 0)
+    (id ^ 1) as usize
 }
 fn head_slot(id: u32) -> usize {
-    (id as usize & !1) + usize::from(id & 1 != 0)
+    id as usize
 }
 
 fn connect(links: &mut [Link], from: u32, to: u32, overlap: usize) {
@@ -279,6 +279,7 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
             buckets[distance].len(),
             receiving.len()
         );
+        debug!("expanding paths");
         let mut candidates = Vec::<ActivePath>::new();
         for path in std::mem::take(&mut buckets[distance]) {
             if !links[tail_slot(path.start)].is_empty() {
@@ -293,7 +294,9 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
         }
         // The receiving ids and candidate tail ids have the same orientation
         // encoding. Sorting permits a single merge pass over both vectors.
+        debug!("Sorting candidates");
         candidates.voracious_mt_sort(rayon::current_num_threads());
+        debug!("Matching candidates to receiving ends");
         let mut r = 0;
         for candidate in &mut candidates {
             while r < receiving.len() && (receiving[r] == DEAD || receiving[r] < candidate.current)
@@ -310,21 +313,23 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
             if tail_slot(candidate.start) == head_slot(candidate.current) {
                 continue;
             }
-            if links[head_slot(candidate.current)].is_empty() {
-                connect(
-                    &mut links,
-                    candidate.start,
-                    candidate.current,
-                    k - 1 - distance,
-                );
+            if !links[head_slot(candidate.current)].is_empty() {
                 receiving[r] = DEAD;
-                candidate.start = DEAD;
-            } else {
-                receiving[r] = DEAD;
+                continue;
             }
+            connect(
+                &mut links,
+                candidate.start,
+                candidate.current,
+                k - 1 - distance,
+            );
+            receiving[r] = DEAD;
+            candidate.start = DEAD;
         }
+        debug!("Retain");
         receiving.retain(|&id| id != DEAD && links[head_slot(id)].is_empty());
 
+        debug!("Pushing candidates to next bucket");
         for candidate in candidates {
             if candidate.start == DEAD || !links[tail_slot(candidate.start)].is_empty() {
                 continue;
@@ -339,8 +344,14 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
                 current: candidate.current,
             });
         }
+        let total = buckets.iter().map(Vec::len).sum::<usize>();
+        let dead = buckets
+            .iter()
+            .flatten()
+            .filter(|path| !links[tail_slot(path.start)].is_empty())
+            .count();
         info!(
-            "After distance {distance}, bucket queue sizes: {:?}",
+            "After distance {distance}, total: {total}; dead: {dead};  bucket queue sizes: {:?}",
             buckets.iter().map(Vec::len).collect::<Vec<_>>()
         );
     }
