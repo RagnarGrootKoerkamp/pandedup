@@ -840,6 +840,22 @@ where
 
     let (links, estimated_bases) = match_ends(k, &ranges, &graph, initial_bases);
 
+    let output = reconstruct_output::<K>(k, seq, ranges, short, links);
+    info!(
+        "Length summary: {} estimated bases after links, {} output bases",
+        compact(estimated_bases),
+        compact(output.len()),
+    );
+    output
+}
+
+fn reconstruct_output<K: MssKey>(
+    k: usize,
+    seq: packed_seq::private::PackedSeqVecBase<2>,
+    ranges: Vec<Range<usize>>,
+    short: Vec<Range<usize>>,
+    links: Vec<Link>,
+) -> Vec<u8> {
     info!("Reconstruct output");
     let mut output = Vec::new();
     let mut done = vec![false; ranges.len()];
@@ -882,11 +898,6 @@ where
             append(&mut output, &seq, range, false, 0, k);
         }
     }
-    info!(
-        "Length summary: {} estimated bases after links, {} output bases",
-        compact(estimated_bases),
-        compact(output.len()),
-    );
     output
 }
 
