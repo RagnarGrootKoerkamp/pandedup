@@ -282,8 +282,8 @@ struct DistanceField {
     distance: Vec<u8>,
     owner: Vec<u32>,
     parent: Vec<u32>,
-    unsettled: Vec<bool>,
-    affected: Vec<u32>,
+    queued: Vec<bool>,
+    worklist: Vec<u32>,
 }
 
 impl DistanceField {
@@ -292,21 +292,20 @@ impl DistanceField {
             distance: vec![0; nodes],
             owner: (0..nodes as u32).collect(),
             parent: vec![DEAD; nodes],
-            unsettled: vec![false; nodes],
-            affected: Vec::new(),
+            queued: vec![false; nodes],
+            worklist: Vec::new(),
         }
     }
 
     fn relax(&mut self, node: u32, distance: usize, owner: u32, parent: u32, k: usize) -> bool {
         let index = node as usize;
-        if distance >= k || !self.unsettled[index] || distance >= self.distance[index] as usize {
+        if distance >= k || distance >= self.distance[index] as usize {
             return false;
         }
-        let newly_reached = self.distance[index] == UNREACHABLE;
         self.distance[index] = distance as u8;
         self.owner[index] = owner;
         self.parent[index] = parent;
-        newly_reached
+        true
     }
 
     /// Delete one source and repair exactly the part of its shortest-path tree
@@ -327,85 +326,56 @@ impl DistanceField {
             self.distance[source as usize], 0,
             "active source has nonzero distance"
         );
-        self.affected.clear();
-        self.affected.push(source);
-        self.unsettled[source as usize] = true;
-        let mut cursor = 0;
-        while cursor < self.affected.len() {
-            let node = self.affected[cursor];
-            cursor += 1;
-            let children = graph.outgoing(node);
-            *visited += 1 + children.len() as u64;
-            for &child in children {
-                let index = child as usize;
-                if self.owner[index] == source
-                    && self.parent[index] == node
-                    && !self.unsettled[index]
-                {
-                    self.unsettled[index] = true;
-                    self.affected.push(child);
-                }
-            }
-            self.distance[node as usize] = UNREACHABLE;
-            self.owner[node as usize] = DEAD;
-            self.parent[node as usize] = DEAD;
-        }
+        self.worklist.clear();
+        self.distance[source as usize] = UNREACHABLE;
+        self.owner[source as usize] = DEAD;
+        self.parent[source as usize] = DEAD;
+        self.queued[source as usize] = true;
+        self.worklist.push(source);
 
-        let mut pending = 0usize;
-        let mut first_distance = k;
-        for index in 0..self.affected.len() {
-            let node = self.affected[index];
+        // An old-tree child is invalidated when its parent is visited. Nodes
+        // can be visited again when a replacement path improves their label.
+        while let Some(node) = self.worklist.pop() {
+            self.queued[node as usize] = false;
             let weight = traversal_weight(ranges, node, k);
             let predecessors = graph.outgoing(node ^ 1);
             *visited += 1 + predecessors.len() as u64;
             for &reverse_predecessor in predecessors {
                 let predecessor = reverse_predecessor ^ 1;
                 let from = predecessor as usize;
-                if !self.unsettled[from] && self.owner[from] != DEAD {
+                // An old label owned by the removed source is invalid even
+                // if its node has not yet been reached by this DFS.
+                if self.owner[from] != source && self.owner[from] != DEAD {
                     let distance = (self.distance[from] as usize).saturating_add(weight);
-                    if self.relax(node, distance, self.owner[from], predecessor, k) {
-                        pending += 1;
-                    }
-                    first_distance = first_distance.min(distance);
+                    self.relax(node, distance, self.owner[from], predecessor, k);
                 }
             }
-        }
 
-        // Every edge adds at least one base, so one scan of the affected
-        // nodes per distance settles all labels at that distance. A node
-        // occupies one slot in `affected`, even if many paths relax it.
-        for distance in first_distance..k {
-            *visited += self.affected.len() as u64;
-            for position in 0..self.affected.len() {
-                let node = self.affected[position];
-                let index = node as usize;
-                if !self.unsettled[index] || self.distance[index] as usize != distance {
-                    continue;
+            let distance = self.distance[node as usize] as usize;
+            let owner = self.owner[node as usize];
+            let next_nodes = graph.outgoing(node);
+            *visited += 1 + next_nodes.len() as u64;
+            for &next in next_nodes {
+                let index = next as usize;
+                let old_tree_child = self.owner[index] == source && self.parent[index] == node;
+                if old_tree_child {
+                    self.distance[index] = UNREACHABLE;
+                    self.owner[index] = DEAD;
+                    self.parent[index] = DEAD;
                 }
-                self.unsettled[index] = false;
-                pending -= 1;
-                let owner = self.owner[index];
-                let next_nodes = graph.outgoing(node);
-                *visited += next_nodes.len() as u64;
-                for &next in next_nodes {
-                    if self.relax(
+                let improved = owner != DEAD
+                    && self.relax(
                         next,
                         distance.saturating_add(traversal_weight(ranges, next, k)),
                         owner,
                         node,
                         k,
-                    ) {
-                        pending += 1;
-                    }
+                    );
+                if (old_tree_child || improved) && !self.queued[index] {
+                    self.queued[index] = true;
+                    self.worklist.push(next);
                 }
             }
-            if pending == 0 {
-                break;
-            }
-        }
-        *visited += self.affected.len() as u64;
-        for &node in &self.affected {
-            self.unsettled[node as usize] = false;
         }
     }
 }
@@ -593,9 +563,6 @@ fn match_ends(
     );
     info!(
         "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source includes tree, boundary, and repair scans"
-    );
-    info!(
-        "Estimated bases starts as the sum of unitig lengths and drops by every link overlap; cycle closures can make it lower than the final linear output"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
