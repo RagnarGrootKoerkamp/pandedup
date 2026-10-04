@@ -6,12 +6,14 @@ use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tracing::info;
+use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(1))]
-struct End<K> {
+#[doc(hidden)]
+pub struct End<K> {
     kmer: K,
     id: u32,
 }
@@ -20,6 +22,49 @@ const _: () = {
     assert!(std::mem::size_of::<End<u64>>() == 12);
     assert!(std::mem::size_of::<End<u128>>() == 20);
 };
+
+impl Radixable<u64> for End<u64> {
+    type Key = u64;
+    fn key(&self) -> Self::Key {
+        self.kmer
+    }
+}
+
+impl Radixable<u128> for End<u128> {
+    type Key = u128;
+    fn key(&self) -> Self::Key {
+        self.kmer
+    }
+}
+
+impl<K: MssKey> PartialEq for End<K> {
+    fn eq(&self, other: &Self) -> bool {
+        let left = self.kmer;
+        let right = other.kmer;
+        left == right
+    }
+}
+
+impl<K: MssKey> PartialOrd for End<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let left = self.kmer;
+        let right = other.kmer;
+        Some(left.cmp(&right))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+struct Edge {
+    from: u32,
+    to: u32,
+}
+
+impl Radixable<u64> for Edge {
+    type Key = u64;
+    fn key(&self) -> Self::Key {
+        (u64::from(self.from) << 32) | u64::from(self.to)
+    }
+}
 
 /// CSR adjacency indexed by an oriented outgoing tail. An edge's destination
 /// is the oriented unitig entered at its head; its low bit is the orientation.
@@ -34,7 +79,10 @@ impl Graph {
     }
 }
 
-fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Graph {
+fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Graph
+where
+    End<K>: Radixable<K, Key = K>,
+{
     let overlap = k - 1;
     let mut heads = Vec::with_capacity(2 * ranges.len());
     let mut tails = Vec::with_capacity(2 * ranges.len());
@@ -59,9 +107,9 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
         });
     }
     info!("Sorting heads");
-    heads.sort_unstable_by_key(|end| end.kmer);
+    heads.voracious_mt_sort(rayon::current_num_threads());
     info!("Sorting tails");
-    tails.sort_unstable_by_key(|end| end.kmer);
+    tails.voracious_mt_sort(rayon::current_num_threads());
 
     info!("Matching unitig ends");
     let mut pairs = Vec::new();
@@ -96,7 +144,10 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
                         // The reverse orientation of the same endpoint does not
                         // traverse a unitig or introduce a new graph edge.
                         if tail.id != (head.id ^ 1) {
-                            pairs.push((tail.id, head.id));
+                            pairs.push(Edge {
+                                from: tail.id,
+                                to: head.id,
+                            });
                         }
                     }
                 }
@@ -106,7 +157,7 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
         }
     }
     info!("Sorting {} edges", pairs.len());
-    pairs.sort_unstable();
+    pairs.voracious_mt_sort(rayon::current_num_threads());
     // let old_len = pairs.len();
     // info!("Dedup edges");
     // pairs.dedup();
@@ -119,15 +170,15 @@ fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Gr
         "Filling offsets: {} MB",
         std::mem::size_of_val(offsets.as_slice()) / (1024 * 1024)
     );
-    for &(from, _) in &pairs {
-        offsets[from as usize + 1] += 1;
+    for edge in &pairs {
+        offsets[edge.from as usize + 1] += 1;
     }
     for i in 1..offsets.len() {
         offsets[i] += offsets[i - 1];
     }
     info!("Mapping pairs");
     Graph {
-        edges: pairs.into_iter().map(|(_, to)| to).collect(),
+        edges: pairs.into_iter().map(|edge| edge.to).collect(),
         offsets,
     }
 }
@@ -153,8 +204,27 @@ impl Link {
 
 #[derive(Clone, Copy)]
 struct ActivePath {
-    start: u32,
     current: u32,
+    start: u32,
+}
+
+impl PartialEq for ActivePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.current == other.current
+    }
+}
+
+impl PartialOrd for ActivePath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.current.cmp(&other.current))
+    }
+}
+
+impl Radixable<u32> for ActivePath {
+    type Key = u32;
+    fn key(&self) -> Self::Key {
+        self.current
+    }
 }
 
 fn tail_slot(id: u32) -> usize {
@@ -223,7 +293,7 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
         }
         // The receiving ids and candidate tail ids have the same orientation
         // encoding. Sorting permits a single merge pass over both vectors.
-        candidates.sort_unstable_by_key(|path| (path.current, path.start));
+        candidates.voracious_mt_sort(rayon::current_num_threads());
         let mut r = 0;
         for candidate in &mut candidates {
             while r < receiving.len() && (receiving[r] == DEAD || receiving[r] < candidate.current)
@@ -319,7 +389,10 @@ pub fn masked_superstring<K: MssKey>(
     k: usize,
     seq: PackedSeqVec,
     ranges: Vec<Range<usize>>,
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    End<K>: Radixable<K, Key = K>,
+{
     assert!(k > 0 && k <= K::BITS / 2);
     let (ranges, short): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|r| r.len() >= k);
     assert!(ranges.len() <= (u32::MAX as usize / 2), "too many unitigs");
