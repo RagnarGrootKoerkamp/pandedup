@@ -1,6 +1,7 @@
 use super::*;
+use packed_seq::{PackedSeqVec, SeqVec};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 #[test]
@@ -190,6 +191,189 @@ fn report_spectrum_failure(
         );
     }
     panic!("k-mer spectrum mismatch");
+}
+
+// Compact a directed de Bruijn graph by walking every maximal nonbranching
+// path. Keep this independent of the production graph builder: the test input
+// starts as sequences, not as precomputed unitigs.
+fn naive_unitigs(sequences: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
+    fn vertex_id(vertices: &mut HashMap<Vec<u8>, usize>, label: &[u8]) -> usize {
+        let next = vertices.len();
+        *vertices.entry(label.to_vec()).or_insert(next)
+    }
+
+    let mut kmers: Vec<Vec<u8>> = sequences
+        .iter()
+        .flat_map(|sequence| sequence.windows(k).map(|window| window.to_vec()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    kmers.sort_unstable();
+
+    let mut vertices = HashMap::new();
+    let edges: Vec<_> = kmers
+        .into_iter()
+        .map(|kmer| {
+            let from = vertex_id(&mut vertices, &kmer[..k - 1]);
+            let to = vertex_id(&mut vertices, &kmer[1..]);
+            (from, to, kmer)
+        })
+        .collect();
+    let mut incoming = vec![0usize; vertices.len()];
+    let mut outgoing = vec![Vec::new(); vertices.len()];
+    for (edge, &(from, to, _)) in edges.iter().enumerate() {
+        outgoing[from].push(edge);
+        incoming[to] += 1;
+    }
+
+    fn walk(
+        first: usize,
+        edges: &[(usize, usize, Vec<u8>)],
+        incoming: &[usize],
+        outgoing: &[Vec<usize>],
+        visited: &mut [bool],
+    ) -> Vec<u8> {
+        let mut unitig = edges[first].2.clone();
+        let mut edge = first;
+        loop {
+            visited[edge] = true;
+            let to = edges[edge].1;
+            if incoming[to] != 1 || outgoing[to].len() != 1 {
+                break;
+            }
+            let next = outgoing[to][0];
+            if visited[next] {
+                break;
+            }
+            unitig.push(*edges[next].2.last().unwrap());
+            edge = next;
+        }
+        unitig
+    }
+
+    let mut visited = vec![false; edges.len()];
+    let mut unitigs = Vec::new();
+    for vertex in 0..vertices.len() {
+        if incoming[vertex] == 1 && outgoing[vertex].len() == 1 {
+            continue;
+        }
+        for &edge in &outgoing[vertex] {
+            if !visited[edge] {
+                unitigs.push(walk(edge, &edges, &incoming, &outgoing, &mut visited));
+            }
+        }
+    }
+    // The remaining edges are isolated 1-in/1-out cycles.
+    for edge in 0..edges.len() {
+        if !visited[edge] {
+            unitigs.push(walk(edge, &edges, &incoming, &outgoing, &mut visited));
+        }
+    }
+    assert!(visited.into_iter().all(|done| done));
+    unitigs.sort_unstable();
+    unitigs
+}
+
+#[test]
+fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
+    let k = 15;
+    let mut rng = StdRng::seed_from_u64(0x9b39_7c64_602e_8d41);
+    let parent: Vec<u8> = (0..350).map(|_| b"ACGT"[rng.random_range(0..4)]).collect();
+    let mut copies = Vec::with_capacity(1_000);
+    copies.push(parent.clone());
+    for _ in 1..1_000 {
+        let mut copy = parent.clone();
+        let position = rng.random_range(0..copy.len());
+        let original = b"ACGT"
+            .iter()
+            .position(|&base| base == copy[position])
+            .unwrap();
+        copy[position] = b"ACGT"[(original + 1 + rng.random_range(0..3)) % 4];
+        copies.push(copy);
+    }
+
+    let unitigs = naive_unitigs(&copies, k);
+    let input_bases: usize = unitigs.iter().map(Vec::len).sum();
+    eprintln!(
+        "{} copies compacted into {} input unitigs, {} total bases",
+        copies.len(),
+        unitigs.len(),
+        input_bases,
+    );
+    assert!((800..=1_200).contains(&unitigs.len()));
+    let mut expected: Vec<_> = unitigs
+        .iter()
+        .flat_map(|unitig| {
+            unitig
+                .windows(k)
+                .map(|window| encode_kmer_for_spectrum(window, true))
+        })
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    let copy_spectrum = kmer_values(copies.iter().map(Vec::as_slice), k, true);
+    assert_eq!(
+        expected.len(),
+        copy_spectrum.len(),
+        "naive compaction changed the copy spectrum"
+    );
+    assert!(expected.iter().all(|kmer| copy_spectrum.contains(kmer)));
+
+    let mut packed = PackedSeqVec::default();
+    let ranges: Vec<_> = unitigs
+        .iter()
+        .map(|unitig| packed.push_ascii(unitig))
+        .collect();
+    // Exercise both packed key implementations through graph recovery,
+    // matching, and reconstruction on the same independently built unitigs.
+    for (key_type, output) in [
+        (
+            "u64",
+            matchtigs::masked_superstring::<u64>(k, packed.clone(), ranges.clone()),
+        ),
+        (
+            "u128",
+            matchtigs::masked_superstring::<u128>(k, packed, ranges),
+        ),
+    ] {
+        eprintln!(
+            "{key_type} output: 1 masked superstring, {} total bases",
+            output.len()
+        );
+        let mut actual: Vec<_> = output
+            .windows(k)
+            .filter(|window| window[k - 1].is_ascii_uppercase())
+            .map(|window| {
+                let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
+                encode_kmer_for_spectrum(&uppercase, true)
+            })
+            .collect();
+        actual.sort_unstable();
+        actual.dedup();
+        let missing: Vec<_> = expected
+            .iter()
+            .filter(|kmer| actual.binary_search(kmer).is_err())
+            .copied()
+            .collect();
+        let extra: Vec<_> = actual
+            .iter()
+            .filter(|kmer| expected.binary_search(kmer).is_err())
+            .copied()
+            .collect();
+        eprintln!(
+            "{key_type} canonical k-mers: {} input, {} output, {} missing, {} extra",
+            expected.len(),
+            actual.len(),
+            missing.len(),
+            extra.len(),
+        );
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{key_type} masked matchtigs spectrum differs: missing {:?}, extra {:?}",
+            &missing[..missing.len().min(5)],
+            &extra[..extra.len().min(5)],
+        );
+    }
 }
 
 #[test]

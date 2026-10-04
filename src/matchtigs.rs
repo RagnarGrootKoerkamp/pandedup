@@ -501,8 +501,9 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
                 }
             }
             info!(
-                "Distance {distance}, pass {passes}: {frontier} frontier nodes, {} links",
-                matched_sources.len()
+                "Distance {distance}, pass {passes}: {frontier} frontier nodes, {} links made, {} free ends",
+                matched_sources.len(),
+                nodes - 2 * linked,
             );
             if matched_sources.is_empty() {
                 break;
