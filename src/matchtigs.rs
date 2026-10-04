@@ -277,39 +277,41 @@ fn traversal_weight(ranges: &[Range<usize>], node: u32, k: usize) -> usize {
     ranges[(node / 2) as usize].len() - (k - 1)
 }
 
-/// Nearest still-free outgoing end for each oriented unitig tail.
+/// Distance to the nearest still-free outgoing end for each oriented tail.
 struct DistanceField {
     distance: Vec<u8>,
-    owner: Vec<u32>,
-    parent: Vec<u32>,
-    queued: Vec<bool>,
-    worklist: Vec<u32>,
+    worklist: Vec<(u32, u8)>,
 }
 
 impl DistanceField {
     fn new(nodes: usize) -> Self {
         Self {
             distance: vec![0; nodes],
-            owner: (0..nodes as u32).collect(),
-            parent: vec![DEAD; nodes],
-            queued: vec![false; nodes],
             worklist: Vec::new(),
         }
     }
 
-    fn relax(&mut self, node: u32, distance: usize, owner: u32, parent: u32, k: usize) -> bool {
-        let index = node as usize;
-        if distance >= k || distance >= self.distance[index] as usize {
-            return false;
+    fn replacement_distance(
+        &self,
+        node: u32,
+        graph: &Graph,
+        ranges: &[Range<usize>],
+        k: usize,
+        visited: &mut u64,
+    ) -> u8 {
+        let weight = traversal_weight(ranges, node, k);
+        let predecessors = graph.outgoing(node ^ 1);
+        *visited += 1 + predecessors.len() as u64;
+        let mut best = k;
+        for &reverse_predecessor in predecessors {
+            let predecessor = reverse_predecessor ^ 1;
+            best = best.min(self.distance[predecessor as usize] as usize + weight);
         }
-        self.distance[index] = distance as u8;
-        self.owner[index] = owner;
-        self.parent[index] = parent;
-        true
+        if best == k { UNREACHABLE } else { best as u8 }
     }
 
-    /// Delete one source and repair exactly the part of its shortest-path tree
-    /// that depended on it. Incoming edges use the reverse-complement graph.
+    /// Propagate increases after deleting a source. A neighbor only needs
+    /// repair if its current label was tight through the changed node.
     fn remove_source(
         &mut self,
         source: u32,
@@ -319,69 +321,75 @@ impl DistanceField {
         visited: &mut u64,
     ) {
         assert_eq!(
-            self.owner[source as usize], source,
-            "removed source lost its root label"
-        );
-        assert_eq!(
             self.distance[source as usize], 0,
             "active source has nonzero distance"
         );
         self.worklist.clear();
-        self.distance[source as usize] = UNREACHABLE;
-        self.owner[source as usize] = DEAD;
-        self.parent[source as usize] = DEAD;
-        self.queued[source as usize] = true;
-        self.worklist.push(source);
-
-        // An old-tree child is invalidated when its parent is visited. Nodes
-        // can be visited again when a replacement path improves their label.
-        while let Some(node) = self.worklist.pop() {
-            self.queued[node as usize] = false;
-            let weight = traversal_weight(ranges, node, k);
-            let predecessors = graph.outgoing(node ^ 1);
-            *visited += 1 + predecessors.len() as u64;
-            for &reverse_predecessor in predecessors {
-                let predecessor = reverse_predecessor ^ 1;
-                let from = predecessor as usize;
-                // An old label owned by the removed source is invalid even
-                // if its node has not yet been reached by this DFS.
-                if self.owner[from] != source && self.owner[from] != DEAD {
-                    let distance = (self.distance[from] as usize).saturating_add(weight);
-                    self.relax(node, distance, self.owner[from], predecessor, k);
-                }
-            }
-
-            let distance = self.distance[node as usize] as usize;
-            let owner = self.owner[node as usize];
+        self.distance[source as usize] =
+            self.replacement_distance(source, graph, ranges, k, visited);
+        debug_assert!(self.distance[source as usize] > 0);
+        self.worklist.push((source, 0));
+        while let Some((node, old_distance)) = self.worklist.pop() {
             let next_nodes = graph.outgoing(node);
             *visited += 1 + next_nodes.len() as u64;
             for &next in next_nodes {
-                let index = next as usize;
-                let old_tree_child = self.owner[index] == source && self.parent[index] == node;
-                if old_tree_child {
-                    self.distance[index] = UNREACHABLE;
-                    self.owner[index] = DEAD;
-                    self.parent[index] = DEAD;
-                }
-                let improved = owner != DEAD
-                    && self.relax(
-                        next,
-                        distance.saturating_add(traversal_weight(ranges, next, k)),
-                        owner,
-                        node,
-                        k,
-                    );
-                if (old_tree_child || improved) && !self.queued[index] {
-                    self.queued[index] = true;
-                    self.worklist.push(next);
+                let old_next = self.distance[next as usize];
+                if old_next != UNREACHABLE
+                    && old_distance as usize + traversal_weight(ranges, next, k)
+                        == old_next as usize
+                {
+                    let new_next = self.replacement_distance(next, graph, ranges, k, visited);
+                    debug_assert!(new_next >= old_next);
+                    if new_next > old_next {
+                        self.distance[next as usize] = new_next;
+                        self.worklist.push((next, old_next));
+                    }
                 }
             }
         }
     }
+
+    /// Follow tight incoming edges to recover any source other than forbidden.
+    /// Distances strictly decrease, so recursion is bounded by k.
+    fn source(
+        &self,
+        node: u32,
+        forbidden: u32,
+        graph: &Graph,
+        ranges: &[Range<usize>],
+        k: usize,
+        visited: &mut u64,
+    ) -> Option<u32> {
+        *visited += 1;
+        let distance = self.distance[node as usize];
+        if distance == UNREACHABLE {
+            return None;
+        }
+        if distance == 0 {
+            return (node != forbidden).then_some(node);
+        }
+        let weight = traversal_weight(ranges, node, k);
+        if weight > distance as usize {
+            return None;
+        }
+        let predecessors = graph.outgoing(node ^ 1);
+        *visited += predecessors.len() as u64;
+        for &reverse_predecessor in predecessors {
+            let predecessor = reverse_predecessor ^ 1;
+            let prior = self.distance[predecessor as usize];
+            if prior != UNREACHABLE && prior as usize + weight == distance as usize {
+                if let Some(source) = self.source(predecessor, forbidden, graph, ranges, k, visited)
+                {
+                    return Some(source);
+                }
+            }
+        }
+        None
+    }
 }
 
-/// Reusable scratch for the rare case where a receiver's nearest owner is
-/// its own physical end, which cannot be linked to itself.
+/// Reusable scratch when all nearest tight paths reach the receiver's own
+/// physical end, which cannot be linked to itself.
 struct ReverseSearch {
     distance: Vec<u8>,
     touched: Vec<u32>,
@@ -434,11 +442,13 @@ impl ReverseSearch {
                 if self.distance[node as usize] as usize != distance {
                     continue;
                 }
-                let source = field.owner[node as usize];
                 let combined = distance + field.distance[node as usize] as usize;
-                if source != DEAD && source != target ^ 1 && combined < best_distance {
-                    best_distance = combined;
-                    result = Some((source, combined));
+                if combined < best_distance {
+                    if let Some(source) = field.source(node, target ^ 1, graph, ranges, k, visited)
+                    {
+                        best_distance = combined;
+                        result = Some((source, combined));
+                    }
                 }
                 let next_distance = distance.saturating_add(traversal_weight(ranges, node, k));
                 if next_distance < best_distance && next_distance < k {
@@ -506,15 +516,16 @@ fn nearest_receiver(
     for &reverse_predecessor in predecessors {
         let predecessor = reverse_predecessor ^ 1;
         let index = predecessor as usize;
-        let source = field.owner[index];
-        if source == DEAD {
+        let distance = field.distance[index] as usize;
+        if distance >= k {
             continue;
         }
-        let distance = field.distance[index] as usize;
-        if source == forbidden {
+        if let Some(source) = field.source(predecessor, forbidden, graph, ranges, k, visited) {
+            if best.is_none_or(|(_, old_distance)| distance < old_distance) {
+                best = Some((source, distance));
+            }
+        } else {
             forbidden_distance = forbidden_distance.min(distance);
-        } else if best.is_none_or(|(_, old_distance)| distance < old_distance) {
-            best = Some((source, distance));
         }
     }
     let limit = best.map_or(k, |(_, distance)| distance);
@@ -527,7 +538,7 @@ fn nearest_receiver(
     }
 }
 
-/// Greedy distance-ordered matching with one shortest-path label per graph
+/// Greedy distance-ordered matching with one shortest-path distance per graph
 /// node. A receiver's scheduled distance is a lower bound: deleting sources
 /// can only increase it. Repair the field immediately after every link, so
 /// each receiver needs to be examined at most once at a given distance.
@@ -562,7 +573,7 @@ fn match_ends(
         compact(initial_bases),
     );
     info!(
-        "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source includes tree, boundary, and repair scans"
+        "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source scans changed nodes and edges used to recompute distances"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
