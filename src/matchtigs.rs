@@ -31,7 +31,7 @@
 //! written as a masked superstring.
 
 use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTiming};
-use packed_seq::{PackedSeqVec, SeqVec, complement_char};
+use packed_seq::{PackedSeqVec, SeqVec};
 use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -806,20 +806,21 @@ fn append(
     overlap: usize,
     k: usize,
 ) {
-    let mut bases = seq.slice(range.clone()).unpack();
-    if reverse {
-        bases.reverse();
-        for base in &mut bases {
-            *base = complement_char(*base);
-        }
+    let start = output.len();
+    if !reverse {
+        seq.slice(range.start + overlap..range.end)
+            .unpack_into(output);
+    } else {
+        // FIXME TEST THIS
+        seq.slice(range.start..range.end - overlap)
+            .unpack_rc_into(output);
     }
-    if !output.is_empty() {
-        let mask = (k - 1 - overlap).min(bases.len() - overlap);
-        for base in &mut bases[overlap..overlap + mask] {
-            *base = base.to_ascii_lowercase();
-        }
+
+    // FIXME TEST THIS
+    let num_lowercase = (k - 1 - overlap).min(range.len() - overlap);
+    for base in &mut output[start..start + num_lowercase] {
+        *base = base.to_ascii_lowercase();
     }
-    output.extend_from_slice(&bases[overlap..]);
 }
 
 /// Build a masked superstring from unitigs. Newly created crossing k-mers are
