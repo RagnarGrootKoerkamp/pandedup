@@ -5,7 +5,7 @@ use packed_seq::{PackedSeqVec, SeqVec, complement_char};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
@@ -202,28 +202,192 @@ impl Link {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ActivePath {
-    current: u32,
-    start: u32,
+const UNREACHABLE: u8 = u8::MAX;
+
+fn traversal_weight(ranges: &[Range<usize>], node: u32, k: usize) -> usize {
+    ranges[(node / 2) as usize].len() - (k - 1)
 }
 
-impl PartialEq for ActivePath {
-    fn eq(&self, other: &Self) -> bool {
-        self.current == other.current
+/// Nearest still-free outgoing end for each oriented unitig tail.
+struct DistanceField {
+    distance: Vec<u8>,
+    owner: Vec<u32>,
+    parent: Vec<u32>,
+    unsettled: Vec<bool>,
+    affected: Vec<u32>,
+    buckets: Vec<Vec<u32>>,
+}
+
+impl DistanceField {
+    fn new(nodes: usize, k: usize) -> Self {
+        Self {
+            distance: vec![0; nodes],
+            owner: (0..nodes as u32).collect(),
+            parent: vec![DEAD; nodes],
+            unsettled: vec![false; nodes],
+            affected: Vec::new(),
+            buckets: vec![Vec::new(); k],
+        }
+    }
+
+    fn relax(&mut self, node: u32, distance: usize, owner: u32, parent: u32, k: usize) {
+        let index = node as usize;
+        if distance >= k || !self.unsettled[index] || distance >= self.distance[index] as usize {
+            return;
+        }
+        self.distance[index] = distance as u8;
+        self.owner[index] = owner;
+        self.parent[index] = parent;
+        self.buckets[distance].push(node);
+    }
+
+    /// Delete one source and repair exactly the part of its shortest-path tree
+    /// that depended on it. Incoming edges use the reverse-complement graph.
+    fn remove_source(&mut self, source: u32, graph: &Graph, ranges: &[Range<usize>], k: usize) {
+        assert_eq!(
+            self.owner[source as usize], source,
+            "removed source lost its root label"
+        );
+        assert_eq!(
+            self.distance[source as usize], 0,
+            "active source has nonzero distance"
+        );
+        self.affected.clear();
+        self.affected.push(source);
+        self.unsettled[source as usize] = true;
+        let mut cursor = 0;
+        while cursor < self.affected.len() {
+            let node = self.affected[cursor];
+            cursor += 1;
+            for &child in graph.outgoing(node) {
+                let index = child as usize;
+                if self.owner[index] == source
+                    && self.parent[index] == node
+                    && !self.unsettled[index]
+                {
+                    self.unsettled[index] = true;
+                    self.affected.push(child);
+                }
+            }
+            self.distance[node as usize] = UNREACHABLE;
+            self.owner[node as usize] = DEAD;
+            self.parent[node as usize] = DEAD;
+        }
+
+        for index in 0..self.affected.len() {
+            let node = self.affected[index];
+            let weight = traversal_weight(ranges, node, k);
+            for &reverse_predecessor in graph.outgoing(node ^ 1) {
+                let predecessor = reverse_predecessor ^ 1;
+                let from = predecessor as usize;
+                if !self.unsettled[from] && self.owner[from] != DEAD {
+                    let distance = (self.distance[from] as usize).saturating_add(weight);
+                    self.relax(node, distance, self.owner[from], predecessor, k);
+                }
+            }
+        }
+
+        for distance in 0..k {
+            let mut bucket = std::mem::take(&mut self.buckets[distance]);
+            for node in bucket.drain(..) {
+                let index = node as usize;
+                if !self.unsettled[index] || self.distance[index] as usize != distance {
+                    continue;
+                }
+                self.unsettled[index] = false;
+                let owner = self.owner[index];
+                for &next in graph.outgoing(node) {
+                    self.relax(
+                        next,
+                        distance.saturating_add(traversal_weight(ranges, next, k)),
+                        owner,
+                        node,
+                        k,
+                    );
+                }
+            }
+            self.buckets[distance] = bucket;
+        }
+        for &node in &self.affected {
+            self.unsettled[node as usize] = false;
+        }
     }
 }
 
-impl PartialOrd for ActivePath {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.current.cmp(&other.current))
-    }
+/// Reusable scratch for the rare case where a receiver's nearest owner is
+/// its own physical end, which cannot be linked to itself.
+struct ReverseSearch {
+    distance: Vec<u8>,
+    touched: Vec<u32>,
+    buckets: Vec<Vec<u32>>,
 }
 
-impl Radixable<u32> for ActivePath {
-    type Key = u32;
-    fn key(&self) -> Self::Key {
-        self.current
+impl ReverseSearch {
+    fn new(nodes: usize, k: usize) -> Self {
+        Self {
+            distance: vec![UNREACHABLE; nodes],
+            touched: Vec::new(),
+            buckets: vec![Vec::new(); k],
+        }
+    }
+
+    fn push(&mut self, node: u32, distance: usize, k: usize) {
+        if distance >= k || distance >= self.distance[node as usize] as usize {
+            return;
+        }
+        if self.distance[node as usize] == UNREACHABLE {
+            self.touched.push(node);
+        }
+        self.distance[node as usize] = distance as u8;
+        self.buckets[distance].push(node);
+    }
+
+    fn nearest(
+        &mut self,
+        target: u32,
+        limit: usize,
+        field: &DistanceField,
+        graph: &Graph,
+        ranges: &[Range<usize>],
+        k: usize,
+    ) -> Option<(u32, usize)> {
+        for &reverse_predecessor in graph.outgoing(target ^ 1) {
+            self.push(reverse_predecessor ^ 1, 0, k);
+        }
+        let mut result = None;
+        let mut best_distance = limit;
+        for distance in 0..limit.min(k) {
+            if distance >= best_distance {
+                break;
+            }
+            let mut bucket = std::mem::take(&mut self.buckets[distance]);
+            for node in bucket.drain(..) {
+                if self.distance[node as usize] as usize != distance {
+                    continue;
+                }
+                let source = field.owner[node as usize];
+                let combined = distance + field.distance[node as usize] as usize;
+                if source != DEAD && source != target ^ 1 && combined < best_distance {
+                    best_distance = combined;
+                    result = Some((source, combined));
+                }
+                let next_distance = distance.saturating_add(traversal_weight(ranges, node, k));
+                if next_distance < best_distance && next_distance < k {
+                    for &reverse_predecessor in graph.outgoing(node ^ 1) {
+                        self.push(reverse_predecessor ^ 1, next_distance, k);
+                    }
+                }
+            }
+            self.buckets[distance] = bucket;
+        }
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        for &node in &self.touched {
+            self.distance[node as usize] = UNREACHABLE;
+        }
+        self.touched.clear();
+        result
     }
 }
 
@@ -246,123 +410,90 @@ fn connect(links: &mut [Link], from: u32, to: u32, overlap: usize) {
     };
 }
 
-/// Link every unitig end, preferring paths through the graph whose added
-/// sequence is shorter than a zero-overlap join.
+/// Find the cheapest still-free source for one receiving head. Distances in the
+/// field are to outgoing tails, so entering the receiver costs nothing here.
+fn nearest_receiver(
+    target: u32,
+    field: &DistanceField,
+    reverse_search: &mut ReverseSearch,
+    graph: &Graph,
+    ranges: &[Range<usize>],
+    k: usize,
+) -> Option<(u32, usize)> {
+    let forbidden = target ^ 1;
+    let mut best = None;
+    let mut forbidden_distance = usize::MAX;
+    for &reverse_predecessor in graph.outgoing(target ^ 1) {
+        let predecessor = reverse_predecessor ^ 1;
+        let index = predecessor as usize;
+        let source = field.owner[index];
+        if source == DEAD {
+            continue;
+        }
+        let distance = field.distance[index] as usize;
+        if source == forbidden {
+            forbidden_distance = forbidden_distance.min(distance);
+        } else if best.is_none_or(|(_, old_distance)| distance < old_distance) {
+            best = Some((source, distance));
+        }
+    }
+    let limit = best.map_or(k, |(_, distance)| distance);
+    if forbidden_distance <= limit {
+        reverse_search
+            .nearest(target, limit, field, graph, ranges, k)
+            .or(best)
+    } else {
+        best
+    }
+}
+
+/// Greedy distance-ordered matching with one shortest-path label per graph
+/// node. Receiver queue keys are lower bounds; deleting sources only raises
+/// distances, so a stale receiver is repaired when its bucket is processed.
 fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
-    let n = ranges.len();
-    info!(
-        "Allocating {} links: {} MB",
-        2 * n,
-        std::mem::size_of::<Link>() * 2 * n / (1024 * 1024)
-    );
-    let mut links = vec![Link::EMPTY; 2 * n];
-    info!(
-        "Allocating {} receiving ids: {} MB",
-        2 * n,
-        std::mem::size_of::<u32>() * 2 * n / (1024 * 1024)
-    );
-    let mut receiving: Vec<u32> = (0..2 * n as u32).collect();
-    let mut buckets: Vec<Vec<ActivePath>> = vec![Vec::new(); k];
-    eprintln!("Pushing to initial bucket");
-    for id in 0..2 * n as u32 {
-        buckets[0].push(ActivePath {
-            start: id,
-            current: id,
-        });
-    }
+    let nodes = 2 * ranges.len();
+    let mut links = vec![Link::EMPTY; nodes];
+    let mut field = DistanceField::new(nodes, k);
+    let mut reverse_search = ReverseSearch::new(nodes, k);
+    let mut receivers = vec![Vec::<u32>::new(); k];
+    receivers[0] = (0..nodes as u32).collect();
+    let mut linked = 0usize;
 
-    // At distance k there is no shared base left, so a graph path cannot
-    // improve on the zero-overlap fallback.
     for distance in 0..k {
+        let mut bucket = std::mem::take(&mut receivers[distance]);
+        info!("Distance {distance}: {} receiving ends", bucket.len());
+        for target in bucket.drain(..) {
+            if !links[head_slot(target)].is_empty() {
+                continue;
+            }
+            let Some((source, actual_distance)) =
+                nearest_receiver(target, &field, &mut reverse_search, graph, ranges, k)
+            else {
+                continue;
+            };
+            assert!(actual_distance >= distance, "receiver distance decreased");
+            if actual_distance > distance {
+                receivers[actual_distance].push(target);
+                continue;
+            }
+            debug_assert!(links[tail_slot(source)].is_empty());
+            connect(&mut links, source, target, k - 1 - distance);
+            // Both physical ends are now occupied. Their outgoing orientations
+            // are independent sources in the shortest-path field.
+            field.remove_source(source, graph, ranges, k);
+            field.remove_source(target ^ 1, graph, ranges, k);
+            linked += 1;
+        }
+        drop(bucket);
         info!(
-            "Distance {distance}: {} active paths, {} receiving ends",
-            buckets[distance].len(),
-            receiving.len()
-        );
-        debug!("expanding paths");
-        let mut candidates = Vec::<ActivePath>::new();
-        for path in std::mem::take(&mut buckets[distance]) {
-            if !links[tail_slot(path.start)].is_empty() {
-                continue;
-            }
-            for &next in graph.outgoing(path.current) {
-                candidates.push(ActivePath {
-                    start: path.start,
-                    current: next,
-                });
-            }
-        }
-        // The receiving ids and candidate tail ids have the same orientation
-        // encoding. Sorting permits a single merge pass over both vectors.
-        debug!("Sorting candidates");
-        candidates.voracious_mt_sort(rayon::current_num_threads());
-        debug!("Matching candidates to receiving ends");
-        let mut r = 0;
-        for candidate in &mut candidates {
-            while r < receiving.len() && (receiving[r] == DEAD || receiving[r] < candidate.current)
-            {
-                r += 1;
-            }
-            if r == receiving.len() || receiving[r] != candidate.current {
-                continue;
-            }
-            if !links[tail_slot(candidate.start)].is_empty() {
-                candidate.start = DEAD;
-                continue;
-            }
-            if tail_slot(candidate.start) == head_slot(candidate.current) {
-                continue;
-            }
-            if !links[head_slot(candidate.current)].is_empty() {
-                receiving[r] = DEAD;
-                continue;
-            }
-            connect(
-                &mut links,
-                candidate.start,
-                candidate.current,
-                k - 1 - distance,
-            );
-            receiving[r] = DEAD;
-            candidate.start = DEAD;
-        }
-        debug!("Retain");
-        receiving.retain(|&id| id != DEAD && links[head_slot(id)].is_empty());
-
-        debug!("Pushing candidates to next bucket");
-        for candidate in candidates {
-            if candidate.start == DEAD || !links[tail_slot(candidate.start)].is_empty() {
-                continue;
-            }
-            let weight = ranges[(candidate.current / 2) as usize].len() - (k - 1);
-            let next_distance = distance.saturating_add(weight);
-            if next_distance >= k {
-                continue;
-            }
-            buckets[next_distance].push(ActivePath {
-                start: candidate.start,
-                current: candidate.current,
-            });
-        }
-        let total = buckets.iter().map(Vec::len).sum::<usize>();
-        let dead = buckets
-            .iter()
-            .flatten()
-            .filter(|path| !links[tail_slot(path.start)].is_empty())
-            .count();
-        info!(
-            "After distance {distance}, total: {total}; dead: {dead};  bucket queue sizes: {:?}",
-            buckets.iter().map(Vec::len).collect::<Vec<_>>()
+            "After distance {distance}: {linked} links; receiver bucket sizes: {:?}",
+            receivers.iter().map(Vec::len).collect::<Vec<_>>()
         );
     }
 
-    // Every free outgoing end and free receiving end must be paired so that
-    // reconstruction consists entirely of cycles.
-    let outgoing: Vec<_> = (0..2 * n as u32)
+    let outgoing: Vec<_> = (0..nodes as u32)
         .filter(|&id| links[tail_slot(id)].is_empty())
         .collect();
-    // Each free physical end also has a receiving orientation (id ^ 1).
-    // Pair physical ends once each, then enter the second in that orientation.
     assert_eq!(outgoing.len() % 2, 0, "odd number of unmatched ends");
     for pair in outgoing.chunks_exact(2) {
         connect(&mut links, pair[0], pair[1] ^ 1, 0);
