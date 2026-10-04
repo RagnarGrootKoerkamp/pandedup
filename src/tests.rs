@@ -295,7 +295,7 @@ fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
     let unitigs = naive_unitigs(&copies, k);
     let input_bases: usize = unitigs.iter().map(Vec::len).sum();
     eprintln!(
-        "{} copies compacted into {} input unitigs, {} total bases",
+        "{:>12} copies compacted into {:>12} input unitigs, {:>12} total bases",
         copies.len(),
         unitigs.len(),
         input_bases,
@@ -337,8 +337,9 @@ fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
         ),
     ] {
         eprintln!(
-            "{key_type} output: 1 masked superstring, {} total bases",
-            output.len()
+            "{key_type} output: {:>12} masked superstring, {:>12} total bases",
+            1,
+            output.len(),
         );
         let mut actual: Vec<_> = output
             .windows(k)
@@ -361,7 +362,7 @@ fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
             .copied()
             .collect();
         eprintln!(
-            "{key_type} canonical k-mers: {} input, {} output, {} missing, {} extra",
+            "{key_type} canonical k-mers: {:>12} input, {:>12} output, {:>12} missing, {:>12} extra",
             expected.len(),
             actual.len(),
             missing.len(),

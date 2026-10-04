@@ -94,7 +94,7 @@ where
     let overlap = k - 1;
     let mut heads = Vec::with_capacity(2 * ranges.len());
     let mut tails = Vec::with_capacity(2 * ranges.len());
-    info!("Building graph of {} unitigs..", ranges.len());
+    info!("Building graph of {:>12} unitigs..", ranges.len());
     for (index, range) in ranges.iter().enumerate() {
         let id = (index as u32) * 2;
         let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
@@ -164,7 +164,7 @@ where
             }
         }
     }
-    info!("Sorting {} edges", pairs.len());
+    info!("Sorting {:>12} edges", pairs.len());
     pairs.voracious_mt_sort(rayon::current_num_threads());
     // let old_len = pairs.len();
     // info!("Dedup edges");
@@ -175,7 +175,7 @@ where
     info!("Building CSR adjacency");
     let mut offsets = vec![0; 2 * ranges.len() + 1];
     info!(
-        "Filling offsets: {} MB",
+        "Filling offsets: {:>12} MB",
         std::mem::size_of_val(offsets.as_slice()) / (1024 * 1024)
     );
     for edge in &pairs {
@@ -205,6 +205,7 @@ impl Link {
         target: DEAD,
         overlap: 0,
     };
+
     fn is_empty(self) -> bool {
         self.target == DEAD
     }
@@ -435,16 +436,24 @@ fn head_slot(id: u32) -> usize {
     id as usize
 }
 
-fn connect(links: &mut [Link], from: u32, to: u32, overlap: usize, visited: &mut u64) {
-    let overlap = overlap as u8;
+fn connect(
+    links: &mut [Link],
+    from: u32,
+    to: u32,
+    overlap: usize,
+    total_bases: &mut usize,
+    visited: &mut u64,
+) {
+    debug_assert!(overlap <= u8::MAX as usize);
     links[tail_slot(from)] = Link {
         target: to,
-        overlap,
+        overlap: overlap as u8,
     };
     links[head_slot(to)] = Link {
         target: from ^ 1,
-        overlap,
+        overlap: overlap as u8,
     };
+    *total_bases -= overlap;
     *visited += 2;
 }
 
@@ -492,7 +501,12 @@ fn nearest_receiver(
 /// node. A receiver's scheduled distance is a lower bound: deleting sources
 /// can only increase it. Repair the field immediately after every link, so
 /// each receiver needs to be examined at most once at a given distance.
-fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
+fn match_ends(
+    k: usize,
+    ranges: &[Range<usize>],
+    graph: &Graph,
+    initial_bases: usize,
+) -> (Vec<Link>, usize) {
     let nodes = 2 * ranges.len();
     let mut links = vec![Link::EMPTY; nodes];
     let mut field = DistanceField::new(nodes);
@@ -501,16 +515,22 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
     let mut linked = 0usize;
     let mut remaining_receivers = nodes;
     let mut visits = VisitStats::default();
+    let mut estimated_bases = initial_bases;
     info!(
-        "Matching {} unitigs: {nodes} ends (two per unitig); distance d gives overlap {}-d; examined = receiver checks at d; links made = connections at d; receiving ends remain = unlinked ends scheduled below k={k}; free ends = {nodes} - 2 * cumulative links",
+        "Matching {:>12} unitigs, {:>12} ends, k {:>12}: two ends per unitig; overlap = k minus one minus distance; examined = receiver checks; links made = connections; receiving ends remain = unlinked ends scheduled below k; free ends = initial ends minus twice cumulative links",
         ranges.len(),
-        k - 1,
+        nodes,
+        k,
     );
     info!(
-        "Before distance 0: 0 receiving ends examined, 0 links made, {remaining_receivers} receiving ends remain, {nodes} free ends"
+        "Before distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
+        0, 0, 0, remaining_receivers, nodes, initial_bases,
     );
     info!(
-        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance 0; nearest_receiver includes its reverse search; connect touches two link slots; remove_source includes tree, boundary, and repair scans"
+        "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source includes tree, boundary, and repair scans"
+    );
+    info!(
+        "Estimated bases starts as the sum of unitig lengths and drops by every link overlap; cycle closures can make it lower than the final linear output"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
@@ -528,7 +548,14 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
             if source == target ^ 1 || !links[tail_slot(source)].is_empty() {
                 continue;
             }
-            connect(&mut links, source, target, k - 1, &mut visits.connect);
+            connect(
+                &mut links,
+                source,
+                target,
+                k - 1,
+                &mut estimated_bases,
+                &mut visits.connect,
+            );
             linked += 1;
             direct_made += 1;
             for slot in [head_slot(target), tail_slot(source)] {
@@ -554,13 +581,21 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
         }
     }
     info!(
-        "After distance 0: {direct_examined} receiving ends examined, {direct_made} links made, {remaining_receivers} receiving ends remain, {} free ends",
+        "After distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
+        0,
+        direct_examined,
+        direct_made,
+        remaining_receivers,
         nodes - 2 * linked,
+        estimated_bases,
     );
     info!(
-        "After distance 0 node visits: direct_overlap {} (total {}), nearest_receiver 0 (total 0), connect {} (total {}), remove_source {} (total {})",
+        "After distance {:>12} node visits: direct_overlap {:>12} (total {:>12}), nearest_receiver {:>12} (total {:>12}), connect {:>12} (total {:>12}), remove_source {:>12} (total {:>12})",
+        0,
         visits.direct_overlap,
         visits.direct_overlap,
+        0,
+        0,
         visits.connect,
         visits.connect,
         visits.remove_source,
@@ -597,11 +632,13 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
                 continue;
             }
             debug_assert!(links[tail_slot(source)].is_empty());
+            let overlap = k - 1 - distance;
             connect(
                 &mut links,
                 source,
                 target,
-                k - 1 - distance,
+                overlap,
+                &mut estimated_bases,
                 &mut visits.connect,
             );
             linked += 1;
@@ -620,12 +657,18 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
             field.remove_source(target ^ 1, graph, ranges, k, &mut visits.remove_source);
         }
         info!(
-            "After distance {distance}: {examined} receiving ends examined, {made} links made, {} receiving ends remain, {} free ends",
+            "After distance {:>12}: {:>12} receiving ends examined, {:>12} links made, {:>12} receiving ends remain, {:>12} free ends, {:>12} estimated bases",
+            distance,
+            examined,
+            made,
             remaining_receivers,
             nodes - 2 * linked,
+            estimated_bases,
         );
         info!(
-            "After distance {distance} node visits: direct_overlap 0 (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
+            "After distance {:>12} node visits: direct_overlap {:>12} (total {:>12}), nearest_receiver {:>12} (total {:>12}), connect {:>12} (total {:>12}), remove_source {:>12} (total {:>12})",
+            distance,
+            0,
             visits.direct_overlap,
             visits.nearest_receiver - before.nearest_receiver,
             visits.nearest_receiver,
@@ -641,13 +684,21 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
         .collect();
     assert_eq!(outgoing.len() % 2, 0, "odd number of unmatched ends");
     for pair in outgoing.chunks_exact(2) {
-        connect(&mut links, pair[0], pair[1] ^ 1, 0, &mut visits.connect);
+        let target = pair[1] ^ 1;
+        connect(
+            &mut links,
+            pair[0],
+            target,
+            0,
+            &mut estimated_bases,
+            &mut visits.connect,
+        );
     }
     info!(
-        "Final node visits (including closure links): direct_overlap {}, nearest_receiver {}, connect {}, remove_source {}",
+        "Final node visits (including closure links): direct_overlap {:>12}, nearest_receiver {:>12}, connect {:>12}, remove_source {:>12}",
         visits.direct_overlap, visits.nearest_receiver, visits.connect, visits.remove_source,
     );
-    links
+    (links, estimated_bases)
 }
 
 fn append(
@@ -685,11 +736,12 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     assert!(k > 0 && k <= K::BITS / 2);
+    let initial_bases: usize = ranges.iter().map(Range::len).sum();
     let (ranges, short): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|r| r.len() >= k);
     assert!(ranges.len() <= (u32::MAX as usize / 2), "too many unitigs");
     let graph = graph::<K>(k, &seq, &ranges);
 
-    let links = match_ends(k, &ranges, &graph);
+    let (links, estimated_bases) = match_ends(k, &ranges, &graph, initial_bases);
 
     info!("Reconstruct output");
     let mut output = Vec::new();
@@ -719,6 +771,11 @@ where
             append(&mut output, &seq, range, false, 0, k);
         }
     }
+    info!(
+        "Length summary: {:>12} estimated bases after links, {:>12} output bases",
+        estimated_bases,
+        output.len(),
+    );
     output
 }
 
@@ -744,7 +801,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
     drop(writer);
     log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
     info!(
-        "matchtigs: {}, output {} bases ({})",
+        "matchtigs: {}, output {:>12} bases ({})",
         timing.finish(),
         superstring.len(),
         output.display()
@@ -767,12 +824,13 @@ mod tests {
         };
         let k = 5;
         let ranges = vec![0..k; 4];
-        let links = match_ends(k, &ranges, &graph);
+        let (links, total_bases) = match_ends(k, &ranges, &graph, 4 * k);
         let direct = links
             .iter()
-            .filter(|link| link.overlap == (k - 1) as u8)
+            .filter(|link| link.overlap as usize == k - 1)
             .count();
         assert_eq!(direct, 4);
+        assert_eq!(total_bases, 4 * k - 2 * (k - 1));
         let first_target = links[tail_slot(0)].target;
         let second_target = links[tail_slot(6)].target;
         assert_eq!(first_target, 2);
