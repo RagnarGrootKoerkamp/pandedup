@@ -455,68 +455,51 @@ fn nearest_receiver(
 }
 
 /// Greedy distance-ordered matching with one shortest-path label per graph
-/// node. At each distance, expand the outgoing edges of all nodes on that
-/// frontier, match the receiving ends they reach, then repair labels after
-/// deleting the matched sources. Repeat until that distance is exhausted.
+/// node. A receiver's scheduled distance is a lower bound: deleting sources
+/// can only increase it. Repair the field immediately after every link, so
+/// each receiver needs to be examined at most once at a given distance.
 fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
     let nodes = 2 * ranges.len();
     let mut links = vec![Link::EMPTY; nodes];
     let mut field = DistanceField::new(nodes);
     let mut reverse_search = ReverseSearch::new(nodes);
-    let mut seen = vec![false; nodes];
-    let mut matched_sources = Vec::new();
+    let mut receiver_distance = vec![0u8; nodes];
     let mut linked = 0usize;
 
     for distance in 0..k {
-        let mut passes = 0usize;
-        loop {
-            passes += 1;
-            seen.fill(false);
-            matched_sources.clear();
-            let mut frontier = 0usize;
-            for node in 0..nodes as u32 {
-                if field.distance[node as usize] as usize != distance {
-                    continue;
-                }
-                frontier += 1;
-                // The final edge enters the receiver at zero cost. Charging
-                // its unitig would include the last unitig in the distance.
-                for &target in graph.outgoing(node) {
-                    if seen[target as usize] || !links[head_slot(target)].is_empty() {
-                        continue;
-                    }
-                    seen[target as usize] = true;
-                    let Some((source, actual_distance)) =
-                        nearest_receiver(target, &field, &mut reverse_search, graph, ranges, k)
-                    else {
-                        continue;
-                    };
-                    assert!(actual_distance >= distance, "receiver distance decreased");
-                    if actual_distance != distance || !links[tail_slot(source)].is_empty() {
-                        continue;
-                    }
-                    connect(&mut links, source, target, k - 1 - distance);
-                    matched_sources.push(source);
-                    linked += 1;
-                }
+        let mut examined = 0usize;
+        let mut made = 0usize;
+        for target in 0..nodes as u32 {
+            let index = target as usize;
+            if receiver_distance[index] as usize != distance || !links[head_slot(target)].is_empty()
+            {
+                continue;
             }
-            info!(
-                "Distance {distance}, pass {passes}: {frontier} frontier nodes, {} links made, {} free ends",
-                matched_sources.len(),
-                nodes - 2 * linked,
-            );
-            if matched_sources.is_empty() {
-                break;
+            examined += 1;
+            let Some((source, actual_distance)) =
+                nearest_receiver(target, &field, &mut reverse_search, graph, ranges, k)
+            else {
+                receiver_distance[index] = UNREACHABLE;
+                continue;
+            };
+            assert!(actual_distance >= distance, "receiver distance decreased");
+            if actual_distance > distance {
+                receiver_distance[index] = actual_distance as u8;
+                continue;
             }
-            // Both physical ends of each link are independent sources.
-            // Their removal can reveal another match at this same distance.
-            for &source in &matched_sources {
-                let target = links[tail_slot(source)].target;
-                field.remove_source(source, graph, ranges, k);
-                field.remove_source(target ^ 1, graph, ranges, k);
-            }
+            debug_assert!(links[tail_slot(source)].is_empty());
+            connect(&mut links, source, target, k - 1 - distance);
+            linked += 1;
+            made += 1;
+            // Both physical ends are independent sources. Repairing them now
+            // exposes alternatives to receivers later in this same scan.
+            field.remove_source(source, graph, ranges, k);
+            field.remove_source(target ^ 1, graph, ranges, k);
         }
-        info!("After distance {distance}: {linked} links");
+        info!(
+            "After distance {distance}: {examined} receiving ends examined, {made} links made, {} free ends",
+            nodes - 2 * linked
+        );
     }
 
     let outgoing: Vec<_> = (0..nodes as u32)
@@ -636,10 +619,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matching_revisits_a_distance_after_removing_sources() {
+    fn matching_repairs_before_the_next_receiver_at_same_distance() {
         // Each edge has its reverse-complement counterpart. The first match
-        // consumes source 0 and its reverse end 3. Those sources initially
-        // hide the direct match between source 6 and receiver 4.
+        // consumes the physical ends represented by sources 0 and 3. Their
+        // removal reveals a direct match between source 6 and receiver 4.
         let graph = Graph {
             edges: vec![2, 4, 1, 7, 1, 7, 2, 4],
             offsets: vec![0, 2, 2, 2, 4, 4, 6, 8, 8],
