@@ -465,6 +465,15 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
     let mut reverse_search = ReverseSearch::new(nodes);
     let mut receiver_distance = vec![0u8; nodes];
     let mut linked = 0usize;
+    let mut remaining_receivers = nodes;
+    info!(
+        "Matching {} unitigs: {nodes} ends (two per unitig); distance d gives overlap {}-d; examined = receiver searches at d; links made = connections at d; receiving ends remain = unlinked ends scheduled below k={k}; free ends = {nodes} - 2 * cumulative links",
+        ranges.len(),
+        k - 1,
+    );
+    info!(
+        "Before distance 0: 0 receiving ends examined, 0 links made, {remaining_receivers} receiving ends remain, {nodes} free ends"
+    );
 
     for distance in 0..k {
         let mut examined = 0usize;
@@ -480,6 +489,7 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
                 nearest_receiver(target, &field, &mut reverse_search, graph, ranges, k)
             else {
                 receiver_distance[index] = UNREACHABLE;
+                remaining_receivers -= 1;
                 continue;
             };
             assert!(actual_distance >= distance, "receiver distance decreased");
@@ -491,14 +501,23 @@ fn match_ends(k: usize, ranges: &[Range<usize>], graph: &Graph) -> Vec<Link> {
             connect(&mut links, source, target, k - 1 - distance);
             linked += 1;
             made += 1;
+            // A link occupies both physical ends. An end may already have
+            // been removed from the receiver schedule as unreachable.
+            for slot in [index, tail_slot(source)] {
+                if receiver_distance[slot] != UNREACHABLE {
+                    receiver_distance[slot] = UNREACHABLE;
+                    remaining_receivers -= 1;
+                }
+            }
             // Both physical ends are independent sources. Repairing them now
             // exposes alternatives to receivers later in this same scan.
             field.remove_source(source, graph, ranges, k);
             field.remove_source(target ^ 1, graph, ranges, k);
         }
         info!(
-            "After distance {distance}: {examined} receiving ends examined, {made} links made, {} free ends",
-            nodes - 2 * linked
+            "After distance {distance}: {examined} receiving ends examined, {made} links made, {} receiving ends remain, {} free ends",
+            remaining_receivers,
+            nodes - 2 * linked,
         );
     }
 
