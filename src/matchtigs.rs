@@ -465,99 +465,39 @@ fn connect(
     };
 }
 
-/// A path through `node` costs the distance to its head, its own traversal
-/// weight, and the distance from its tail to a free receiving head. The latter
-/// is read from the same field through reverse-complement orientation.
-fn meet_at(
+/// Cheapest bridge through one oriented unitig. The left and right minima
+/// can be chosen independently because a path may return to its own end.
+fn bridge_candidate(
     node: u32,
-    wanted: usize,
     field: &DistanceField,
     graph: &Graph,
     ranges: &[Range<usize>],
     k: usize,
     visited: &mut u64,
-) -> Option<(u32, u32)> {
-    let weight = traversal_weight(ranges, node, k);
-    if weight > wanted {
-        return None;
-    }
-    let mut successor_at = [DEAD; 64];
-    let successors = graph.outgoing(node);
-    *visited += 1 + successors.len() as u64;
-    for &successor in successors {
-        let distance = field.distance[(successor ^ 1) as usize];
-        if distance != UNREACHABLE && successor_at[distance as usize] == DEAD {
-            successor_at[distance as usize] = successor;
-        }
-    }
-    let predecessors = graph.incoming(node);
-    *visited += 1 + predecessors.len() as u64;
-    for predecessor in predecessors {
-        let left = field.distance[predecessor as usize] as usize;
-        if left > wanted - weight {
-            continue;
-        }
-        let right = wanted - weight - left;
-        if right >= successor_at.len() || successor_at[right] == DEAD {
-            continue;
-        }
-        let source = field.source(predecessor, graph, ranges, k, visited);
-        let receiver_end = field.source(successor_at[right] ^ 1, graph, ranges, k, visited);
-        return Some((source, receiver_end ^ 1));
-    }
-    None
-}
-
-/// Cheapest bridge through one oriented unitig at or above `minimum`.
-/// A bucket owns its entry until it is popped, so deletions only require
-/// rechecking and possibly moving that entry to a later bucket.
-fn bridge_cost(
-    node: u32,
-    minimum: usize,
-    field: &DistanceField,
-    graph: &Graph,
-    ranges: &[Range<usize>],
-    k: usize,
-    visited: &mut u64,
-) -> Option<usize> {
+) -> Option<(usize, u32, u32)> {
     let weight = traversal_weight(ranges, node, k);
     if weight >= k - 1 {
         return None;
     }
-    let mut right_mask = 0u64;
     let successors = graph.outgoing(node);
     *visited += 1 + successors.len() as u64;
-    for &successor in successors {
-        let right = field.distance[(successor ^ 1) as usize];
-        if right != UNREACHABLE {
-            right_mask |= 1u64 << right;
-        }
-    }
-    if right_mask == 0 {
-        return None;
-    }
+    let (successor, right) = successors
+        .iter()
+        .filter_map(|&successor| {
+            let distance = field.distance[(successor ^ 1) as usize];
+            (distance != UNREACHABLE).then_some((successor, distance as usize))
+        })
+        .min_by_key(|&(_, distance)| distance)?;
     let predecessors = graph.incoming(node);
     *visited += 1 + predecessors.len() as u64;
-    let mut best = k - 1;
-    for predecessor in predecessors {
-        let left = field.distance[predecessor as usize];
-        if left == UNREACHABLE {
-            continue;
-        }
-        let base = left as usize + weight;
-        if base >= best {
-            continue;
-        }
-        let required_right = minimum.saturating_sub(base);
-        if required_right >= 64 {
-            continue;
-        }
-        let eligible = right_mask >> required_right;
-        if eligible != 0 {
-            best = best.min(base + required_right + eligible.trailing_zeros() as usize);
-        }
-    }
-    (best < k - 1).then_some(best)
+    let (predecessor, left) = predecessors
+        .filter_map(|predecessor| {
+            let distance = field.distance[predecessor as usize];
+            (distance != UNREACHABLE).then_some((predecessor, distance as usize))
+        })
+        .min_by_key(|&(_, distance)| distance)?;
+    let cost = left + weight + right;
+    (cost < k - 1).then_some((cost, predecessor, successor))
 }
 
 /// Greedy distance-ordered matching through central unitig traversals.
@@ -667,7 +607,9 @@ fn match_ends(
     // bridge cost, so we recheck and move its single entry when popped.
     let mut buckets = vec![Vec::<u32>::new(); k];
     for node in 0..nodes as u32 {
-        if let Some(cost) = bridge_cost(node, 1, &field, graph, ranges, k, &mut visits.meet) {
+        if let Some((cost, _, _)) =
+            bridge_candidate(node, &field, graph, ranges, k, &mut visits.meet)
+        {
             buckets[cost].push(node);
         }
     }
@@ -677,8 +619,8 @@ fn match_ends(
         let mut made = 0usize;
         while let Some(node) = buckets[distance].pop() {
             examined += 1;
-            let Some(cost) =
-                bridge_cost(node, distance, &field, graph, ranges, k, &mut visits.meet)
+            let Some((cost, predecessor, successor)) =
+                bridge_candidate(node, &field, graph, ranges, k, &mut visits.meet)
             else {
                 continue;
             };
@@ -686,9 +628,10 @@ fn match_ends(
                 buckets[cost].push(node);
                 continue;
             }
-            let (source, target) =
-                meet_at(node, distance, &field, graph, ranges, k, &mut visits.meet)
-                    .expect("bridge cost has no meeting path");
+            debug_assert_eq!(cost, distance);
+            let source = field.source(predecessor, graph, ranges, k, &mut visits.meet);
+            let receiver_end = field.source(successor ^ 1, graph, ranges, k, &mut visits.meet);
+            let target = receiver_end ^ 1;
             // The same traversal may connect another pair at this distance.
             buckets[distance].push(node);
             connect(
