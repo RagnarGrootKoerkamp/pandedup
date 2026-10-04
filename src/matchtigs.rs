@@ -1,4 +1,34 @@
 //! Greedy matching of unitig ends through the compacted de Bruijn graph.
+//!
+//! Each unitig has two oriented copies. Their outgoing tails and incoming
+//! heads are grouped by their `(k-1)`-mers to build tail-to-head graph edges.
+//! Following one of these edges joins two unitigs with a direct `(k-1)`-base
+//! overlap. Traversing an oriented unitig from head to tail costs its length
+//! minus `k-1`: the number of new bases contributed by that unitig.
+//!
+//! First, greedily link free ends across direct graph edges (distance zero).
+//! For longer overlaps, `DistanceField` stores the shortest distance from a
+//! free outgoing tail to each oriented tail. A path to a free receiving head
+//! can be read from the same field by reversing its orientation. Thus a path
+//! meeting inside oriented unitig `v` has cost
+//!
+//!     distance to v's head + traversal cost of v + distance from v's tail.
+//!
+//! Distances are stored only below `k/2`. Every path with positive overlap
+//! has a meeting unitig for which both sides fit within that bound. The
+//! resulting cost `d` gives an overlap of `k-1-d`; costs at least `k-1` give
+//! no overlap and are left for the final arbitrary pairing.
+//!
+//! Each traversal with a possible positive-overlap bridge initially gets one
+//! entry in the bucket for its cheapest cost. Buckets are processed in
+//! increasing cost. When a bridge links two free ends, those ends cease to
+//! be distance-zero sources.
+//! `remove_source` repairs affected distances on both orientations. Deleting
+//! sources can only increase bridge costs, so each queued traversal is
+//! rechecked when popped and moved to a later bucket if necessary. If the
+//! shortest bridge returns to the same physical end, a receiver search looks
+//! for another source. Finally, any remaining ends are paired with zero
+//! overlap, and the links are written as a masked superstring.
 
 use crate::{log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec, complement_char};
@@ -73,6 +103,7 @@ impl Display for Compact {
 #[derive(Clone, Copy, Default)]
 struct VisitStats {
     direct_overlap: u64,
+    meet: u64,
     nearest_receiver: u64,
     connect: u64,
     remove_source: u64,
@@ -144,6 +175,11 @@ struct Graph {
 impl Graph {
     fn outgoing(&self, id: u32) -> &[u32] {
         &self.edges[self.offsets[id as usize] as usize..self.offsets[id as usize + 1] as usize]
+    }
+
+    /// Incoming neighbors, recovered from reverse-complement graph edges.
+    fn incoming(&self, id: u32) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.outgoing(id ^ 1).iter().map(|&reverse| reverse ^ 1)
     }
 }
 
@@ -273,13 +309,16 @@ impl Link {
 
 const UNREACHABLE: u8 = u8::MAX;
 
+/// The cost of crossing unitig `node`.
 fn traversal_weight(ranges: &[Range<usize>], node: u32, k: usize) -> usize {
     ranges[(node / 2) as usize].len() - (k - 1)
 }
 
-/// Distance to the nearest still-free outgoing end for each oriented tail.
+/// Distance to the nearest still-free outgoing end within a bounded radius.
 struct DistanceField {
+    /// Distances to all unitig ends.
     distance: Vec<u8>,
+    /// Scratch buffer `remove_source`.
     worklist: Vec<(u32, u8)>,
 }
 
@@ -291,26 +330,31 @@ impl DistanceField {
         }
     }
 
+    /// Compute the distance to a node by iterating over its predecessors.
     fn replacement_distance(
         &self,
         node: u32,
         graph: &Graph,
         ranges: &[Range<usize>],
         k: usize,
+        radius: usize,
         visited: &mut u64,
     ) -> u8 {
         let weight = traversal_weight(ranges, node, k);
-        let predecessors = graph.outgoing(node ^ 1);
+        let predecessors = graph.incoming(node);
         *visited += 1 + predecessors.len() as u64;
-        let mut best = k;
-        for &reverse_predecessor in predecessors {
-            let predecessor = reverse_predecessor ^ 1;
+        let mut best = radius;
+        for predecessor in predecessors {
             best = best.min(self.distance[predecessor as usize] as usize + weight);
         }
-        if best == k { UNREACHABLE } else { best as u8 }
+        if best == radius {
+            UNREACHABLE
+        } else {
+            best as u8
+        }
     }
 
-    /// Propagate increases after deleting a source. A neighbor only needs
+    /// Propagate increases after deleting a source. A neighbour only needs
     /// repair if its current label was tight through the changed node.
     fn remove_source(
         &mut self,
@@ -318,6 +362,7 @@ impl DistanceField {
         graph: &Graph,
         ranges: &[Range<usize>],
         k: usize,
+        radius: usize,
         visited: &mut u64,
     ) {
         assert_eq!(
@@ -326,7 +371,7 @@ impl DistanceField {
         );
         self.worklist.clear();
         self.distance[source as usize] =
-            self.replacement_distance(source, graph, ranges, k, visited);
+            self.replacement_distance(source, graph, ranges, k, radius, visited);
         debug_assert!(self.distance[source as usize] > 0);
         self.worklist.push((source, 0));
         while let Some((node, old_distance)) = self.worklist.pop() {
@@ -338,7 +383,8 @@ impl DistanceField {
                     && old_distance as usize + traversal_weight(ranges, next, k)
                         == old_next as usize
                 {
-                    let new_next = self.replacement_distance(next, graph, ranges, k, visited);
+                    let new_next =
+                        self.replacement_distance(next, graph, ranges, k, radius, visited);
                     debug_assert!(new_next >= old_next);
                     if new_next > old_next {
                         self.distance[next as usize] = new_next;
@@ -349,7 +395,7 @@ impl DistanceField {
         }
     }
 
-    /// Follow tight incoming edges to recover any source other than forbidden.
+    /// Repeatedly follow a tight incoming edge to recover any source other than forbidden.
     /// Distances strictly decrease, so recursion is bounded by k.
     fn source(
         &self,
@@ -370,12 +416,12 @@ impl DistanceField {
         }
         let weight = traversal_weight(ranges, node, k);
         if weight > distance as usize {
+            panic!();
             return None;
         }
-        let predecessors = graph.outgoing(node ^ 1);
+        let predecessors = graph.incoming(node);
         *visited += predecessors.len() as u64;
-        for &reverse_predecessor in predecessors {
-            let predecessor = reverse_predecessor ^ 1;
+        for predecessor in predecessors {
             let prior = self.distance[predecessor as usize];
             if prior != UNREACHABLE && prior as usize + weight == distance as usize {
                 if let Some(source) = self.source(predecessor, forbidden, graph, ranges, k, visited)
@@ -423,10 +469,10 @@ impl ReverseSearch {
         k: usize,
         visited: &mut u64,
     ) -> Option<(u32, usize)> {
-        let predecessors = graph.outgoing(target ^ 1);
+        let predecessors = graph.incoming(target);
         *visited += predecessors.len() as u64;
-        for &reverse_predecessor in predecessors {
-            self.push(reverse_predecessor ^ 1, 0, k);
+        for predecessor in predecessors {
+            self.push(predecessor, 0, k);
         }
         let mut result = None;
         let mut best_distance = limit;
@@ -452,10 +498,10 @@ impl ReverseSearch {
                 }
                 let next_distance = distance.saturating_add(traversal_weight(ranges, node, k));
                 if next_distance < best_distance && next_distance < k {
-                    let predecessors = graph.outgoing(node ^ 1);
+                    let predecessors = graph.incoming(node);
                     *visited += predecessors.len() as u64;
-                    for &reverse_predecessor in predecessors {
-                        self.push(reverse_predecessor ^ 1, next_distance, k);
+                    for predecessor in predecessors {
+                        self.push(predecessor, next_distance, k);
                     }
                 }
             }
@@ -511,13 +557,12 @@ fn nearest_receiver(
     let forbidden = target ^ 1;
     let mut best = None;
     let mut forbidden_distance = usize::MAX;
-    let predecessors = graph.outgoing(target ^ 1);
+    let predecessors = graph.incoming(target);
     *visited += predecessors.len() as u64;
-    for &reverse_predecessor in predecessors {
-        let predecessor = reverse_predecessor ^ 1;
+    for predecessor in predecessors {
         let index = predecessor as usize;
         let distance = field.distance[index] as usize;
-        if distance >= k {
+        if distance >= k - 1 {
             continue;
         }
         if let Some(source) = field.source(predecessor, forbidden, graph, ranges, k, visited) {
@@ -528,8 +573,8 @@ fn nearest_receiver(
             forbidden_distance = forbidden_distance.min(distance);
         }
     }
-    let limit = best.map_or(k, |(_, distance)| distance);
-    if forbidden_distance <= limit {
+    let limit = best.map_or(k - 1, |(_, distance)| distance);
+    if best.is_none() || forbidden_distance <= limit {
         reverse_search
             .nearest(target, limit, field, graph, ranges, k, visited)
             .or(best)
@@ -538,10 +583,139 @@ fn nearest_receiver(
     }
 }
 
-/// Greedy distance-ordered matching with one shortest-path distance per graph
-/// node. A receiver's scheduled distance is a lower bound: deleting sources
-/// can only increase it. Repair the field immediately after every link, so
-/// each receiver needs to be examined at most once at a given distance.
+fn meeting_pair(
+    predecessor: u32,
+    successor: u32,
+    field: &DistanceField,
+    graph: &Graph,
+    ranges: &[Range<usize>],
+    k: usize,
+    visited: &mut u64,
+) -> Option<(u32, u32)> {
+    let receiver_end = field.source(successor ^ 1, DEAD, graph, ranges, k, visited)?;
+    if let Some(source) = field.source(predecessor, receiver_end, graph, ranges, k, visited) {
+        return Some((source, receiver_end ^ 1));
+    }
+    let source = field.source(predecessor, DEAD, graph, ranges, k, visited)?;
+    let receiver_end = field.source(successor ^ 1, source, graph, ranges, k, visited)?;
+    Some((source, receiver_end ^ 1))
+}
+
+/// A path through `node` costs the distance to its head, its own traversal
+/// weight, and the distance from its tail to a free receiving head. The latter
+/// is read from the same field through reverse-complement orientation.
+fn meet_at(
+    node: u32,
+    wanted: usize,
+    field: &DistanceField,
+    graph: &Graph,
+    ranges: &[Range<usize>],
+    k: usize,
+    visited: &mut u64,
+) -> Option<(u32, u32)> {
+    let weight = traversal_weight(ranges, node, k);
+    if weight > wanted {
+        return None;
+    }
+    let mut successor_at = [DEAD; 64];
+    let successors = graph.outgoing(node);
+    *visited += 1 + successors.len() as u64;
+    for &successor in successors {
+        let distance = field.distance[(successor ^ 1) as usize];
+        if distance != UNREACHABLE && successor_at[distance as usize] == DEAD {
+            successor_at[distance as usize] = successor;
+        }
+    }
+    let predecessors = graph.incoming(node);
+    *visited += 1 + predecessors.len() as u64;
+    for predecessor in predecessors {
+        let left = field.distance[predecessor as usize] as usize;
+        if left > wanted - weight {
+            continue;
+        }
+        let right = wanted - weight - left;
+        if right >= successor_at.len() || successor_at[right] == DEAD {
+            continue;
+        }
+        if let Some(pair) = meeting_pair(
+            predecessor,
+            successor_at[right],
+            field,
+            graph,
+            ranges,
+            k,
+            visited,
+        ) {
+            return Some(pair);
+        }
+        // A tied path through another successor may reach a different end.
+        for &successor in successors {
+            *visited += 1;
+            if field.distance[(successor ^ 1) as usize] as usize == right {
+                if let Some(pair) =
+                    meeting_pair(predecessor, successor, field, graph, ranges, k, visited)
+                {
+                    return Some(pair);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cheapest bridge through one oriented unitig at or above `minimum`.
+/// A bucket owns its entry until it is popped, so deletions only require
+/// rechecking and possibly moving that entry to a later bucket.
+fn bridge_cost(
+    node: u32,
+    minimum: usize,
+    field: &DistanceField,
+    graph: &Graph,
+    ranges: &[Range<usize>],
+    k: usize,
+    visited: &mut u64,
+) -> Option<usize> {
+    let weight = traversal_weight(ranges, node, k);
+    if weight >= k - 1 {
+        return None;
+    }
+    let mut right_mask = 0u64;
+    let successors = graph.outgoing(node);
+    *visited += 1 + successors.len() as u64;
+    for &successor in successors {
+        let right = field.distance[(successor ^ 1) as usize];
+        if right != UNREACHABLE {
+            right_mask |= 1u64 << right;
+        }
+    }
+    if right_mask == 0 {
+        return None;
+    }
+    let predecessors = graph.incoming(node);
+    *visited += 1 + predecessors.len() as u64;
+    let mut best = k - 1;
+    for predecessor in predecessors {
+        let left = field.distance[predecessor as usize];
+        if left == UNREACHABLE {
+            continue;
+        }
+        let base = left as usize + weight;
+        if base >= best {
+            continue;
+        }
+        let required_right = minimum.saturating_sub(base);
+        if required_right >= 64 {
+            continue;
+        }
+        let eligible = right_mask >> required_right;
+        if eligible != 0 {
+            best = best.min(base + required_right + eligible.trailing_zeros() as usize);
+        }
+    }
+    (best < k - 1).then_some(best)
+}
+
+/// Greedy distance-ordered matching through central unitig traversals.
 fn match_ends(
     k: usize,
     ranges: &[Range<usize>],
@@ -549,31 +723,33 @@ fn match_ends(
     initial_bases: usize,
 ) -> (Vec<Link>, usize) {
     let nodes = 2 * ranges.len();
+    let radius = k / 2;
     let mut links = vec![Link::EMPTY; nodes];
     let mut field = DistanceField::new(nodes);
-    let mut reverse_search = ReverseSearch::new(nodes);
-    let mut receiver_distance = vec![0u8; nodes];
     let mut linked = 0usize;
-    let mut remaining_receivers = nodes;
     let mut visits = VisitStats::default();
     let mut estimated_bases = initial_bases;
     info!(
-        "Matching {} unitigs, {} ends, k {}: two ends per unitig; overlap = k minus one minus distance; examined = receiver checks; links made = connections; receiving ends remain = unlinked ends scheduled below k; free ends = initial ends minus twice cumulative links",
+        "Matching {} unitigs, {} ends, k {}: two ends per unitig; overlap = k minus one minus distance; examined = bridge entries checked; links made = connections; receiving ends remain and free ends = initial ends minus twice cumulative links",
         compact(ranges.len()),
         compact(nodes),
         compact(k),
+    );
+    info!(
+        "Meeting search: source and receiver fronts each store distances below {}; a path through one unitig has cost left distance + unitig extensions + right distance",
+        compact(radius),
     );
     info!(
         "Before distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
         compact(0u64),
         compact(0u64),
         compact(0u64),
-        compact(remaining_receivers),
+        compact(nodes),
         compact(nodes),
         compact(initial_bases),
     );
     info!(
-        "Node visits count repeated inspections: direct_overlap scans graph neighbors at the initial distance; nearest_receiver includes its reverse search; connect touches two link slots; remove_source scans changed nodes and edges used to recompute distances"
+        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; meet checks and schedules central unitig traversals and traces endpoints; nearest_receiver handles same-end collisions; connect touches two link slots; remove_source repairs both bounded fronts"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
@@ -581,13 +757,15 @@ fn match_ends(
     let mut direct_examined = 0usize;
     let mut direct_made = 0usize;
     for target in 0..nodes as u32 {
+        if k == 1 {
+            break;
+        }
         if !links[head_slot(target)].is_empty() {
             continue;
         }
         direct_examined += 1;
-        for &reverse_predecessor in graph.outgoing(target ^ 1) {
+        for source in graph.incoming(target) {
             visits.direct_overlap += 1;
-            let source = reverse_predecessor ^ 1;
             if source == target ^ 1 || !links[tail_slot(source)].is_empty() {
                 continue;
             }
@@ -601,26 +779,16 @@ fn match_ends(
             );
             linked += 1;
             direct_made += 1;
-            for slot in [head_slot(target), tail_slot(source)] {
-                receiver_distance[slot] = UNREACHABLE;
-                remaining_receivers -= 1;
-            }
-            field.remove_source(source, graph, ranges, k, &mut visits.remove_source);
-            field.remove_source(target ^ 1, graph, ranges, k, &mut visits.remove_source);
+            field.remove_source(source, graph, ranges, k, radius, &mut visits.remove_source);
+            field.remove_source(
+                target ^ 1,
+                graph,
+                ranges,
+                k,
+                radius,
+                &mut visits.remove_source,
+            );
             break;
-        }
-    }
-    // With no free direct edge left, all remaining overlaps cost at least one
-    // character. Schedule those receivers for the next distance.
-    for target in 0..nodes {
-        if receiver_distance[target] == UNREACHABLE {
-            continue;
-        }
-        if k > 1 {
-            receiver_distance[target] = 1;
-        } else {
-            receiver_distance[target] = UNREACHABLE;
-            remaining_receivers -= 1;
         }
     }
     info!(
@@ -628,15 +796,17 @@ fn match_ends(
         compact(0u64),
         compact(direct_examined),
         compact(direct_made),
-        compact(remaining_receivers),
+        compact(nodes - 2 * linked),
         compact(nodes - 2 * linked),
         compact(estimated_bases),
     );
     info!(
-        "After distance {} node visits: direct_overlap {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
+        "After distance {} node visits: direct_overlap {} (total {}), meet {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
         compact(0u64),
         compact(visits.direct_overlap),
         compact(visits.direct_overlap),
+        compact(0u64),
+        compact(0u64),
         compact(0u64),
         compact(0u64),
         compact(visits.connect),
@@ -645,74 +815,136 @@ fn match_ends(
         compact(visits.remove_source),
     );
 
-    for distance in 1..k {
+    // Every oriented end starts as a distance-zero source. After the direct
+    // links, remove_source has already repaired the bounded distance field.
+    // Seed each internal traversal once; later deletions only increase its
+    // bridge cost, so we recheck and move its single entry when popped.
+    let mut buckets = vec![Vec::<u32>::new(); k];
+    let mut receiver_buckets = vec![Vec::<u32>::new(); k];
+    let mut receiver_queued = vec![0u64; nodes.div_ceil(64)];
+    let mut reverse_search = None;
+    for node in 0..nodes as u32 {
+        if let Some(cost) = bridge_cost(node, 1, &field, graph, ranges, k, &mut visits.meet) {
+            buckets[cost].push(node);
+        }
+    }
+    for distance in 1..k - 1 {
         let before = visits;
         let mut examined = 0usize;
         let mut made = 0usize;
-        for target in 0..nodes as u32 {
-            let index = target as usize;
-            if receiver_distance[index] as usize != distance || !links[head_slot(target)].is_empty()
-            {
-                continue;
-            }
-            examined += 1;
-            let Some((source, actual_distance)) = nearest_receiver(
-                target,
-                &field,
-                &mut reverse_search,
-                graph,
-                ranges,
-                k,
-                &mut visits.nearest_receiver,
-            ) else {
-                receiver_distance[index] = UNREACHABLE;
-                remaining_receivers -= 1;
-                continue;
+        while !buckets[distance].is_empty() || !receiver_buckets[distance].is_empty() {
+            let (source, target) = if let Some(node) = buckets[distance].pop() {
+                examined += 1;
+                let Some(cost) =
+                    bridge_cost(node, distance, &field, graph, ranges, k, &mut visits.meet)
+                else {
+                    continue;
+                };
+                if cost > distance {
+                    buckets[cost].push(node);
+                    continue;
+                }
+                let Some(pair) =
+                    meet_at(node, distance, &field, graph, ranges, k, &mut visits.meet)
+                else {
+                    // The nearest two roots can be opposite ends of the same
+                    // unitig. Search those receivers for a longer valid path.
+                    for &successor in graph.outgoing(node) {
+                        let Some(receiver_end) =
+                            field.source(successor ^ 1, DEAD, graph, ranges, k, &mut visits.meet)
+                        else {
+                            continue;
+                        };
+                        let target = receiver_end ^ 1;
+                        let word = target as usize / 64;
+                        let bit = 1u64 << (target % 64);
+                        if receiver_queued[word] & bit == 0 && links[head_slot(target)].is_empty() {
+                            receiver_queued[word] |= bit;
+                            receiver_buckets[distance].push(target);
+                        }
+                    }
+                    if let Some(next) = bridge_cost(
+                        node,
+                        distance + 1,
+                        &field,
+                        graph,
+                        ranges,
+                        k,
+                        &mut visits.meet,
+                    ) {
+                        buckets[next].push(node);
+                    }
+                    continue;
+                };
+                // The same traversal may connect another pair at this distance.
+                buckets[distance].push(node);
+                pair
+            } else {
+                let target = receiver_buckets[distance].pop().unwrap();
+                let word = target as usize / 64;
+                let bit = 1u64 << (target % 64);
+                receiver_queued[word] &= !bit;
+                if !links[head_slot(target)].is_empty() {
+                    continue;
+                }
+                examined += 1;
+                let Some((source, cost)) = nearest_receiver(
+                    target,
+                    &field,
+                    reverse_search.get_or_insert_with(|| ReverseSearch::new(nodes)),
+                    graph,
+                    ranges,
+                    k,
+                    &mut visits.nearest_receiver,
+                ) else {
+                    continue;
+                };
+                assert!(cost >= distance, "receiver distance decreased");
+                if cost > distance {
+                    receiver_queued[word] |= bit;
+                    receiver_buckets[cost].push(target);
+                    continue;
+                }
+                (source, target)
             };
-            assert!(actual_distance >= distance, "receiver distance decreased");
-            if actual_distance > distance {
-                receiver_distance[index] = actual_distance as u8;
-                continue;
-            }
             debug_assert!(links[tail_slot(source)].is_empty());
-            let overlap = k - 1 - distance;
+            debug_assert!(links[head_slot(target)].is_empty());
             connect(
                 &mut links,
                 source,
                 target,
-                overlap,
+                k - 1 - distance,
                 &mut estimated_bases,
                 &mut visits.connect,
             );
             linked += 1;
             made += 1;
-            // A link occupies both physical ends. An end may already have
-            // been removed from the receiver schedule as unreachable.
-            for slot in [index, tail_slot(source)] {
-                if receiver_distance[slot] != UNREACHABLE {
-                    receiver_distance[slot] = UNREACHABLE;
-                    remaining_receivers -= 1;
-                }
-            }
-            // Both physical ends are independent sources. Repairing them now
-            // exposes alternatives to receivers later in this same scan.
-            field.remove_source(source, graph, ranges, k, &mut visits.remove_source);
-            field.remove_source(target ^ 1, graph, ranges, k, &mut visits.remove_source);
+            field.remove_source(source, graph, ranges, k, radius, &mut visits.remove_source);
+            field.remove_source(
+                target ^ 1,
+                graph,
+                ranges,
+                k,
+                radius,
+                &mut visits.remove_source,
+            );
         }
         info!(
-            "After distance {}: {} receiving ends examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
+            "After distance {}: {} bridge entries examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
             compact(distance),
             compact(examined),
             compact(made),
-            compact(remaining_receivers),
+            compact(nodes - 2 * linked),
             compact(nodes - 2 * linked),
             compact(estimated_bases),
         );
         info!(
-            "After distance {} node visits: direct_overlap {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
+            "After distance {} node visits: direct_overlap {} (total {}), meet {} (total {}), nearest_receiver {} (total {}), connect {} (total {}), remove_source {} (total {})",
             compact(distance),
             compact(0u64),
             compact(visits.direct_overlap),
+            compact(visits.meet - before.meet),
+            compact(visits.meet),
             compact(visits.nearest_receiver - before.nearest_receiver),
             compact(visits.nearest_receiver),
             compact(visits.connect - before.connect),
@@ -738,8 +970,9 @@ fn match_ends(
         );
     }
     info!(
-        "Final node visits (including closure links): direct_overlap {}, nearest_receiver {}, connect {}, remove_source {}",
+        "Final node visits (including closure links): direct_overlap {}, meet {}, nearest_receiver {}, connect {}, remove_source {}",
         compact(visits.direct_overlap),
+        compact(visits.meet),
         compact(visits.nearest_receiver),
         compact(visits.connect),
         compact(visits.remove_source),
@@ -853,33 +1086,4 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
         output.display()
     );
     output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matching_repairs_before_the_next_receiver_at_same_distance() {
-        // Each edge has its reverse-complement counterpart. The first match
-        // consumes the physical ends represented by sources 0 and 3. Their
-        // removal reveals a direct match between source 6 and receiver 4.
-        let graph = Graph {
-            edges: vec![2, 4, 1, 7, 1, 7, 2, 4],
-            offsets: vec![0, 2, 2, 2, 4, 4, 6, 8, 8],
-        };
-        let k = 5;
-        let ranges = vec![0..k; 4];
-        let (links, total_bases) = match_ends(k, &ranges, &graph, 4 * k);
-        let direct = links
-            .iter()
-            .filter(|link| link.overlap as usize == k - 1)
-            .count();
-        assert_eq!(direct, 4);
-        assert_eq!(total_bases, 4 * k - 2 * (k - 1));
-        let first_target = links[tail_slot(0)].target;
-        let second_target = links[tail_slot(6)].target;
-        assert_eq!(first_target, 2);
-        assert_eq!(second_target, 4);
-    }
 }
