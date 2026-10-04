@@ -1,7 +1,39 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ggcat_api::ExtraElaboration;
-use std::{io::IsTerminal, num::NonZeroUsize, path::PathBuf};
+use std::{io::IsTerminal, num::NonZeroUsize, path::PathBuf, time::Instant};
 use tracing::Level;
+use tracing_subscriber::fmt::{
+    format::Writer,
+    time::{ChronoLocal, FormatTime},
+};
+
+struct WallAndElapsed {
+    wall: ChronoLocal,
+    start: Instant,
+}
+
+impl Default for WallAndElapsed {
+    fn default() -> Self {
+        Self {
+            wall: ChronoLocal::new("%H:%M:%S".to_string()),
+            start: Instant::now(),
+        }
+    }
+}
+
+impl FormatTime for WallAndElapsed {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        self.wall.format_time(writer)?;
+        let seconds = self.start.elapsed().as_secs();
+        write!(
+            writer,
+            " ({:02}:{:02}:{:02})",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    }
+}
 
 #[derive(Parser)]
 struct Cli {
@@ -114,9 +146,7 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .with_max_level(Level::DEBUG)
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
-            "%H:%M:%S".to_string(),
-        ))
+        .with_timer(WallAndElapsed::default())
         .init();
 
     match cli.command {
