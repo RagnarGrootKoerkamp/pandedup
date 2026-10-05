@@ -35,7 +35,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
@@ -613,14 +613,13 @@ fn bridge_candidate(
 /// head labels have reached a layer, so later relaxation cannot lower its cost.
 struct BridgeQueue {
     buckets: Vec<Vec<u32>>,
-    queued: Vec<u64>,
+    // queued: Vec<u64>,
 }
 
 impl BridgeQueue {
-    fn new(k: usize, unitigs: usize) -> Self {
+    fn new(k: usize) -> Self {
         Self {
             buckets: vec![Vec::new(); k],
-            queued: vec![0; unitigs.div_ceil(64)],
         }
     }
 
@@ -635,11 +634,6 @@ impl BridgeQueue {
         visited: &mut u64,
     ) {
         debug_assert_eq!(node & 1, 0);
-        let unitig = (node / 2) as usize;
-        let mask = 1u64 << (unitig % 64);
-        if self.queued[unitig / 64] & mask != 0 {
-            return;
-        }
         let cost = bridge_candidate(node, field, ranges, k, reached_layer, visited);
         self.schedule_known(node, cost, k, first_unprocessed_cost);
     }
@@ -655,17 +649,11 @@ impl BridgeQueue {
         if cost < first_unprocessed_cost || cost >= k - 1 {
             return;
         }
-        let unitig = (node / 2) as usize;
-        let mask = 1u64 << (unitig % 64);
-        debug_assert_eq!(self.queued[unitig / 64] & mask, 0);
         self.buckets[cost].push(node);
-        self.queued[unitig / 64] |= mask;
     }
 
     fn pop(&mut self, cost: usize) -> Option<u32> {
         let node = self.buckets[cost].pop()?;
-        let unitig = (node / 2) as usize;
-        self.queued[unitig / 64] &= !(1u64 << (unitig % 64));
         Some(node)
     }
 }
@@ -738,7 +726,7 @@ fn match_ends(
         }
     }
     let mut field = DistanceField::new(&links, graph, &mut visits.build_distances);
-    let mut bridges = BridgeQueue::new(k, ranges.len());
+    let mut bridges = BridgeQueue::new(k);
     let initial_frontier = field.relax_at(
         0,
         graph,
