@@ -37,6 +37,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tracing::info;
 use voracious_radix_sort::{RadixSort, Radixable};
 
@@ -189,47 +190,63 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     let overlap = k - 1;
-    // small extra buffer for self-rc kmers.
-    let mut heads = Vec::with_capacity(ranges.len() + 100);
-    let mut tails = Vec::with_capacity(ranges.len() + 100);
+    // Small extra buffer for self-rc kmers.
+    let ends = Mutex::new((vec![], vec![]));
+
+    StageTiming::start().finish();
+
     info!("Building graph of {} unitigs..", compact(ranges.len()));
-    for (index, range) in ranges.iter().enumerate() {
-        let id = (index as u32) * 2;
-        let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
-            K::read_kmer(seq, overlap, range.start),
-            K::read_kmer(seq, overlap, range.end - overlap),
-            K::read_revcomp_kmer(seq, overlap, range.start),
-            K::read_revcomp_kmer(seq, overlap, range.end - overlap),
-        );
-        if head <= rc_head {
-            heads.push(End { kmer: head, id });
-        }
-        if rc_head <= head {
-            tails.push(End {
-                kmer: rc_head,
-                id: id ^ 1,
-            });
-        }
-        if tail <= rc_tail {
-            tails.push(End { kmer: tail, id });
-        }
-        if rc_tail <= tail {
-            heads.push(End {
-                kmer: rc_tail,
-                id: id ^ 1,
-            });
-        }
-    }
+    const CHUNK_SIZE: usize = 1 << 16;
+    ranges
+        .par_chunks(CHUNK_SIZE)
+        .enumerate()
+        .for_each(|(chunk_index, chunk)| {
+            let mut local_heads = Vec::with_capacity(chunk.len());
+            let mut local_tails = Vec::with_capacity(chunk.len());
+            for (offset, range) in chunk.iter().enumerate() {
+                let id = ((chunk_index * CHUNK_SIZE + offset) as u32) * 2;
+                let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
+                    K::read_kmer(seq, overlap, range.start),
+                    K::read_kmer(seq, overlap, range.end - overlap),
+                    K::read_revcomp_kmer(seq, overlap, range.start),
+                    K::read_revcomp_kmer(seq, overlap, range.end - overlap),
+                );
+                if head <= rc_head {
+                    local_heads.push(End { kmer: head, id });
+                }
+                if rc_head <= head {
+                    local_tails.push(End {
+                        kmer: rc_head,
+                        id: id ^ 1,
+                    });
+                }
+                if tail <= rc_tail {
+                    local_tails.push(End { kmer: tail, id });
+                }
+                if rc_tail <= tail {
+                    local_heads.push(End {
+                        kmer: rc_tail,
+                        id: id ^ 1,
+                    });
+                }
+            }
+            let mut shared = ends.lock().unwrap_or_else(|error| error.into_inner());
+            shared.0.append(&mut local_heads);
+            shared.1.append(&mut local_tails);
+        });
+    let (mut heads, mut tails) = ends.into_inner().unwrap_or_else(|error| error.into_inner());
+    StageTiming::start().finish();
     info!(
-        "Sorting canonical heads ({} B)",
+        "Sorting heads ({} B)",
         compact(std::mem::size_of_val(heads.as_slice()))
     );
     heads.voracious_mt_sort(rayon::current_num_threads());
     info!(
-        "Sorting canonical tails ({} B)",
+        "Sorting tails ({} B)",
         compact(std::mem::size_of_val(tails.as_slice()))
     );
     tails.voracious_mt_sort(rayon::current_num_threads());
+    StageTiming::start().finish();
 
     info!("Matching unitig ends");
     let mut pairs = Vec::new();
@@ -279,11 +296,13 @@ where
     }
     drop(heads);
     drop(tails);
+    StageTiming::start().finish();
     info!("Sorting {} edges", compact(pairs.len()));
     pairs.voracious_mt_sort(rayon::current_num_threads());
     // Palindromic ends match in both canonical directions; remove their
     // duplicate oriented edges before building CSR offsets.
     pairs.dedup();
+    StageTiming::start().finish();
     assert!(pairs.len() < u32::MAX as usize, "too many graph edges");
     info!("Building CSR adjacency");
     let mut offsets = vec![0; 2 * ranges.len() + 1];
@@ -298,6 +317,7 @@ where
         offsets[i] += offsets[i - 1];
     }
     info!("Mapping pairs");
+    StageTiming::start().finish();
     Graph {
         edges: pairs.into_iter().map(|edge| edge.to).collect(),
         offsets,
@@ -711,6 +731,7 @@ fn match_ends(
     info!(
         "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; build_distances scans and relaxes distance layers; meet checks and queues bridges and traces endpoints; connect touches link slots; remove_source repairs distance labels"
     );
+    StageTiming::start().finish();
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
     // those edges without querying shortest-path labels.
@@ -756,6 +777,7 @@ fn match_ends(
         &mut visits.build_distances,
         &mut visits.meet,
     );
+    StageTiming::start().finish();
     info!(
         "Half-distance 0: {} nodes settled",
         compact(initial_frontier)
@@ -903,6 +925,7 @@ fn match_ends(
                 compact(visits.remove_source - before.remove_source),
                 compact(visits.remove_source),
             );
+            StageTiming::start().finish();
             before = visits;
         }
     }
@@ -1004,8 +1027,12 @@ where
     let graph = graph::<K>(k, &seq, &ranges);
 
     let (links, estimated_bases) = match_ends(k, &ranges, &graph, initial_bases);
+    info!("Dropping graph");
+    drop(graph);
 
+    StageTiming::start().finish();
     let output = reconstruct_output::<K>(k, seq, ranges, short, links, mask);
+    StageTiming::start().finish();
     info!(
         "Length summary: {} estimated bases after links, {} output bases in {} records",
         compact(estimated_bases),
@@ -1092,6 +1119,7 @@ fn reconstruct_output<K: MssKey>(
         }
     }
     info!("Reconstructing {} parts in parallel", compact(parts.len()));
+    StageTiming::start().finish();
     let mut strings: Vec<OutputPart> = parts
         .into_par_iter()
         .with_max_len(1)
@@ -1119,6 +1147,10 @@ fn reconstruct_output<K: MssKey>(
             }
         })
         .collect();
+    StageTiming::start().finish();
+    info!("Dropping links");
+    drop(links);
+    StageTiming::start().finish();
     for range in &short {
         if !range.is_empty() {
             let mut string = Vec::with_capacity(range.len());

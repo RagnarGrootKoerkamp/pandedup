@@ -72,10 +72,12 @@ impl StageTiming {
                 format!("MaxRSS {:.1} MiB", max_rss as f64 / (1u64 << 20) as f64)
             });
         }
-        if details.is_empty() {
+        let out = if details.is_empty() {
             format!("{wall:.2?} wall")
         } else {
             format!("{wall:.2?} wall [{}]", details.join("; "))
-        }
+        };
+        warn!("{}", out);
+        out
     }
 }
