@@ -30,6 +30,7 @@
 
 use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec};
+use rayon::prelude::*;
 use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -896,8 +897,19 @@ fn reconstruct_output<K: MssKey>(
     links: Vec<Link>,
 ) -> Vec<u8> {
     info!("Reconstruct output");
-    let mut output = Vec::new();
     let mut done = vec![false; ranges.len()];
+    // make output seqs of length at most 32Mbp, to keep threads busy.
+    const PART_BASES: usize = 32 * 1024 * 1024;
+    let mut parts = Vec::<Vec<u32>>::new();
+    let mut first_overlaps = Vec::<u8>::new();
+    let mut cycle_count = 0usize;
+    let mut cycle_unitigs = 0usize;
+    let mut cycle_bases = 0usize;
+    let mut min_cycle_unitigs = usize::MAX;
+    let mut max_cycle_unitigs = 0usize;
+    let mut min_cycle_bases = usize::MAX;
+    let mut max_cycle_bases = 0usize;
+    let mut cycle_sizes = [0usize; 32];
     // Start open paths at their self-linked head, oriented away from it.
     // Remaining components have no such endpoint and can be traversed as cycles.
     for pass in 0..2 {
@@ -916,26 +928,120 @@ fn reconstruct_output<K: MssKey>(
             } else {
                 forward
             };
-            let mut overlap = 0;
+            let mut part = Vec::new();
+            let mut part_bases = 0usize;
+            let mut first_overlap = 0u8;
+            let mut component_unitigs = 0usize;
+            let mut component_bases = 0usize;
+            let mut overlap = 0u8;
             loop {
                 let index = (id / 2) as usize;
                 assert!(!done[index], "link cycle revisits unitig before closing");
                 done[index] = true;
-                append(&mut output, &seq, &ranges[index], id & 1 != 0, overlap, k);
+                let added_bases = ranges[index].len() - overlap as usize;
+                // Keep unitigs intact; an individual contribution may exceed
+                // the target part size.
+                if !part.is_empty() && part_bases + added_bases > PART_BASES {
+                    parts.push(std::mem::take(&mut part));
+                    first_overlaps.push(first_overlap);
+                    part_bases = 0;
+                    first_overlap = overlap;
+                }
+                part.push(id);
+                part_bases += added_bases;
+                component_unitigs += 1;
+                component_bases += added_bases;
                 let link = links[tail_slot(id)];
                 assert!(!link.is_empty(), "unmatched unitig end");
                 if link.target == id ^ 1 || (link.target / 2) as usize == start {
                     break;
                 }
                 id = link.target;
-                overlap = link.overlap as usize;
+                overlap = link.overlap;
             }
+            parts.push(part);
+            first_overlaps.push(first_overlap);
+            cycle_count += 1;
+            cycle_unitigs += component_unitigs;
+            cycle_bases += component_bases;
+            min_cycle_unitigs = min_cycle_unitigs.min(component_unitigs);
+            max_cycle_unitigs = max_cycle_unitigs.max(component_unitigs);
+            min_cycle_bases = min_cycle_bases.min(component_bases);
+            max_cycle_bases = max_cycle_bases.max(component_bases);
+            let size_bin = component_unitigs.ilog2() as usize;
+            cycle_sizes[size_bin] += 1;
         }
     }
+    info!("Reconstructing {} parts in parallel", compact(parts.len()));
+    let strings: Vec<Vec<u8>> = parts
+        .into_par_iter()
+        .zip(first_overlaps)
+        .with_max_len(1)
+        .map(|(part, first_overlap)| {
+            let mut string = Vec::new();
+            for (position, id) in part.into_iter().enumerate() {
+                let overlap = if position == 0 {
+                    first_overlap
+                } else {
+                    links[head_slot(id)].overlap
+                };
+                append(
+                    &mut string,
+                    &seq,
+                    &ranges[(id / 2) as usize],
+                    id & 1 != 0,
+                    overlap as usize,
+                    k,
+                );
+            }
+            string
+        })
+        .collect();
+    // FIXME: These should be separate contigs, or we should insert padding characters.
+    info!("Concatenating strings..");
+    let mut output = Vec::with_capacity(strings.iter().map(Vec::len).sum());
+    for string in strings {
+        output.extend_from_slice(&string);
+    }
+    // FIXME: These should be separate contigs, or we should insert padding characters.
     for range in &short {
         if !range.is_empty() {
             append(&mut output, &seq, range, false, 0, k);
         }
+    }
+    if cycle_count == 0 {
+        info!("Cycles: 0");
+    } else {
+        info!(
+            "Cycles: {} containing {} unitigs and {} output bases; unitigs per cycle min {}, mean {}, max {}; output bases per cycle min {}, mean {}, max {}",
+            compact(cycle_count),
+            compact(cycle_unitigs),
+            compact(cycle_bases),
+            compact(min_cycle_unitigs),
+            compact(cycle_unitigs / cycle_count),
+            compact(max_cycle_unitigs),
+            compact(min_cycle_bases),
+            compact(cycle_bases / cycle_count),
+            compact(max_cycle_bases),
+        );
+        let distribution: Vec<_> = cycle_sizes
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(bin, &count)| {
+                let low = 1usize << bin;
+                let high = ((1usize << (bin + 1)) - 1).min(ranges.len());
+                if low == high {
+                    format!("{}: {}", compact(low), compact(count))
+                } else {
+                    format!("{}-{}: {}", compact(low), compact(high), compact(count))
+                }
+            })
+            .collect();
+        info!(
+            "Cycle size distribution (unitigs per cycle): {}",
+            distribution.join(", ")
+        );
     }
     output
 }
