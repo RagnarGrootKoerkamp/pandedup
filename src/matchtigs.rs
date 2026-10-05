@@ -1004,14 +1004,6 @@ fn reconstruct_output<K: MssKey>(
     const PART_BASES: usize = 32 * 1024 * 1024;
     let mut parts = Vec::<Vec<u32>>::new();
     let mut first_overlaps = Vec::<u8>::new();
-    let mut cycle_count = 0usize;
-    let mut cycle_unitigs = 0usize;
-    let mut cycle_bases = 0usize;
-    let mut min_cycle_unitigs = usize::MAX;
-    let mut max_cycle_unitigs = 0usize;
-    let mut min_cycle_bases = usize::MAX;
-    let mut max_cycle_bases = 0usize;
-    let mut cycle_sizes = [0usize; 32];
     // Start open paths at their self-linked head, oriented away from it.
     // Remaining components have no such endpoint and can be traversed as cycles.
     for pass in 0..2 {
@@ -1033,8 +1025,6 @@ fn reconstruct_output<K: MssKey>(
             let mut part = Vec::new();
             let mut part_bases = 0usize;
             let mut first_overlap = 0u8;
-            let mut component_unitigs = 0usize;
-            let mut component_bases = 0usize;
             let mut overlap = 0u8;
             let first_part = parts.len();
             loop {
@@ -1052,8 +1042,6 @@ fn reconstruct_output<K: MssKey>(
                 }
                 part.push(id);
                 part_bases += added_bases;
-                component_unitigs += 1;
-                component_bases += added_bases;
                 let link = links[tail_slot(id)];
                 assert!(!link.is_empty(), "unmatched unitig end");
                 if link.target == id ^ 1 || (link.target / 2) as usize == start {
@@ -1068,22 +1056,10 @@ fn reconstruct_output<K: MssKey>(
                 let cut = (0..part.len())
                     .min_by_key(|&i| links[head_slot(part[i])].overlap)
                     .unwrap();
-                let old_cut = links[head_slot(part[0])].overlap as usize;
-                let new_cut = links[head_slot(part[cut])].overlap as usize;
                 part.rotate_left(cut);
-                component_bases -= old_cut - new_cut;
             }
             parts.push(part);
             first_overlaps.push(first_overlap);
-            cycle_count += 1;
-            cycle_unitigs += component_unitigs;
-            cycle_bases += component_bases;
-            min_cycle_unitigs = min_cycle_unitigs.min(component_unitigs);
-            max_cycle_unitigs = max_cycle_unitigs.max(component_unitigs);
-            min_cycle_bases = min_cycle_bases.min(component_bases);
-            max_cycle_bases = max_cycle_bases.max(component_bases);
-            let size_bin = component_unitigs.ilog2() as usize;
-            cycle_sizes[size_bin] += 1;
         }
     }
     info!("Reconstructing {} parts in parallel", compact(parts.len()));
@@ -1092,7 +1068,6 @@ fn reconstruct_output<K: MssKey>(
         .zip(first_overlaps)
         .with_max_len(1)
         .map(|(part, first_overlap)| {
-            let len = part.len();
             let mut string = Vec::new();
             for (position, id) in part.into_iter().enumerate() {
                 let overlap = if position == 0 {
@@ -1122,40 +1097,6 @@ fn reconstruct_output<K: MssKey>(
         if !range.is_empty() {
             append(&mut output, &seq, range, false, 0, k);
         }
-    }
-    if cycle_count == 0 {
-        info!("Cycles: 0");
-    } else {
-        info!(
-            "Cycles: {} containing {} unitigs and {} output bases; unitigs per cycle min {}, mean {}, max {}; output bases per cycle min {}, mean {}, max {}",
-            compact(cycle_count),
-            compact(cycle_unitigs),
-            compact(cycle_bases),
-            compact(min_cycle_unitigs),
-            compact(cycle_unitigs / cycle_count),
-            compact(max_cycle_unitigs),
-            compact(min_cycle_bases),
-            compact(cycle_bases / cycle_count),
-            compact(max_cycle_bases),
-        );
-        let distribution: Vec<_> = cycle_sizes
-            .iter()
-            .enumerate()
-            .filter(|(_, count)| **count > 0)
-            .map(|(bin, &count)| {
-                let low = 1usize << bin;
-                let high = ((1usize << (bin + 1)) - 1).min(ranges.len());
-                if low == high {
-                    format!("{}: {}", compact(low), compact(count))
-                } else {
-                    format!("{}-{}: {}", compact(low), compact(high), compact(count))
-                }
-            })
-            .collect();
-        info!(
-            "Cycle size distribution (unitigs per cycle): {}",
-            distribution.join(", ")
-        );
     }
     output
 }
