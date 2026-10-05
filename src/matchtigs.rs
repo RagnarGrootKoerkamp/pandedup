@@ -1,7 +1,9 @@
 //! Greedy matching of unitig ends through the compacted de Bruijn graph.
 //!
-//! Each unitig has two oriented copies. Their outgoing tails and incoming
-//! heads are grouped by their `(k-1)`-mers to build tail-to-head graph edges.
+//! Each physical unitig end is stored under the smaller of its forward and
+//! reverse-complement `(k-1)`-mers. Matching a canonical tail and head produces
+//! both orientations of the graph edge. Palindromic ends occur in both lists
+//! because they can act as either a head or a tail.
 //! Following one of these edges joins two unitigs with a direct `(k-1)`-base
 //! overlap. Traversing an oriented unitig from head to tail costs its length
 //! minus `k-1`: the number of new bases contributed by that unitig.
@@ -187,8 +189,8 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     let overlap = k - 1;
-    let mut heads = Vec::with_capacity(2 * ranges.len());
-    let mut tails = Vec::with_capacity(2 * ranges.len());
+    let mut heads = Vec::with_capacity(ranges.len());
+    let mut tails = Vec::with_capacity(ranges.len());
     info!("Building graph of {} unitigs..", compact(ranges.len()));
     for (index, range) in ranges.iter().enumerate() {
         let id = (index as u32) * 2;
@@ -198,24 +200,32 @@ where
             K::read_revcomp_kmer(seq, overlap, range.start),
             K::read_revcomp_kmer(seq, overlap, range.end - overlap),
         );
-        heads.push(End { kmer: head, id });
-        heads.push(End {
-            kmer: rc_tail,
-            id: id + 1,
-        });
-        tails.push(End { kmer: tail, id });
-        tails.push(End {
-            kmer: rc_head,
-            id: id + 1,
-        });
+        if head <= rc_head {
+            heads.push(End { kmer: head, id });
+        }
+        if rc_head <= head {
+            tails.push(End {
+                kmer: rc_head,
+                id: id ^ 1,
+            });
+        }
+        if tail <= rc_tail {
+            tails.push(End { kmer: tail, id });
+        }
+        if rc_tail <= tail {
+            heads.push(End {
+                kmer: rc_tail,
+                id: id ^ 1,
+            });
+        }
     }
     info!(
-        "Sorting heads ({} GB)",
+        "Sorting canonical heads ({} B)",
         compact(std::mem::size_of_val(heads.as_slice()))
     );
     heads.voracious_mt_sort(rayon::current_num_threads());
     info!(
-        "Sorting tails ({} GB)",
+        "Sorting canonical tails ({} B)",
         compact(std::mem::size_of_val(tails.as_slice()))
     );
     tails.voracious_mt_sort(rayon::current_num_threads());
@@ -224,40 +234,41 @@ where
     let mut pairs = Vec::new();
     let (mut h, mut t) = (0, 0);
     while h < heads.len() && t < tails.len() {
-        // Copy keys out of packed entries before borrowing them for comparison.
         let head_key = heads[h].kmer;
         let tail_key = tails[t].kmer;
         match head_key.cmp(&tail_key) {
             std::cmp::Ordering::Less => h += 1,
             std::cmp::Ordering::Greater => t += 1,
             std::cmp::Ordering::Equal => {
-                let key = heads[h].kmer;
                 let mut he = h;
                 let mut te = t;
                 while he < heads.len() {
                     let next = heads[he].kmer;
-                    if next != key {
+                    if next != head_key {
                         break;
                     }
                     he += 1;
                 }
                 while te < tails.len() {
                     let next = tails[te].kmer;
-                    if next != key {
+                    if next != tail_key {
                         break;
                     }
                     te += 1;
                 }
                 for tail in &tails[t..te] {
                     for head in &heads[h..he] {
-                        // The reverse orientation of the same endpoint does not
-                        // traverse a unitig or introduce a new graph edge.
-                        if tail.id != (head.id ^ 1) {
-                            pairs.push(Edge {
-                                from: tail.id,
-                                to: head.id,
-                            });
+                        if tail.id == (head.id ^ 1) {
+                            continue;
                         }
+                        pairs.push(Edge {
+                            from: tail.id,
+                            to: head.id,
+                        });
+                        pairs.push(Edge {
+                            from: head.id ^ 1,
+                            to: tail.id ^ 1,
+                        });
                     }
                 }
                 h = he;
@@ -265,13 +276,13 @@ where
             }
         }
     }
+    drop(heads);
+    drop(tails);
     info!("Sorting {} edges", compact(pairs.len()));
     pairs.voracious_mt_sort(rayon::current_num_threads());
-    // let old_len = pairs.len();
-    // info!("Dedup edges");
-    // pairs.dedup();
-    // info!("Dedup edges => {} left", pairs.len());
-    // assert_eq!(old_len, pairs.len(), "duplicate graph edges");
+    // Palindromic ends match in both canonical directions; remove their
+    // duplicate oriented edges before building CSR offsets.
+    pairs.dedup();
     assert!(pairs.len() < u32::MAX as usize, "too many graph edges");
     info!("Building CSR adjacency");
     let mut offsets = vec![0; 2 * ranges.len() + 1];
