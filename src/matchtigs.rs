@@ -189,8 +189,9 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     let overlap = k - 1;
-    let mut heads = Vec::with_capacity(ranges.len());
-    let mut tails = Vec::with_capacity(ranges.len());
+    // small extra buffer for self-rc kmers.
+    let mut heads = Vec::with_capacity(ranges.len() + 100);
+    let mut tails = Vec::with_capacity(ranges.len() + 100);
     info!("Building graph of {} unitigs..", compact(ranges.len()));
     for (index, range) in ranges.iter().enumerate() {
         let id = (index as u32) * 2;

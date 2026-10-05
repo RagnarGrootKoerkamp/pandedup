@@ -44,18 +44,23 @@ impl MssKey for u64 {
     const ZERO: Self = 0;
     const ONE: Self = 1;
     const MAX: Self = u64::MAX;
+    #[inline(always)]
     fn from_usize(value: usize) -> Self {
         value as u64
     }
+    #[inline(always)]
     fn div_ceil(self, rhs: Self) -> Self {
         u64::div_ceil(self, rhs)
     }
+    #[inline(always)]
     fn checked_shr(self, rhs: u32) -> Option<Self> {
         u64::checked_shr(self, rhs)
     }
+    #[inline(always)]
     fn read_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
         seq.read_kmer(k, pos)
     }
+    #[inline(always)]
     fn read_revcomp_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
         seq.read_revcomp_kmer(k, pos)
     }
@@ -66,18 +71,23 @@ impl MssKey for u128 {
     const ZERO: Self = 0;
     const ONE: Self = 1;
     const MAX: Self = u128::MAX;
+    #[inline(always)]
     fn from_usize(value: usize) -> Self {
         value as u128
     }
+    #[inline(always)]
     fn div_ceil(self, rhs: Self) -> Self {
         u128::div_ceil(self, rhs)
     }
+    #[inline(always)]
     fn checked_shr(self, rhs: u32) -> Option<Self> {
         u128::checked_shr(self, rhs)
     }
+    #[inline(always)]
     fn read_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
         seq.read_kmer_u128(k, pos)
     }
+    #[inline(always)]
     fn read_revcomp_kmer(seq: &PackedSeqVec, k: usize, pos: usize) -> Self {
         seq.read_revcomp_kmer_u128(k, pos)
     }
