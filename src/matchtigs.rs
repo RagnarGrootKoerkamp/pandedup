@@ -969,9 +969,17 @@ fn append(
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C, packed(1))]
+struct PathStep {
+    id: u32,
+    overlap: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<PathStep>() == 5);
+
 struct PathPart {
-    ids: Vec<u32>,
-    first_overlap: u8,
+    steps: Vec<PathStep>,
     starts_record: bool,
 }
 
@@ -1075,7 +1083,6 @@ fn reconstruct_output<K: MssKey>(
             };
             let mut part = Vec::new();
             let mut part_bases = 0usize;
-            let mut first_overlap = 0u8;
             let mut overlap = 0u8;
             let first_part = parts.len();
             loop {
@@ -1087,14 +1094,12 @@ fn reconstruct_output<K: MssKey>(
                 // the target part size.
                 if !part.is_empty() && part_bases + added_bases > PART_BASES {
                     parts.push(PathPart {
-                        ids: std::mem::take(&mut part),
-                        first_overlap,
+                        steps: std::mem::take(&mut part),
                         starts_record: parts.len() == first_part,
                     });
                     part_bases = 0;
-                    first_overlap = overlap;
                 }
-                part.push(id);
+                part.push(PathStep { id, overlap });
                 part_bases += added_bases;
                 let link = links[tail_slot(id)];
                 if link.is_empty() || link.target == id ^ 1 || (link.target / 2) as usize == start {
@@ -1106,18 +1111,20 @@ fn reconstruct_output<K: MssKey>(
             if pass == 1 && parts.len() == first_part {
                 // The whole cycle fits in one part. Omit its shortest overlap
                 // by opening the cycle at the unitig immediately after it.
-                let cut = (0..part.len())
-                    .min_by_key(|&i| links[head_slot(part[i])].overlap)
-                    .unwrap();
+                part[0].overlap = links[head_slot(part[0].id)].overlap;
+                let cut = (0..part.len()).min_by_key(|&i| part[i].overlap).unwrap();
                 part.rotate_left(cut);
+                part[0].overlap = 0;
             }
             parts.push(PathPart {
-                ids: part,
-                first_overlap,
+                steps: part,
                 starts_record: parts.len() == first_part,
             });
         }
     }
+    drop(done);
+    info!("Dropping links");
+    drop(links);
     info!("Reconstructing {} parts in parallel", compact(parts.len()));
     StageTiming::start().finish();
     let mut strings: Vec<OutputPart> = parts
@@ -1125,18 +1132,13 @@ fn reconstruct_output<K: MssKey>(
         .with_max_len(1)
         .map(|part| {
             let mut string = Vec::new();
-            for (position, id) in part.ids.into_iter().enumerate() {
-                let overlap = if position == 0 {
-                    part.first_overlap
-                } else {
-                    links[head_slot(id)].overlap
-                };
+            for step in part.steps {
                 append(
                     &mut string,
                     &seq,
-                    &ranges[(id / 2) as usize],
-                    id & 1 != 0,
-                    overlap as usize,
+                    &ranges[(step.id / 2) as usize],
+                    step.id & 1 != 0,
+                    step.overlap as usize,
                     k,
                     mask,
                 );
@@ -1147,9 +1149,6 @@ fn reconstruct_output<K: MssKey>(
             }
         })
         .collect();
-    StageTiming::start().finish();
-    info!("Dropping links");
-    drop(links);
     StageTiming::start().finish();
     for range in &short {
         if !range.is_empty() {
@@ -1196,7 +1195,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
                 writer.write_all(b"\n").unwrap();
             }
             written_records += 1;
-            writeln!(writer, ">matchtig_{written_records}").unwrap();
+            writeln!(writer, ">").unwrap();
         }
         writer.write_all(&part.sequence).unwrap();
     }
