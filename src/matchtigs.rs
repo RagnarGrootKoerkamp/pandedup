@@ -1036,6 +1036,7 @@ fn reconstruct_output<K: MssKey>(
             let mut component_unitigs = 0usize;
             let mut component_bases = 0usize;
             let mut overlap = 0u8;
+            let first_part = parts.len();
             loop {
                 let index = (id / 2) as usize;
                 assert!(!done[index], "link cycle revisits unitig before closing");
@@ -1060,6 +1061,17 @@ fn reconstruct_output<K: MssKey>(
                 }
                 id = link.target;
                 overlap = link.overlap;
+            }
+            if pass == 1 && parts.len() == first_part {
+                // The whole cycle fits in one part. Omit its shortest overlap
+                // by opening the cycle at the unitig immediately after it.
+                let cut = (0..part.len())
+                    .min_by_key(|&i| links[head_slot(part[i])].overlap)
+                    .unwrap();
+                let old_cut = links[head_slot(part[0])].overlap as usize;
+                let new_cut = links[head_slot(part[cut])].overlap as usize;
+                part.rotate_left(cut);
+                component_bases -= old_cut - new_cut;
             }
             parts.push(part);
             first_overlaps.push(first_overlap);
@@ -1096,10 +1108,6 @@ fn reconstruct_output<K: MssKey>(
                     overlap as usize,
                     k,
                 );
-            }
-            if string.len() > 10000 {
-                let t = std::thread::current().id();
-                debug!("{t:?} unitigs {:>6} len {:>8}", len, string.len());
             }
             string
         })
