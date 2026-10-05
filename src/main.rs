@@ -49,8 +49,8 @@ enum Command {
     Ggcat(GgcatArgs),
     /// Build a masked superstring from contigs.
     Mss(MssArgs),
-    /// Build a masked superstring by matching unitigs through their graph.
-    Matchtigs(MssArgs),
+    /// Build a superstring by matching unitigs through their graph.
+    Matchtigs(MatchtigsArgs),
 }
 
 #[derive(Args)]
@@ -138,6 +138,15 @@ struct MssArgs {
     threads: Option<NonZeroUsize>,
 }
 
+#[derive(Args)]
+struct MatchtigsArgs {
+    #[command(flatten)]
+    common: MssArgs,
+    /// Lowercase bases added at joins with less than k-1 overlap.
+    #[arg(long)]
+    mask: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
@@ -180,7 +189,12 @@ fn main() {
             );
         }
         Command::Matchtigs(args) => {
-            pandedup::matchtigs::run(&args.input, args.output.as_deref(), args.k);
+            pandedup::matchtigs::run(
+                &args.common.input,
+                args.common.output.as_deref(),
+                args.common.k,
+                args.mask,
+            );
         }
     }
 }

@@ -940,6 +940,7 @@ fn append(
     reverse: bool,
     overlap: usize,
     k: usize,
+    mask: bool,
 ) {
     let start = output.len();
     if !reverse {
@@ -952,9 +953,11 @@ fn append(
     }
 
     // FIXME TEST THIS
-    let num_lowercase = (k - 1 - overlap).min(range.len() - overlap);
-    for base in &mut output[start..start + num_lowercase] {
-        *base = base.to_ascii_lowercase();
+    if mask {
+        let num_lowercase = (k - 1 - overlap).min(range.len() - overlap);
+        for base in &mut output[start..start + num_lowercase] {
+            *base = base.to_ascii_lowercase();
+        }
     }
 }
 
@@ -968,6 +971,18 @@ pub fn masked_superstring<K: MssKey>(
 where
     End<K>: Radixable<K, Key = K>,
 {
+    build_superstring::<K>(k, seq, ranges, true)
+}
+
+fn build_superstring<K: MssKey>(
+    k: usize,
+    seq: PackedSeqVec,
+    ranges: Vec<Range<usize>>,
+    mask: bool,
+) -> Vec<u8>
+where
+    End<K>: Radixable<K, Key = K>,
+{
     assert!(k > 0 && k <= K::BITS / 2);
     let initial_bases: usize = ranges.iter().map(Range::len).sum();
     let (ranges, short): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|r| r.len() >= k);
@@ -976,7 +991,7 @@ where
 
     let (links, estimated_bases) = match_ends(k, &ranges, &graph, initial_bases);
 
-    let output = reconstruct_output::<K>(k, seq, ranges, short, links);
+    let output = reconstruct_output::<K>(k, seq, ranges, short, links, mask);
     info!(
         "Length summary: {} estimated bases after links, {} output bases",
         compact(estimated_bases),
@@ -991,6 +1006,7 @@ fn reconstruct_output<K: MssKey>(
     ranges: Vec<Range<usize>>,
     short: Vec<Range<usize>>,
     links: Vec<Link>,
+    mask: bool,
 ) -> Vec<u8> {
     info!("Reconstruct output");
     let mut done = vec![false; ranges.len()];
@@ -1076,6 +1092,7 @@ fn reconstruct_output<K: MssKey>(
                     id & 1 != 0,
                     overlap as usize,
                     k,
+                    mask,
                 );
             }
             string
@@ -1089,14 +1106,14 @@ fn reconstruct_output<K: MssKey>(
     // FIXME: These should be separate contigs, or we should insert padding characters.
     for range in &short {
         if !range.is_empty() {
-            append(&mut output, &seq, range, false, 0, k);
+            append(&mut output, &seq, range, false, 0, k, mask);
         }
     }
     output
 }
 
-/// Read unitigs and write one masked superstring in FASTA format.
-pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
+/// Read unitigs and write one superstring in FASTA format.
+pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
     let (seq, ranges) = PackedSeqVec::from_fastx(input);
@@ -1108,15 +1125,24 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
     let input_bases = ranges.iter().map(Range::len).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
     let superstring = if k <= 32 {
-        masked_superstring::<u64>(k, seq, ranges)
+        build_superstring::<u64>(k, seq, ranges, mask)
     } else {
-        masked_superstring::<u128>(k, seq, ranges)
+        build_superstring::<u128>(k, seq, ranges, mask)
     };
     let output = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_msfa_output(input, "greedytigs"));
     let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
-    writeln!(writer, ">matchtigs-masked-superstring").unwrap();
+    writeln!(
+        writer,
+        ">{}",
+        if mask {
+            "matchtigs-masked-superstring"
+        } else {
+            "matchtigs-superstring"
+        }
+    )
+    .unwrap();
     writer.write_all(&superstring).unwrap();
     writer.write_all(b"\n").unwrap();
     drop(writer);

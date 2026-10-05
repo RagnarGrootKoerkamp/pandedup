@@ -68,8 +68,11 @@ pandedup mss input.fa.zst -k 64 -j 6 -o output.msfa
 ### Greedy matchtig output (*very much* WIP)
 
 ```sh
-pandedup matchtig input.fa.zst -k 64 -j 6 -o output.msfa
+pandedup matchtigs input.fa.zst -k 64 -j 6 -o output.msfa --mask
 ```
+
+`--mask` lowercases bases added at joins with less than `k-1` overlap. Without it,
+the output uses uppercase bases throughout.
 
 ### Ambiguous bases
 Input sequences are _split_ on ambiguous IUPAC bases such as `N`, `Y`, and `R`.
