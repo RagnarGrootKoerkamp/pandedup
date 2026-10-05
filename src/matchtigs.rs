@@ -25,8 +25,8 @@
 //! After a link consumes its free ends, `remove_source` repairs every affected
 //! finite label, including tentative labels in later layers. The same
 //! traversal can connect several pairs at one cost, so it is rechecked after
-//! a link. Finally, remaining ends are paired with zero overlap and written
-//! as a masked superstring.
+//! a link. Remaining ends stay free; each resulting path or cycle is written
+//! as a separate FASTA record.
 
 use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec};
@@ -895,35 +895,8 @@ fn match_ends(
         }
     }
 
-    // Link up (concatenate) remaining seqs.
-    let outgoing: Vec<_> = (0..nodes as u32)
-        .filter(|&id| links[tail_slot(id)].is_empty())
-        .collect();
-    let mut pairs = outgoing.chunks_exact(2);
-    for pair in &mut pairs {
-        let target = pair[1] ^ 1;
-        connect(
-            &mut links,
-            pair[0],
-            target,
-            0,
-            &mut estimated_bases,
-            &mut visits.connect,
-        );
-    }
-    // A self-link without overlap is fine.
-    if let [source] = pairs.remainder() {
-        connect(
-            &mut links,
-            *source,
-            *source ^ 1,
-            0,
-            &mut estimated_bases,
-            &mut visits.connect,
-        );
-    }
     info!(
-        "Final node visits (including closure links): direct_overlap {}, build_distances {}, meet {}, connect {}, remove_source {}",
+        "Final node visits: direct_overlap {}, build_distances {}, meet {}, connect {}, remove_source {}",
         compact(visits.direct_overlap),
         compact(visits.build_distances),
         compact(visits.meet),
@@ -961,17 +934,46 @@ fn append(
     }
 }
 
-/// Build a masked superstring from unitigs. Newly created crossing k-mers are
-/// lowercase, as in `mss::masked_superstring`.
+struct PathPart {
+    ids: Vec<u32>,
+    first_overlap: u8,
+    starts_record: bool,
+}
+
+struct OutputPart {
+    sequence: Vec<u8>,
+    starts_record: bool,
+}
+
+struct ReconstructedOutput {
+    parts: Vec<OutputPart>,
+    records: usize,
+    bases: usize,
+}
+
+/// Build masked matchtig records from unitigs. Newly created crossing k-mers
+/// are lowercase, as in `mss::masked_superstring`.
 pub fn masked_superstring<K: MssKey>(
     k: usize,
     seq: PackedSeqVec,
     ranges: Vec<Range<usize>>,
-) -> Vec<u8>
+) -> Vec<Vec<u8>>
 where
     End<K>: Radixable<K, Key = K>,
 {
-    build_superstring::<K>(k, seq, ranges, true)
+    let output = build_superstring::<K>(k, seq, ranges, true);
+    let mut records = Vec::with_capacity(output.records);
+    for part in output.parts {
+        if part.starts_record {
+            records.push(part.sequence);
+        } else {
+            records
+                .last_mut()
+                .expect("continuation without a record")
+                .extend_from_slice(&part.sequence);
+        }
+    }
+    records
 }
 
 fn build_superstring<K: MssKey>(
@@ -979,7 +981,7 @@ fn build_superstring<K: MssKey>(
     seq: PackedSeqVec,
     ranges: Vec<Range<usize>>,
     mask: bool,
-) -> Vec<u8>
+) -> ReconstructedOutput
 where
     End<K>: Radixable<K, Key = K>,
 {
@@ -993,9 +995,10 @@ where
 
     let output = reconstruct_output::<K>(k, seq, ranges, short, links, mask);
     info!(
-        "Length summary: {} estimated bases after links, {} output bases",
+        "Length summary: {} estimated bases after links, {} output bases in {} records",
         compact(estimated_bases),
-        compact(output.len()),
+        compact(output.bases),
+        compact(output.records),
     );
     output
 }
@@ -1007,15 +1010,14 @@ fn reconstruct_output<K: MssKey>(
     short: Vec<Range<usize>>,
     links: Vec<Link>,
     mask: bool,
-) -> Vec<u8> {
+) -> ReconstructedOutput {
     info!("Reconstruct output");
     let mut done = vec![false; ranges.len()];
     // make output seqs of length at most 32Mbp, to keep threads busy.
     const PART_BASES: usize = 32 * 1024 * 1024;
-    let mut parts = Vec::<Vec<u32>>::new();
-    let mut first_overlaps = Vec::<u8>::new();
-    // Start open paths at their self-linked head, oriented away from it.
-    // Remaining components have no such endpoint and can be traversed as cycles.
+    let mut parts = Vec::<PathPart>::new();
+    // Start open paths at their free head, oriented away from it.
+    // Remaining components have no free endpoint and are cycles.
     for pass in 0..2 {
         for start in 0..ranges.len() {
             if done[start] {
@@ -1023,9 +1025,9 @@ fn reconstruct_output<K: MssKey>(
             }
             let forward = (start as u32) * 2;
             let reverse = forward ^ 1;
-            let mut id = if links[head_slot(forward)].target == forward {
+            let mut id = if links[head_slot(forward)].is_empty() {
                 forward
-            } else if links[head_slot(reverse)].target == reverse {
+            } else if links[head_slot(reverse)].is_empty() {
                 reverse
             } else if pass == 0 {
                 continue;
@@ -1045,16 +1047,18 @@ fn reconstruct_output<K: MssKey>(
                 // Keep unitigs intact; an individual contribution may exceed
                 // the target part size.
                 if !part.is_empty() && part_bases + added_bases > PART_BASES {
-                    parts.push(std::mem::take(&mut part));
-                    first_overlaps.push(first_overlap);
+                    parts.push(PathPart {
+                        ids: std::mem::take(&mut part),
+                        first_overlap,
+                        starts_record: parts.len() == first_part,
+                    });
                     part_bases = 0;
                     first_overlap = overlap;
                 }
                 part.push(id);
                 part_bases += added_bases;
                 let link = links[tail_slot(id)];
-                assert!(!link.is_empty(), "unmatched unitig end");
-                if link.target == id ^ 1 || (link.target / 2) as usize == start {
+                if link.is_empty() || link.target == id ^ 1 || (link.target / 2) as usize == start {
                     break;
                 }
                 id = link.target;
@@ -1068,20 +1072,22 @@ fn reconstruct_output<K: MssKey>(
                     .unwrap();
                 part.rotate_left(cut);
             }
-            parts.push(part);
-            first_overlaps.push(first_overlap);
+            parts.push(PathPart {
+                ids: part,
+                first_overlap,
+                starts_record: parts.len() == first_part,
+            });
         }
     }
     info!("Reconstructing {} parts in parallel", compact(parts.len()));
-    let strings: Vec<Vec<u8>> = parts
+    let mut strings: Vec<OutputPart> = parts
         .into_par_iter()
-        .zip(first_overlaps)
         .with_max_len(1)
-        .map(|(part, first_overlap)| {
+        .map(|part| {
             let mut string = Vec::new();
-            for (position, id) in part.into_iter().enumerate() {
+            for (position, id) in part.ids.into_iter().enumerate() {
                 let overlap = if position == 0 {
-                    first_overlap
+                    part.first_overlap
                 } else {
                     links[head_slot(id)].overlap
                 };
@@ -1095,24 +1101,30 @@ fn reconstruct_output<K: MssKey>(
                     mask,
                 );
             }
-            string
+            OutputPart {
+                sequence: string,
+                starts_record: part.starts_record,
+            }
         })
         .collect();
-    info!("Concatenating strings..");
-    let mut output = Vec::with_capacity(strings.iter().map(Vec::len).sum());
-    for string in strings {
-        output.extend_from_slice(&string);
-    }
-    // FIXME: These should be separate contigs, or we should insert padding characters.
     for range in &short {
         if !range.is_empty() {
-            append(&mut output, &seq, range, false, 0, k, mask);
+            let mut string = Vec::with_capacity(range.len());
+            append(&mut string, &seq, range, false, 0, k, mask);
+            strings.push(OutputPart {
+                sequence: string,
+                starts_record: true,
+            });
         }
     }
-    output
+    ReconstructedOutput {
+        records: strings.iter().filter(|part| part.starts_record).count(),
+        bases: strings.iter().map(|part| part.sequence.len()).sum(),
+        parts: strings,
+    }
 }
 
-/// Read unitigs and write one superstring in FASTA format.
+/// Read unitigs and write matched paths as separate FASTA records.
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
@@ -1124,7 +1136,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
     );
     let input_bases = ranges.iter().map(Range::len).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
-    let superstring = if k <= 32 {
+    let reconstructed = if k <= 32 {
         build_superstring::<u64>(k, seq, ranges, mask)
     } else {
         build_superstring::<u128>(k, seq, ranges, mask)
@@ -1133,24 +1145,33 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_msfa_output(input, "greedytigs"));
     let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
-    writeln!(
-        writer,
-        ">{}",
-        if mask {
-            "matchtigs-masked-superstring"
-        } else {
-            "matchtigs-superstring"
+    let mut written_records = 0usize;
+    for part in reconstructed.parts {
+        if part.starts_record {
+            if written_records > 0 {
+                writer.write_all(b"\n").unwrap();
+            }
+            written_records += 1;
+            writeln!(writer, ">matchtig_{written_records}").unwrap();
         }
+        writer.write_all(&part.sequence).unwrap();
+    }
+    if written_records > 0 {
+        writer.write_all(b"\n").unwrap();
+    }
+    drop(writer);
+    assert_eq!(written_records, reconstructed.records);
+    log_file_stats(
+        "Wrote",
+        &output,
+        Some((reconstructed.records, reconstructed.bases)),
     )
     .unwrap();
-    writer.write_all(&superstring).unwrap();
-    writer.write_all(b"\n").unwrap();
-    drop(writer);
-    log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
     info!(
-        "matchtigs: {}, output {} bases ({})",
+        "matchtigs: {}, output {} bases in {} records ({})",
         timing.finish(),
-        compact(superstring.len()),
+        compact(reconstructed.bases),
+        compact(reconstructed.records),
         output.display()
     );
     output

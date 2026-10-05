@@ -337,12 +337,13 @@ fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
         ),
     ] {
         eprintln!(
-            "{key_type} output: {:>12} masked superstring, {:>12} total bases",
-            1,
+            "{key_type} output: {:>12} masked matchtigs, {:>12} total bases",
             output.len(),
+            output.iter().map(Vec::len).sum::<usize>(),
         );
         let mut actual: Vec<_> = output
-            .windows(k)
+            .iter()
+            .flat_map(|record| record.windows(k))
             .filter(|window| window[k - 1].is_ascii_uppercase())
             .map(|window| {
                 let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();

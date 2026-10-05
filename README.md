@@ -72,7 +72,8 @@ pandedup matchtigs input.fa.zst -k 64 -j 6 -o output.msfa --mask
 ```
 
 `--mask` lowercases bases added at joins with less than `k-1` overlap. Without it,
-the output uses uppercase bases throughout.
+the output uses uppercase bases throughout. Each path or cycle is written as a
+separate FASTA record; unmatched ends are left open.
 
 ### Ambiguous bases
 Input sequences are _split_ on ambiguous IUPAC bases such as `N`, `Y`, and `R`.
