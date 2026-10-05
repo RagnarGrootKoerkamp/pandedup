@@ -22,11 +22,11 @@
 //! at the cost currently being matched are kept. A bridge of cost `c` gives
 //! an overlap of `k-1-c`; costs at least `k-1` have no overlap.
 //!
-//! After a link consumes its free ends, `remove_source` repairs distances only
-//! through the current layer. Tentative labels in later layers are checked
-//! when those layers are reached. The same traversal can connect several
-//! pairs at one cost, so it is rechecked after a link. Finally, remaining ends
-//! are paired with zero overlap and written as a masked superstring.
+//! After a link consumes its free ends, `remove_source` repairs every affected
+//! finite label, including tentative labels in later layers. The same
+//! traversal can connect several pairs at one cost, so it is rechecked after
+//! a link. Finally, remaining ends are paired with zero overlap and written
+//! as a masked superstring.
 
 use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTiming};
 use packed_seq::{PackedSeqVec, SeqVec};
@@ -312,7 +312,7 @@ fn traversal_weight(ranges: &[Range<usize>], node: u32, k: usize) -> usize {
     ranges[(node / 2) as usize].len() - (k - 1)
 }
 
-/// Settled distances through the current layer, plus tentative later labels.
+/// Settled distances through the current layer, plus valid tentative labels.
 struct DistanceField {
     /// Distance to each oriented head, excluding that unitig's traversal.
     distance: Vec<u8>,
@@ -340,12 +340,10 @@ impl DistanceField {
         field
     }
 
-    /// Validate tentative labels at `distance`, then relax exactly that layer.
-    /// All predecessors of a node at this distance have smaller labels.
+    /// Relax the nodes currently labeled with this distance.
     fn relax_at(
         &mut self,
         distance: usize,
-        links: &[Link],
         graph: &Graph,
         ranges: &[Range<usize>],
         k: usize,
@@ -357,15 +355,6 @@ impl DistanceField {
         for node in 0..self.distance.len() as u32 {
             if self.distance[node as usize] as usize != distance {
                 continue;
-            }
-            if distance > 0 {
-                let replacement =
-                    self.replacement_distance(node, links, graph, ranges, k, radius, visited);
-                debug_assert!(replacement as usize >= distance);
-                if replacement as usize != distance {
-                    self.distance[node as usize] = replacement;
-                    continue;
-                }
             }
             settled += 1;
             self.relax_from(node, distance, graph, ranges, k, radius, visited);
@@ -400,7 +389,8 @@ impl DistanceField {
         }
     }
 
-    /// Compute the distance to a node by iterating over its predecessors.
+    /// Find a replacement through a free tail or a predecessor in a reached
+    /// layer. Later tentative predecessors have not been expanded yet.
     fn replacement_distance(
         &self,
         node: u32,
@@ -409,6 +399,7 @@ impl DistanceField {
         ranges: &[Range<usize>],
         k: usize,
         radius: usize,
+        reached_layer: usize,
         visited: &mut u64,
     ) -> u8 {
         let predecessors = graph.incoming(node);
@@ -418,10 +409,10 @@ impl DistanceField {
             if links[tail_slot(predecessor)].is_empty() {
                 return 0;
             }
-            best = best.min(
-                self.distance[predecessor as usize] as usize
-                    + traversal_weight(ranges, predecessor, k),
-            );
+            let prior = self.distance[predecessor as usize] as usize;
+            if prior <= reached_layer {
+                best = best.min(prior + traversal_weight(ranges, predecessor, k));
+            }
         }
         if best == radius {
             UNREACHABLE
@@ -430,8 +421,8 @@ impl DistanceField {
         }
     }
 
-    /// Repair settled labels after deleting a source. Tentative later labels
-    /// may be stale; `relax_at` validates them when their layer is reached.
+    /// Repair all finite labels affected by deleting a source, including
+    /// tentative labels for later layers.
     fn remove_source(
         &mut self,
         source: u32,
@@ -440,7 +431,7 @@ impl DistanceField {
         ranges: &[Range<usize>],
         k: usize,
         radius: usize,
-        settled_limit: usize,
+        reached_layer: usize,
         visited: &mut u64,
     ) {
         debug_assert!(!links[tail_slot(source)].is_empty());
@@ -452,8 +443,16 @@ impl DistanceField {
             if self.distance[next as usize] != 0 {
                 continue;
             }
-            let replacement =
-                self.replacement_distance(next, links, graph, ranges, k, radius, visited);
+            let replacement = self.replacement_distance(
+                next,
+                links,
+                graph,
+                ranges,
+                k,
+                radius,
+                reached_layer,
+                visited,
+            );
             if replacement > 0 {
                 self.distance[next as usize] = replacement;
                 self.worklist.push((next, 0));
@@ -464,12 +463,20 @@ impl DistanceField {
             *visited += 1 + next_nodes.len() as u64;
             for &next in next_nodes {
                 let old_next = self.distance[next as usize];
-                if old_next as usize <= settled_limit
+                if old_next != UNREACHABLE
                     && old_distance as usize + traversal_weight(ranges, node, k)
                         == old_next as usize
                 {
-                    let new_next =
-                        self.replacement_distance(next, links, graph, ranges, k, radius, visited);
+                    let new_next = self.replacement_distance(
+                        next,
+                        links,
+                        graph,
+                        ranges,
+                        k,
+                        radius,
+                        reached_layer,
+                        visited,
+                    );
                     debug_assert!(new_next >= old_next);
                     if new_next > old_next {
                         self.distance[next as usize] = new_next;
@@ -642,15 +649,7 @@ fn match_ends(
         }
     }
     let mut field = DistanceField::new(&links, graph, &mut visits.build_distances);
-    let initial_frontier = field.relax_at(
-        0,
-        &links,
-        graph,
-        ranges,
-        k,
-        radius,
-        &mut visits.build_distances,
-    );
+    let initial_frontier = field.relax_at(0, graph, ranges, k, radius, &mut visits.build_distances);
     info!(
         "Half-distance 0: {} nodes settled",
         compact(initial_frontier)
@@ -689,7 +688,6 @@ fn match_ends(
         let frontier = if half_distance < radius {
             field.relax_at(
                 half_distance,
-                &links,
                 graph,
                 ranges,
                 k,
