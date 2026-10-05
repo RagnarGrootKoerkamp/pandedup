@@ -294,6 +294,8 @@ struct Link<I: MssIndex> {
     overlap: u8,
 }
 
+const OUTPUT_CHUNK_BASES: usize = 32 * 1024 * 1024;
+
 fn append_contig(
     output: &mut Vec<u8>,
     seq: &PackedSeqVec,
@@ -301,6 +303,7 @@ fn append_contig(
     reverse: bool,
     overlap: usize,
     k: usize,
+    has_previous: bool,
 ) {
     // FIXME: Use packed_seq utils for this somehow
     let mut bases = seq.slice(range.clone()).unpack();
@@ -310,8 +313,8 @@ fn append_contig(
             *base = complement_char(*base);
         }
     }
-    assert!(overlap < k && overlap <= bases.len() && overlap <= output.len());
-    if !output.is_empty() {
+    assert!(overlap < k && overlap <= bases.len());
+    if !output.is_empty() && overlap <= output.len() {
         let end = output.len();
         debug_assert!(
             output[end - overlap..]
@@ -319,8 +322,9 @@ fn append_contig(
                 .zip(&bases[..overlap])
                 .all(|(left, right)| left.to_ascii_uppercase() == *right)
         );
+    }
+    if has_previous {
         // The first k-1-overlap appended bases end the new crossing k-mers.
-        // Leave the existing output, including the cycle's first contig, intact.
         let mask_len = (k - 1 - overlap).min(bases.len() - overlap);
         for base in &mut bases[overlap..overlap + mask_len] {
             *base = base.to_ascii_lowercase();
@@ -335,44 +339,86 @@ fn reconstruct_cycles<I: MssIndex>(
     ranges: &[Range<usize>],
     short_ranges: &[Range<usize>],
     links: &[Links<I>],
-    capacity: usize,
-) -> Vec<u8> {
-    let mut output = Vec::with_capacity(capacity);
+    emit: &mut impl FnMut(&[u8]),
+) -> usize {
+    let mut steps =
+        Vec::<(Range<usize>, bool, usize)>::with_capacity(links.len() + short_ranges.len());
     let mut done = vec![false; links.len()];
     let mut num_cycles = 0;
     for start in 0..links.len() {
         if done[start] {
             continue;
         }
+        let cycle_start = steps.len();
         let mut id = I::from_parts(start, false);
         let mut overlap = 0;
         loop {
             let index = id.contig_index();
             assert!(!done[index], "cycle revisits contig {index} before closing");
             done[index] = true;
-            append_contig(&mut output, seq, &ranges[index], id.reverse(), overlap, k);
+            steps.push((ranges[index].clone(), id.reverse(), overlap));
             let link =
                 links[index].nbs[usize::from(!id.reverse())].expect("missing link at contig tail");
             let next = link.id;
             if next.contig_index() == start {
+                steps[cycle_start].2 = link.overlap as usize;
                 break;
             }
             id = next;
             overlap = link.overlap as usize;
         }
+        // Opening the cycle discards one overlap; discard the smallest.
+        let cycle = &mut steps[cycle_start..];
+        let cut = (0..cycle.len()).min_by_key(|&i| cycle[i].2).unwrap();
+        cycle.rotate_left(cut);
+        cycle[0].2 = 0;
         num_cycles += 1;
     }
     // Short contigs contain no input k-mers, but retain their sequences.
     for range in short_ranges {
         if !range.is_empty() {
-            append_contig(&mut output, seq, range, false, 0, k);
+            steps.push((range.clone(), false, 0));
+        }
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut chunk_bases = 0;
+    for (index, (range, _, overlap)) in steps.iter().enumerate() {
+        let added = range.len() - overlap;
+        if index > start && chunk_bases + added > OUTPUT_CHUNK_BASES {
+            chunks.push(start..index);
+            start = index;
+            chunk_bases = 0;
+        }
+        chunk_bases += added;
+    }
+    if start < steps.len() {
+        chunks.push(start..steps.len());
+    }
+    info!("Reconstructing {} chunks in parallel", chunks.len());
+    let mut output_len = 0;
+    for batch in chunks.chunks(rayon::current_num_threads()) {
+        let strings: Vec<_> = batch
+            .par_iter()
+            .map(|chunk| {
+                let mut output = Vec::new();
+                for index in chunk.clone() {
+                    let (range, reverse, overlap) = &steps[index];
+                    append_contig(&mut output, seq, range, *reverse, *overlap, k, index > 0);
+                }
+                output
+            })
+            .collect();
+        for string in strings {
+            output_len += string.len();
+            emit(&string);
         }
     }
     info!(
         "Number of cycles: {num_cycles}; output length: {}",
-        output.len()
+        output_len
     );
-    output
+    output_len
 }
 
 /// Input: unitigs, simplitigs=pathtigs, eulertigs (or (greedy) matchtigs).
@@ -391,6 +437,21 @@ where
     HeadOrTail<K, u32>: Radixable<K, Key = K>,
     HeadOrTail<K, u64>: Radixable<K, Key = K>,
 {
+    let mut output = Vec::new();
+    process_superstring::<K>(k, seq, ranges, &mut |chunk| output.extend_from_slice(chunk));
+    output
+}
+
+fn process_superstring<K: MssKey>(
+    k: usize,
+    seq: PackedSeqVec,
+    ranges: Vec<Range<usize>>,
+    emit: &mut impl FnMut(&[u8]),
+) -> usize
+where
+    HeadOrTail<K, u32>: Radixable<K, Key = K>,
+    HeadOrTail<K, u64>: Radixable<K, Key = K>,
+{
     info!("masked_superstring: k={}, contigs={}", k, ranges.len());
     assert!(k > 0 && k <= K::BITS / 2);
     let total_len = ranges.iter().map(|c| c.len()).sum::<usize>();
@@ -398,9 +459,9 @@ where
     // the input contains contigs shorter than k.
     let (ranges, short_ranges): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|c| c.len() >= k);
     if ranges.len() < (1usize << 31) {
-        masked_superstring_with_index::<K, u32>(k, seq, ranges, short_ranges, total_len)
+        masked_superstring_with_index::<K, u32>(k, seq, ranges, short_ranges, total_len, emit)
     } else {
-        masked_superstring_with_index::<K, u64>(k, seq, ranges, short_ranges, total_len)
+        masked_superstring_with_index::<K, u64>(k, seq, ranges, short_ranges, total_len, emit)
     }
 }
 
@@ -417,27 +478,31 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, threads: Option<usize>
     let input_bases = ranges.iter().map(|range| range.len()).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
 
-    let superstring = pool.install(|| {
-        if k <= 32 {
-            masked_superstring::<u64>(k, seq, ranges)
-        } else {
-            masked_superstring::<u128>(k, seq, ranges)
-        }
-    });
     let output = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_msfa_output(input, "mss"));
-    let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
-    writeln!(writer, ">masked-superstring").unwrap();
-    writer.write_all(&superstring).unwrap();
-    writer.write_all(b"\n").unwrap();
-    drop(writer);
-    log_file_stats("Wrote", &output, Some((1, superstring.len()))).unwrap();
+    let output_bases = pool.install(|| {
+        let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
+        writeln!(writer, ">masked-superstring").unwrap();
+        let bases = if k <= 32 {
+            process_superstring::<u64>(k, seq, ranges, &mut |chunk| {
+                writer.write_all(chunk).unwrap()
+            })
+        } else {
+            process_superstring::<u128>(k, seq, ranges, &mut |chunk| {
+                writer.write_all(chunk).unwrap()
+            })
+        };
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+        bases
+    });
+    log_file_stats("Wrote", &output, Some((1, output_bases))).unwrap();
     info!(
         "mss: {}, input {} bytes, output {} bases, {} bytes ({})",
         timing.finish(),
         std::fs::metadata(input).unwrap().len(),
-        superstring.len(),
+        output_bases,
         std::fs::metadata(&output).unwrap().len(),
         output.display()
     );
@@ -450,7 +515,8 @@ fn masked_superstring_with_index<K: MssKey, I: MssIndex>(
     ranges: Vec<Range<usize>>,
     short_ranges: Vec<Range<usize>>,
     mut total_len: usize,
-) -> Vec<u8>
+    emit: &mut impl FnMut(&[u8]),
+) -> usize
 where
     HeadOrTail<K, I>: Radixable<K, Key = K>,
 {
@@ -732,5 +798,5 @@ where
     assert_eq!(total_merged, links.len());
 
     info!("Reconstructing cycles..");
-    reconstruct_cycles(k, &seq, &ranges, &short_ranges, &links, total_len)
+    reconstruct_cycles(k, &seq, &ranges, &short_ranges, &links, emit)
 }

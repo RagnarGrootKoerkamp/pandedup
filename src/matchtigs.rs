@@ -34,7 +34,7 @@ use crate::{default_msfa_output, log_file_stats, mss::MssKey, timing::StageTimin
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use std::fmt::{self, Display, Formatter};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1031,18 +1031,16 @@ const _: () = assert!(std::mem::size_of::<PathStep>() == 5);
 struct PathPart {
     steps: Vec<PathStep>,
     starts_record: bool,
-}
-
-struct OutputPart {
-    sequence: Vec<u8>,
-    starts_record: bool,
-}
-
-struct ReconstructedOutput {
-    parts: Vec<OutputPart>,
-    records: usize,
     bases: usize,
 }
+
+struct PlannedOutput {
+    seq: PackedSeqVec,
+    ranges: RangeStarts,
+    parts: Vec<PathPart>,
+}
+
+const PART_BASES: usize = 32 * 1024 * 1024;
 
 /// Build masked matchtig records from unitigs. Newly created crossing k-mers
 /// are lowercase, as in `mss::masked_superstring`.
@@ -1054,27 +1052,35 @@ pub fn masked_superstring<K: MssKey>(
 where
     End<K>: Radixable<K, Key = K>,
 {
-    let output = build_superstring::<K>(k, seq, ranges, true);
-    let mut records = Vec::with_capacity(output.records);
-    for part in output.parts {
+    let planned = plan_superstring::<K>(k, seq, ranges);
+    let strings: Vec<_> = planned
+        .parts
+        .par_iter()
+        .map(|part| {
+            let mut string = Vec::with_capacity(part.bases);
+            append_part(&mut string, part, &planned.seq, &planned.ranges, k, true);
+            string
+        })
+        .collect();
+    let mut records = Vec::new();
+    for (part, string) in planned.parts.into_iter().zip(strings) {
         if part.starts_record {
-            records.push(part.sequence);
+            records.push(string);
         } else {
             records
                 .last_mut()
                 .expect("continuation without a record")
-                .extend_from_slice(&part.sequence);
+                .extend_from_slice(&string);
         }
     }
     records
 }
 
-fn build_superstring<K: MssKey>(
+fn plan_superstring<K: MssKey>(
     k: usize,
     seq: PackedSeqVec,
     ranges: Vec<Range<usize>>,
-    mask: bool,
-) -> ReconstructedOutput
+) -> PlannedOutput
 where
     End<K>: Radixable<K, Key = K>,
 {
@@ -1093,28 +1099,21 @@ where
     drop(graph);
 
     StageTiming::start().finish();
-    let output = reconstruct_output::<K>(k, seq, ranges, links, mask);
+    let parts = plan_paths(&ranges, links);
     StageTiming::start().finish();
     info!(
-        "Length summary: {} estimated bases after links, {} output bases in {} records",
+        "Length summary: {} estimated bases after links, {} planned bases in {} records",
         compact(estimated_bases),
-        compact(output.bases),
-        compact(output.records),
+        compact(parts.iter().map(|part| part.bases).sum::<usize>()),
+        compact(parts.iter().filter(|part| part.starts_record).count()),
     );
-    output
+    PlannedOutput { seq, ranges, parts }
 }
 
-fn reconstruct_output<K: MssKey>(
-    k: usize,
-    seq: packed_seq::private::PackedSeqVecBase<2>,
-    ranges: RangeStarts,
-    links: Vec<Link>,
-    mask: bool,
-) -> ReconstructedOutput {
-    info!("Reconstruct output");
+fn plan_paths(ranges: &RangeStarts, links: Vec<Link>) -> Vec<PathPart> {
+    info!("Plan output paths");
     let mut done = vec![false; ranges.len()];
     // make output seqs of length at most 32Mbp, to keep threads busy.
-    const PART_BASES: usize = 32 * 1024 * 1024;
     let mut parts = Vec::<PathPart>::new();
     // Start open paths at their free head, oriented away from it.
     // Remaining components have no free endpoint and are cycles.
@@ -1153,6 +1152,7 @@ fn reconstruct_output<K: MssKey>(
                     parts.push(PathPart {
                         steps: std::mem::take(&mut part),
                         starts_record: parts.len() == first_part,
+                        bases: part_bases,
                     });
                     part_bases = 0;
                 }
@@ -1172,47 +1172,46 @@ fn reconstruct_output<K: MssKey>(
                 let cut = (0..part.len()).min_by_key(|&i| part[i].overlap).unwrap();
                 part.rotate_left(cut);
                 part[0].overlap = 0;
+                part_bases = part
+                    .iter()
+                    .map(|step| ranges.range_len((step.id / 2) as usize) - step.overlap as usize)
+                    .sum();
             }
             parts.push(PathPart {
                 steps: part,
                 starts_record: parts.len() == first_part,
+                bases: part_bases,
             });
         }
     }
     drop(done);
     info!("Dropping links");
     drop(links);
-    info!("Reconstructing {} parts in parallel", compact(parts.len()));
-    StageTiming::start().finish();
-    let strings: Vec<OutputPart> = parts
-        .into_par_iter()
-        .with_max_len(1)
-        .map(|part| {
-            let mut string = Vec::new();
-            for step in part.steps {
-                let range = ranges.range((step.id / 2) as usize);
-                append(
-                    &mut string,
-                    &seq,
-                    &range,
-                    step.id & 1 != 0,
-                    step.overlap as usize,
-                    k,
-                    mask,
-                );
-            }
-            OutputPart {
-                sequence: string,
-                starts_record: part.starts_record,
-            }
-        })
-        .collect();
-    StageTiming::start().finish();
-    ReconstructedOutput {
-        records: strings.iter().filter(|part| part.starts_record).count(),
-        bases: strings.iter().map(|part| part.sequence.len()).sum(),
-        parts: strings,
+    parts
+}
+
+fn append_part(
+    output: &mut Vec<u8>,
+    part: &PathPart,
+    seq: &PackedSeqVec,
+    ranges: &RangeStarts,
+    k: usize,
+    mask: bool,
+) {
+    let start = output.len();
+    for step in &part.steps {
+        let range = ranges.range((step.id / 2) as usize);
+        append(
+            output,
+            seq,
+            &range,
+            step.id & 1 != 0,
+            step.overlap as usize,
+            k,
+            mask,
+        );
     }
+    debug_assert_eq!(output.len() - start, part.bases);
 }
 
 /// Read unitigs and write matched paths as separate FASTA records.
@@ -1227,43 +1226,81 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
     );
     let input_bases = ranges.iter().map(Range::len).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
-    let reconstructed = if k <= 32 {
-        build_superstring::<u64>(k, seq, ranges, mask)
+    let planned = if k <= 32 {
+        plan_superstring::<u64>(k, seq, ranges)
     } else {
-        build_superstring::<u128>(k, seq, ranges, mask)
+        plan_superstring::<u128>(k, seq, ranges)
     };
     let output = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_msfa_output(input, "greedytigs"));
-    let mut writer = BufWriter::new(std::fs::File::create(&output).unwrap());
-    let mut written_records = 0usize;
-    for part in reconstructed.parts {
-        if part.starts_record {
-            if written_records > 0 {
-                writer.write_all(b"\n").unwrap();
-            }
-            written_records += 1;
-            writeln!(writer, ">").unwrap();
-        }
-        writer.write_all(&part.sequence).unwrap();
-    }
-    if written_records > 0 {
-        writer.write_all(b"\n").unwrap();
-    }
-    drop(writer);
-    assert_eq!(written_records, reconstructed.records);
-    log_file_stats(
-        "Wrote",
-        &output,
-        Some((reconstructed.records, reconstructed.bases)),
-    )
-    .unwrap();
+    let file = Mutex::new(std::fs::File::create(&output).unwrap());
+    let written_records = planned
+        .parts
+        .iter()
+        .filter(|part| part.starts_record)
+        .count();
+    let written_bases = planned.parts.iter().map(|part| part.bases).sum::<usize>();
+    planned
+        .parts
+        .par_iter()
+        .for_each_with(Vec::new(), |buffer, part| {
+            buffer.clear();
+            buffer.extend_from_slice(b">\n");
+            append_part(buffer, part, &planned.seq, &planned.ranges, k, mask);
+            buffer.push(b'\n');
+            file.lock().unwrap().write_all(buffer).unwrap();
+        });
+    log_file_stats("Wrote", &output, Some((written_records, written_bases))).unwrap();
     info!(
         "matchtigs: {}, output {} bases in {} records ({})",
         timing.finish(),
-        compact(reconstructed.bases),
-        compact(reconstructed.records),
+        compact(written_bases),
+        compact(written_records),
         output.display()
     );
     output
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn run_writes_masked_fasta_records() {
+        let input = std::env::temp_dir().join(format!(
+            "pandedup-matchtigs-{}-{}.fa",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = input.with_extension("msfa");
+        let unitigs: [&[u8]; 3] = [b"ACGTAC", b"TACGGA", b"TTCCAA"];
+        let mut seq = PackedSeqVec::default();
+        let mut ranges = Vec::new();
+        let mut input_fasta = Vec::new();
+        for unitig in unitigs {
+            input_fasta.extend_from_slice(b">\n");
+            input_fasta.extend_from_slice(unitig);
+            input_fasta.push(b'\n');
+            ranges.push(seq.push_ascii(unitig));
+        }
+        std::fs::write(&input, input_fasta).unwrap();
+        let mut expected_records = masked_superstring::<u64>(3, seq, ranges);
+        run(&input, Some(&output), 3, true);
+        let mut reader =
+            needletail::parse_fastx_reader(std::io::Cursor::new(std::fs::read(&output).unwrap()))
+                .unwrap();
+        let mut actual_records = Vec::new();
+        while let Some(record) = reader.next() {
+            actual_records.push(record.unwrap().seq().into_owned());
+        }
+        expected_records.sort();
+        actual_records.sort();
+        assert_eq!(actual_records, expected_records);
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
+    }
 }
