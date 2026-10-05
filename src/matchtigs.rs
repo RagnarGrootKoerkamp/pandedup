@@ -171,6 +171,7 @@ impl Radixable<u64> for Edge {
 /// is the oriented unitig entered at its head; its low bit is the orientation.
 struct Graph {
     edges: Vec<u32>,
+    // TODO: This could be compressed
     offsets: Vec<u32>,
 }
 
@@ -182,6 +183,26 @@ impl Graph {
     /// Incoming neighbors, recovered from reverse-complement graph edges.
     fn incoming(&self, id: u32) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.outgoing(id ^ 1).iter().map(|&reverse| reverse ^ 1)
+    }
+}
+
+fn group_start<K: MssKey>(ends: &[End<K>], mut end: usize, key: K) -> usize {
+    while end > 0 {
+        let previous = ends[end - 1].kmer;
+        if previous != key {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
+fn truncate_consumed<K>(ends: &mut Vec<End<K>>, remaining: usize) {
+    const BLOCK: usize = 1 << 20;
+    let keep = remaining.next_multiple_of(BLOCK);
+    if keep < ends.len() {
+        ends.truncate(keep);
+        ends.shrink_to_fit();
     }
 }
 
@@ -250,32 +271,18 @@ where
 
     info!("Matching unitig ends");
     let mut pairs = Vec::new();
-    let (mut h, mut t) = (0, 0);
-    while h < heads.len() && t < tails.len() {
-        let head_key = heads[h].kmer;
-        let tail_key = tails[t].kmer;
+    let (mut h, mut t) = (heads.len(), tails.len());
+    while h > 0 && t > 0 {
+        let head_key = heads[h - 1].kmer;
+        let tail_key = tails[t - 1].kmer;
         match head_key.cmp(&tail_key) {
-            std::cmp::Ordering::Less => h += 1,
-            std::cmp::Ordering::Greater => t += 1,
+            std::cmp::Ordering::Less => t = group_start(&tails, t, tail_key),
+            std::cmp::Ordering::Greater => h = group_start(&heads, h, head_key),
             std::cmp::Ordering::Equal => {
-                let mut he = h;
-                let mut te = t;
-                while he < heads.len() {
-                    let next = heads[he].kmer;
-                    if next != head_key {
-                        break;
-                    }
-                    he += 1;
-                }
-                while te < tails.len() {
-                    let next = tails[te].kmer;
-                    if next != tail_key {
-                        break;
-                    }
-                    te += 1;
-                }
-                for tail in &tails[t..te] {
-                    for head in &heads[h..he] {
+                let start_h = group_start(&heads, h, head_key);
+                let start_t = group_start(&tails, t, tail_key);
+                for tail in &tails[start_t..t] {
+                    for head in &heads[start_h..h] {
                         if tail.id == (head.id ^ 1) {
                             continue;
                         }
@@ -289,10 +296,12 @@ where
                         });
                     }
                 }
-                h = he;
-                t = te;
+                h = start_h;
+                t = start_t;
             }
         }
+        truncate_consumed(&mut heads, h);
+        truncate_consumed(&mut tails, t);
     }
     drop(heads);
     drop(tails);
@@ -1171,6 +1180,7 @@ fn reconstruct_output<K: MssKey>(
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
+    // TODO: Compress ranges into just startpoints?
     let (seq, ranges) = PackedSeqVec::from_fastx(input);
     info!("Seq: {} GB", compact(seq.len() / 4));
     info!(
