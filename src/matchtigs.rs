@@ -16,10 +16,10 @@
 //! distance[v] + traversal cost of v + distance[v^1].
 //!
 //! Distances are grown one layer at a time, up to `k/2`. At half-distance `d`,
-//! scan the nodes at distance `d` and relax their outgoing edges. Then scan
-//! one orientation per unitig for bridges of total cost `2d-1` and `2d`;
-//! reversing a path gives the same physical link. Only bridges at those two
-//! costs are kept. A bridge of cost `c` gives
+//! scan the nodes at distance `d` and relax their outgoing edges. When both
+//! orientations of a unitig have reached labels, queue its bridge by total
+//! cost. Buckets at costs `2d-1` and `2d` are then matched; earlier bridges
+//! wait in those buckets. A bridge of cost `c` gives
 //! an overlap of `k-1-c`; costs at least `k-1` have no overlap.
 //!
 //! After a link consumes its free ends, `remove_source` repairs every affected
@@ -35,7 +35,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
@@ -349,7 +349,10 @@ impl DistanceField {
         ranges: &[Range<usize>],
         k: usize,
         radius: usize,
+        bridges: &mut BridgeQueue,
+        first_unprocessed_cost: usize,
         visited: &mut u64,
+        meet_visited: &mut u64,
     ) -> usize {
         let mut settled = 0;
         *visited += self.distance.len() as u64;
@@ -359,6 +362,15 @@ impl DistanceField {
             }
             settled += 1;
             self.relax_from(node, distance, graph, ranges, k, radius, visited);
+            bridges.schedule(
+                node & !1,
+                self,
+                ranges,
+                k,
+                distance,
+                first_unprocessed_cost,
+                meet_visited,
+            );
         }
         settled
     }
@@ -433,7 +445,10 @@ impl DistanceField {
         k: usize,
         radius: usize,
         reached_layer: usize,
+        first_unprocessed_cost: usize,
+        bridges: &mut BridgeQueue,
         visited: &mut u64,
+        meet_visited: &mut u64,
     ) {
         debug_assert!(!links[tail_slot(source)].is_empty());
         self.worklist.clear();
@@ -456,6 +471,15 @@ impl DistanceField {
             );
             if replacement > 0 {
                 self.distance[next as usize] = replacement;
+                bridges.schedule(
+                    next & !1,
+                    self,
+                    ranges,
+                    k,
+                    reached_layer,
+                    first_unprocessed_cost,
+                    meet_visited,
+                );
                 self.worklist.push((next, 0));
             }
         }
@@ -481,6 +505,15 @@ impl DistanceField {
                     debug_assert!(new_next >= old_next);
                     if new_next > old_next {
                         self.distance[next as usize] = new_next;
+                        bridges.schedule(
+                            next & !1,
+                            self,
+                            ranges,
+                            k,
+                            reached_layer,
+                            first_unprocessed_cost,
+                            meet_visited,
+                        );
                         self.worklist.push((next, old_next));
                     }
                 }
@@ -576,6 +609,67 @@ fn bridge_candidate(
         .then(|| forward as usize + traversal_weight(ranges, node, k) + backward as usize)
 }
 
+/// One pending bridge per physical unitig. A bridge is queued only after both
+/// head labels have reached a layer, so later relaxation cannot lower its cost.
+struct BridgeQueue {
+    buckets: Vec<Vec<u32>>,
+    queued: Vec<u64>,
+}
+
+impl BridgeQueue {
+    fn new(k: usize, unitigs: usize) -> Self {
+        Self {
+            buckets: vec![Vec::new(); k],
+            queued: vec![0; unitigs.div_ceil(64)],
+        }
+    }
+
+    fn schedule(
+        &mut self,
+        node: u32,
+        field: &DistanceField,
+        ranges: &[Range<usize>],
+        k: usize,
+        reached_layer: usize,
+        first_unprocessed_cost: usize,
+        visited: &mut u64,
+    ) {
+        debug_assert_eq!(node & 1, 0);
+        let unitig = (node / 2) as usize;
+        let mask = 1u64 << (unitig % 64);
+        if self.queued[unitig / 64] & mask != 0 {
+            return;
+        }
+        let cost = bridge_candidate(node, field, ranges, k, reached_layer, visited);
+        self.schedule_known(node, cost, k, first_unprocessed_cost);
+    }
+
+    fn schedule_known(
+        &mut self,
+        node: u32,
+        cost: Option<usize>,
+        k: usize,
+        first_unprocessed_cost: usize,
+    ) {
+        let Some(cost) = cost else { return };
+        if cost < first_unprocessed_cost || cost >= k - 1 {
+            return;
+        }
+        let unitig = (node / 2) as usize;
+        let mask = 1u64 << (unitig % 64);
+        debug_assert_eq!(self.queued[unitig / 64] & mask, 0);
+        self.buckets[cost].push(node);
+        self.queued[unitig / 64] |= mask;
+    }
+
+    fn pop(&mut self, cost: usize) -> Option<u32> {
+        let node = self.buckets[cost].pop()?;
+        let unitig = (node / 2) as usize;
+        self.queued[unitig / 64] &= !(1u64 << (unitig % 64));
+        Some(node)
+    }
+}
+
 /// Greedy distance-ordered matching through central unitig traversals.
 fn match_ends(
     k: usize,
@@ -609,7 +703,7 @@ fn match_ends(
         compact(initial_bases),
     );
     info!(
-        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; build_distances scans and relaxes distance layers; meet scans unitig traversals and traces endpoints; connect touches link slots; remove_source repairs settled distances"
+        "Node visits count repeated inspections: direct_overlap scans graph neighbors at distance zero; build_distances scans and relaxes distance layers; meet checks and queues bridges and traces endpoints; connect touches link slots; remove_source repairs distance labels"
     );
 
     // An edge in the unitig graph is a direct (k-1)-character overlap. Match
@@ -644,7 +738,18 @@ fn match_ends(
         }
     }
     let mut field = DistanceField::new(&links, graph, &mut visits.build_distances);
-    let initial_frontier = field.relax_at(0, graph, ranges, k, radius, &mut visits.build_distances);
+    let mut bridges = BridgeQueue::new(k, ranges.len());
+    let initial_frontier = field.relax_at(
+        0,
+        graph,
+        ranges,
+        k,
+        radius,
+        &mut bridges,
+        1,
+        &mut visits.build_distances,
+        &mut visits.meet,
+    );
     info!(
         "Half-distance 0: {} nodes settled",
         compact(initial_frontier)
@@ -664,17 +769,16 @@ fn match_ends(
         compact(visits.direct_overlap),
         compact(visits.direct_overlap),
         compact(visits.build_distances),
-        compact(0u64),
-        compact(0u64),
+        compact(visits.meet),
+        compact(visits.meet),
         compact(visits.connect),
         compact(visits.connect),
         compact(visits.remove_source),
         compact(visits.remove_source),
     );
 
-    // Scan unitigs once per layer and retain candidates for its two costs.
-    // Later bridges are rediscovered by the next layer's scan.
-    let mut candidates = [Vec::<u32>::new(), Vec::<u32>::new()];
+    // Reached nodes schedule bridges once both sides are known. Process the
+    // cost buckets in increasing order, rechecking entries after links.
     for half_distance in 1..=radius {
         if free_ends == 0 {
             break;
@@ -687,7 +791,10 @@ fn match_ends(
                 ranges,
                 k,
                 radius,
+                &mut bridges,
+                2 * half_distance - 1,
                 &mut visits.build_distances,
+                &mut visits.meet,
             )
         } else {
             0
@@ -697,33 +804,19 @@ fn match_ends(
             compact(half_distance),
             compact(frontier),
         );
-        let distances = [2 * half_distance - 1, 2 * half_distance];
-        for bucket in &mut candidates {
-            bucket.clear();
-        }
-        for unitig in 0..ranges.len() {
-            let node = (unitig as u32) * 2;
-            match bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet) {
-                Some(cost) if cost == distances[0] => candidates[0].push(node),
-                Some(cost) if cost == distances[1] && cost < k - 1 => candidates[1].push(node),
-                _ => {}
-            }
-        }
-        for (bucket, distance) in distances.into_iter().enumerate() {
+        for distance in [2 * half_distance - 1, 2 * half_distance] {
             if distance >= k - 1 || free_ends == 0 {
                 break;
             }
-            let found = candidates[bucket].len();
+            let found = bridges.buckets[distance].len();
             let mut examined = 0usize;
             let mut made = 0usize;
-            while let Some(node) = candidates[bucket].pop() {
+            while let Some(node) = bridges.pop(distance) {
                 examined += 1;
                 let cost =
                     bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet);
                 if cost != Some(distance) {
-                    if bucket == 0 && cost == Some(distances[1]) && distances[1] < k - 1 {
-                        candidates[1].push(node);
-                    }
+                    bridges.schedule_known(node, cost, k, distance);
                     continue;
                 }
                 let source = field.source(node, &links, graph, ranges, k, &mut visits.meet);
@@ -748,7 +841,10 @@ fn match_ends(
                     k,
                     radius,
                     half_distance,
+                    distance,
+                    &mut bridges,
                     &mut visits.remove_source,
+                    &mut visits.meet,
                 );
                 if source != target ^ 1 {
                     field.remove_source(
@@ -759,20 +855,26 @@ fn match_ends(
                         k,
                         radius,
                         half_distance,
+                        distance,
+                        &mut bridges,
                         &mut visits.remove_source,
+                        &mut visits.meet,
                     );
                 }
-                // Another pair may still meet through this traversal.
-                let cost =
-                    bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet);
-                if cost == Some(distance) {
-                    candidates[bucket].push(node);
-                } else if bucket == 0 && cost == Some(distances[1]) && distances[1] < k - 1 {
-                    candidates[1].push(node);
-                }
+                // This traversal may connect another pair at the same or a
+                // later cost after its sources have been removed.
+                bridges.schedule(
+                    node,
+                    &field,
+                    ranges,
+                    k,
+                    half_distance,
+                    distance,
+                    &mut visits.meet,
+                );
             }
             info!(
-                "After distance {}: {} bridges found, {} entries examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
+                "After distance {}: {} bridge entries queued, {} entries examined, {} links made, {} receiving ends remain, {} free ends, {} estimated bases",
                 compact(distance),
                 compact(found),
                 compact(examined),
@@ -978,6 +1080,7 @@ fn reconstruct_output<K: MssKey>(
         .zip(first_overlaps)
         .with_max_len(1)
         .map(|(part, first_overlap)| {
+            let len = part.len();
             let mut string = Vec::new();
             for (position, id) in part.into_iter().enumerate() {
                 let overlap = if position == 0 {
@@ -994,10 +1097,13 @@ fn reconstruct_output<K: MssKey>(
                     k,
                 );
             }
+            if string.len() > 10000 {
+                let t = std::thread::current().id();
+                debug!("{t:?} unitigs {:>6} len {:>8}", len, string.len());
+            }
             string
         })
         .collect();
-    // FIXME: These should be separate contigs, or we should insert padding characters.
     info!("Concatenating strings..");
     let mut output = Vec::with_capacity(strings.iter().map(Vec::len).sum());
     for string in strings {
