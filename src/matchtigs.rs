@@ -186,6 +186,43 @@ impl Graph {
     }
 }
 
+struct RangeStarts {
+    starts: Vec<usize>,
+}
+
+impl RangeStarts {
+    fn new(ranges: Vec<Range<usize>>) -> Self {
+        let mut starts = Vec::with_capacity(ranges.len() + 1);
+        starts.push(ranges.first().map_or(0, |range| range.start));
+        for range in ranges {
+            assert!(range.start <= range.end, "invalid range");
+            assert_eq!(
+                starts.last().copied(),
+                Some(range.start),
+                "ranges are not adjacent"
+            );
+            starts.push(range.end);
+        }
+        Self { starts }
+    }
+
+    fn len(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    fn range(&self, index: usize) -> Range<usize> {
+        self.starts[index]..self.starts[index + 1]
+    }
+
+    fn range_len(&self, index: usize) -> usize {
+        self.starts[index + 1] - self.starts[index]
+    }
+
+    fn total_bases(&self) -> usize {
+        self.starts[self.len()] - self.starts[0]
+    }
+}
+
 fn group_start<K: MssKey>(ends: &[End<K>], mut end: usize, key: K) -> usize {
     while end > 0 {
         let previous = ends[end - 1].kmer;
@@ -206,7 +243,7 @@ fn truncate_consumed<K>(ends: &mut Vec<End<K>>, remaining: usize) {
     }
 }
 
-fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &[Range<usize>]) -> Graph
+fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &RangeStarts) -> Graph
 where
     End<K>: Radixable<K, Key = K>,
 {
@@ -218,14 +255,18 @@ where
 
     info!("Building graph of {} unitigs..", compact(ranges.len()));
     const CHUNK_SIZE: usize = 1 << 16;
-    ranges
-        .par_chunks(CHUNK_SIZE)
-        .enumerate()
-        .for_each(|(chunk_index, chunk)| {
+    (0..ranges.len())
+        .into_par_iter()
+        .chunks(CHUNK_SIZE)
+        .for_each(|chunk| {
             let mut local_heads = Vec::with_capacity(chunk.len());
             let mut local_tails = Vec::with_capacity(chunk.len());
-            for (offset, range) in chunk.iter().enumerate() {
-                let id = ((chunk_index * CHUNK_SIZE + offset) as u32) * 2;
+            for index in chunk {
+                let range = ranges.range(index);
+                if range.len() < k {
+                    continue;
+                }
+                let id = (index as u32) * 2;
                 let (head, tail, rc_head, rc_tail): (K, K, K, K) = (
                     K::read_kmer(seq, overlap, range.start),
                     K::read_kmer(seq, overlap, range.end - overlap),
@@ -356,8 +397,8 @@ impl Link {
 const UNREACHABLE: u8 = u8::MAX;
 
 /// The cost of crossing unitig `node`.
-fn traversal_weight(ranges: &[Range<usize>], node: u32, k: usize) -> usize {
-    ranges[(node / 2) as usize].len() - (k - 1)
+fn traversal_weight(ranges: &RangeStarts, node: u32, k: usize) -> usize {
+    ranges.range_len((node / 2) as usize) - (k - 1)
 }
 
 /// Settled distances through the current layer, plus valid tentative labels.
@@ -393,7 +434,7 @@ impl DistanceField {
         &mut self,
         distance: usize,
         graph: &Graph,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         radius: usize,
         bridges: &mut BridgeQueue,
@@ -427,7 +468,7 @@ impl DistanceField {
         node: u32,
         distance: usize,
         graph: &Graph,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         radius: usize,
         visited: &mut u64,
@@ -456,7 +497,7 @@ impl DistanceField {
         node: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         radius: usize,
         reached_layer: usize,
@@ -488,7 +529,7 @@ impl DistanceField {
         source: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         radius: usize,
         reached_layer: usize,
@@ -575,7 +616,7 @@ impl DistanceField {
         mut node: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         visited: &mut u64,
     ) -> u32 {
@@ -644,7 +685,7 @@ fn connect(
 fn bridge_candidate(
     node: u32,
     field: &DistanceField,
-    ranges: &[Range<usize>],
+    ranges: &RangeStarts,
     k: usize,
     settled_limit: usize,
     visited: &mut u64,
@@ -674,7 +715,7 @@ impl BridgeQueue {
         &mut self,
         node: u32,
         field: &DistanceField,
-        ranges: &[Range<usize>],
+        ranges: &RangeStarts,
         k: usize,
         reached_layer: usize,
         first_unprocessed_cost: usize,
@@ -708,7 +749,7 @@ impl BridgeQueue {
 /// Greedy distance-ordered matching through central unitig traversals.
 fn match_ends(
     k: usize,
-    ranges: &[Range<usize>],
+    ranges: &RangeStarts,
     graph: &Graph,
     initial_bases: usize,
 ) -> (Vec<Link>, usize) {
@@ -1038,9 +1079,13 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     assert!(k > 0 && k <= K::BITS / 2);
-    let initial_bases: usize = ranges.iter().map(Range::len).sum();
-    let (ranges, short): (Vec<_>, Vec<_>) = ranges.into_iter().partition(|r| r.len() >= k);
+    let ranges = RangeStarts::new(ranges);
+    let initial_bases = ranges.total_bases();
     assert!(ranges.len() <= (u32::MAX as usize / 2), "too many unitigs");
+    info!(
+        "Range starts: {} B",
+        compact(std::mem::size_of_val(ranges.starts.as_slice()))
+    );
     let graph = graph::<K>(k, &seq, &ranges);
 
     let (links, estimated_bases) = match_ends(k, &ranges, &graph, initial_bases);
@@ -1048,7 +1093,7 @@ where
     drop(graph);
 
     StageTiming::start().finish();
-    let output = reconstruct_output::<K>(k, seq, ranges, short, links, mask);
+    let output = reconstruct_output::<K>(k, seq, ranges, links, mask);
     StageTiming::start().finish();
     info!(
         "Length summary: {} estimated bases after links, {} output bases in {} records",
@@ -1062,8 +1107,7 @@ where
 fn reconstruct_output<K: MssKey>(
     k: usize,
     seq: packed_seq::private::PackedSeqVecBase<2>,
-    ranges: Vec<Range<usize>>,
-    short: Vec<Range<usize>>,
+    ranges: RangeStarts,
     links: Vec<Link>,
     mask: bool,
 ) -> ReconstructedOutput {
@@ -1077,6 +1121,10 @@ fn reconstruct_output<K: MssKey>(
     for pass in 0..2 {
         for start in 0..ranges.len() {
             if done[start] {
+                continue;
+            }
+            if ranges.range_len(start) == 0 {
+                done[start] = true;
                 continue;
             }
             let forward = (start as u32) * 2;
@@ -1098,7 +1146,7 @@ fn reconstruct_output<K: MssKey>(
                 let index = (id / 2) as usize;
                 assert!(!done[index], "link cycle revisits unitig before closing");
                 done[index] = true;
-                let added_bases = ranges[index].len() - overlap as usize;
+                let added_bases = ranges.range_len(index) - overlap as usize;
                 // Keep unitigs intact; an individual contribution may exceed
                 // the target part size.
                 if !part.is_empty() && part_bases + added_bases > PART_BASES {
@@ -1136,16 +1184,17 @@ fn reconstruct_output<K: MssKey>(
     drop(links);
     info!("Reconstructing {} parts in parallel", compact(parts.len()));
     StageTiming::start().finish();
-    let mut strings: Vec<OutputPart> = parts
+    let strings: Vec<OutputPart> = parts
         .into_par_iter()
         .with_max_len(1)
         .map(|part| {
             let mut string = Vec::new();
             for step in part.steps {
+                let range = ranges.range((step.id / 2) as usize);
                 append(
                     &mut string,
                     &seq,
-                    &ranges[(step.id / 2) as usize],
+                    &range,
                     step.id & 1 != 0,
                     step.overlap as usize,
                     k,
@@ -1159,16 +1208,6 @@ fn reconstruct_output<K: MssKey>(
         })
         .collect();
     StageTiming::start().finish();
-    for range in &short {
-        if !range.is_empty() {
-            let mut string = Vec::with_capacity(range.len());
-            append(&mut string, &seq, range, false, 0, k, mask);
-            strings.push(OutputPart {
-                sequence: string,
-                starts_record: true,
-            });
-        }
-    }
     ReconstructedOutput {
         records: strings.iter().filter(|part| part.starts_record).count(),
         bases: strings.iter().map(|part| part.sequence.len()).sum(),
@@ -1180,11 +1219,10 @@ fn reconstruct_output<K: MssKey>(
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
-    // TODO: Compress ranges into just startpoints?
     let (seq, ranges) = PackedSeqVec::from_fastx(input);
     info!("Seq: {} GB", compact(seq.len() / 4));
     info!(
-        "Ranges: {} GB",
+        "Input range pairs: {} B",
         compact(ranges.len() * std::mem::size_of::<Range<usize>>())
     );
     let input_bases = ranges.iter().map(Range::len).sum();
