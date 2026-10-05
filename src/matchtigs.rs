@@ -209,9 +209,15 @@ where
             id: id + 1,
         });
     }
-    info!("Sorting heads");
+    info!(
+        "Sorting heads ({} GB)",
+        compact(std::mem::size_of_val(heads.as_slice()))
+    );
     heads.voracious_mt_sort(rayon::current_num_threads());
-    info!("Sorting tails");
+    info!(
+        "Sorting tails ({} GB)",
+        compact(std::mem::size_of_val(tails.as_slice()))
+    );
     tails.voracious_mt_sort(rayon::current_num_threads());
 
     info!("Matching unitig ends");
@@ -1094,6 +1100,11 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
     let (seq, ranges) = PackedSeqVec::from_fastx(input);
+    info!("Seq: {} GB", compact(seq.len() / 4));
+    info!(
+        "Ranges: {} GB",
+        compact(ranges.len() * std::mem::size_of::<Range<usize>>())
+    );
     let input_bases = ranges.iter().map(Range::len).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
     let superstring = if k <= 32 {
