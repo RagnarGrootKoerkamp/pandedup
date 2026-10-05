@@ -18,8 +18,8 @@
 //! Distances are grown one layer at a time, up to `k/2`. At half-distance `d`,
 //! scan the nodes at distance `d` and relax their outgoing edges. Then scan
 //! one orientation per unitig for bridges of total cost `2d-1` and `2d`;
-//! reversing a path gives the same physical link. Only bridges
-//! at the cost currently being matched are kept. A bridge of cost `c` gives
+//! reversing a path gives the same physical link. Only bridges at those two
+//! costs are kept. A bridge of cost `c` gives
 //! an overlap of `k-1-c`; costs at least `k-1` have no overlap.
 //!
 //! After a link consumes its free ends, `remove_source` repairs every affected
@@ -559,26 +559,20 @@ fn connect(
     };
 }
 
-/// Check a bridge using only the distances to its two oriented heads.
+/// Read the cost of a bridge from the distances to its two oriented heads.
 fn bridge_candidate(
     node: u32,
     field: &DistanceField,
     ranges: &[Range<usize>],
     k: usize,
     settled_limit: usize,
-    target_distance: usize,
     visited: &mut u64,
-) -> bool {
+) -> Option<usize> {
     *visited += 1;
-    let weight = traversal_weight(ranges, node, k);
-    if weight > target_distance {
-        return false;
-    }
     let forward = field.distance[node as usize];
     let backward = field.distance[(node ^ 1) as usize];
-    forward as usize <= settled_limit
-        && backward as usize <= settled_limit
-        && forward as usize + weight + backward as usize == target_distance
+    (forward as usize <= settled_limit && backward as usize <= settled_limit)
+        .then(|| forward as usize + traversal_weight(ranges, node, k) + backward as usize)
 }
 
 /// Greedy distance-ordered matching through central unitig traversals.
@@ -677,9 +671,9 @@ fn match_ends(
         compact(visits.remove_source),
     );
 
-    // Scan the whole distance array once per layer. A candidate list exists
-    // only while processing its cost; later bridges are rediscovered by scans.
-    let mut candidates = Vec::<u32>::new();
+    // Scan unitigs once per layer and retain candidates for its two costs.
+    // Later bridges are rediscovered by the next layer's scan.
+    let mut candidates = [Vec::<u32>::new(), Vec::<u32>::new()];
     for half_distance in 1..=radius {
         if free_ends == 0 {
             break;
@@ -702,39 +696,33 @@ fn match_ends(
             compact(half_distance),
             compact(frontier),
         );
-        for distance in [2 * half_distance - 1, 2 * half_distance] {
+        let distances = [2 * half_distance - 1, 2 * half_distance];
+        for bucket in &mut candidates {
+            bucket.clear();
+        }
+        for unitig in 0..ranges.len() {
+            let node = (unitig as u32) * 2;
+            match bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet) {
+                Some(cost) if cost == distances[0] => candidates[0].push(node),
+                Some(cost) if cost == distances[1] && cost < k - 1 => candidates[1].push(node),
+                _ => {}
+            }
+        }
+        for (bucket, distance) in distances.into_iter().enumerate() {
             if distance >= k - 1 || free_ends == 0 {
                 break;
             }
-            candidates.clear();
-            for unitig in 0..ranges.len() {
-                let node = (unitig as u32) * 2;
-                if bridge_candidate(
-                    node,
-                    &field,
-                    ranges,
-                    k,
-                    half_distance,
-                    distance,
-                    &mut visits.meet,
-                ) {
-                    candidates.push(node);
-                }
-            }
-            let found = candidates.len();
+            let found = candidates[bucket].len();
             let mut examined = 0usize;
             let mut made = 0usize;
-            while let Some(node) = candidates.pop() {
+            while let Some(node) = candidates[bucket].pop() {
                 examined += 1;
-                if !bridge_candidate(
-                    node,
-                    &field,
-                    ranges,
-                    k,
-                    half_distance,
-                    distance,
-                    &mut visits.meet,
-                ) {
+                let cost =
+                    bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet);
+                if cost != Some(distance) {
+                    if bucket == 0 && cost == Some(distances[1]) && distances[1] < k - 1 {
+                        candidates[1].push(node);
+                    }
                     continue;
                 }
                 let source = field.source(node, &links, graph, ranges, k, &mut visits.meet);
@@ -774,16 +762,12 @@ fn match_ends(
                     );
                 }
                 // Another pair may still meet through this traversal.
-                if bridge_candidate(
-                    node,
-                    &field,
-                    ranges,
-                    k,
-                    half_distance,
-                    distance,
-                    &mut visits.meet,
-                ) {
-                    candidates.push(node);
+                let cost =
+                    bridge_candidate(node, &field, ranges, k, half_distance, &mut visits.meet);
+                if cost == Some(distance) {
+                    candidates[bucket].push(node);
+                } else if bucket == 0 && cost == Some(distances[1]) && distances[1] < k - 1 {
+                    candidates[1].push(node);
                 }
             }
             info!(
