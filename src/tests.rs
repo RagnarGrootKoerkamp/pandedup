@@ -3,6 +3,7 @@ use packed_seq::{PackedSeqVec, SeqVec};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::ops::Range;
 
 #[test]
 fn split_contigs_on_ambiguous_bases() {
@@ -196,7 +197,7 @@ fn report_spectrum_failure(
 // Compact a directed de Bruijn graph by walking every maximal nonbranching
 // path. Keep this independent of the production graph builder: the test input
 // starts as sequences, not as precomputed unitigs.
-fn naive_unitigs(sequences: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
+fn naive_unitigs(sequences: &[Vec<u8>], k: usize, canonical: bool) -> Vec<Vec<u8>> {
     fn vertex_id(vertices: &mut HashMap<Vec<u8>, usize>, label: &[u8]) -> usize {
         let next = vertices.len();
         *vertices.entry(label.to_vec()).or_insert(next)
@@ -204,7 +205,30 @@ fn naive_unitigs(sequences: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
 
     let mut kmers: Vec<Vec<u8>> = sequences
         .iter()
-        .flat_map(|sequence| sequence.windows(k).map(|window| window.to_vec()))
+        .flat_map(|sequence| {
+            sequence.windows(k).map(move |window| {
+                if canonical {
+                    let reverse_complement: Vec<_> = window
+                        .iter()
+                        .rev()
+                        .map(|base| match base {
+                            b'A' => b'T',
+                            b'C' => b'G',
+                            b'G' => b'C',
+                            b'T' => b'A',
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    if window <= reverse_complement.as_slice() {
+                        window.to_vec()
+                    } else {
+                        reverse_complement
+                    }
+                } else {
+                    window.to_vec()
+                }
+            })
+        })
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -274,107 +298,61 @@ fn naive_unitigs(sequences: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
     unitigs
 }
 
-#[test]
-fn matchtigs_on_mutated_copies_compacted_into_unitigs() {
-    let k = 15;
-    let mut rng = StdRng::seed_from_u64(0x9b39_7c64_602e_8d41);
-    let parent: Vec<u8> = (0..350).map(|_| b"ACGT"[rng.random_range(0..4)]).collect();
-    let mut copies = Vec::with_capacity(1_000);
-    copies.push(parent.clone());
-    for _ in 1..1_000 {
-        let mut copy = parent.clone();
-        let position = rng.random_range(0..copy.len());
-        let original = b"ACGT"
-            .iter()
-            .position(|&base| base == copy[position])
-            .unwrap();
-        copy[position] = b"ACGT"[(original + 1 + rng.random_range(0..3)) % 4];
-        copies.push(copy);
-    }
+struct FuzzUnitigInput {
+    packed: PackedSeqVec,
+    ranges: Vec<Range<usize>>,
+    expected: HashSet<u128>,
+    shorts: Vec<Vec<u8>>,
+}
 
-    let unitigs = naive_unitigs(&copies, k);
-    let input_bases: usize = unitigs.iter().map(Vec::len).sum();
-    eprintln!(
-        "{:>12} copies compacted into {:>12} input unitigs, {:>12} total bases",
-        copies.len(),
-        unitigs.len(),
-        input_bases,
-    );
-    assert!((800..=1_200).contains(&unitigs.len()));
-    let mut expected: Vec<_> = unitigs
-        .iter()
-        .flat_map(|unitig| {
-            unitig
-                .windows(k)
-                .map(|window| encode_kmer_for_spectrum(window, true))
-        })
+fn fuzz_ks(rng: &mut StdRng) -> Vec<usize> {
+    (1..=6)
+        .chain([31, 32, 63, 64])
+        .chain((0..20).map(|_| rng.random_range(6..=64)))
+        .collect()
+}
+
+fn fuzz_unitig_input(
+    rng: &mut StdRng,
+    case: usize,
+    k: usize,
+    length: usize,
+    mutation_rate: f64,
+) -> FuzzUnitigInput {
+    let parent: Vec<_> = (0..length)
+        .map(|_| b"ACGT"[rng.random_range(0..4)])
         .collect();
-    expected.sort_unstable();
-    expected.dedup();
-    let copy_spectrum = kmer_values(copies.iter().map(Vec::as_slice), k, true);
+    let copies: Vec<_> = (0..rng.random_range(1..=100))
+        .map(|_| mutate(&parent, mutation_rate, rng))
+        .collect();
+    let mut unitigs = naive_unitigs(&copies, k, true);
+    let expected = kmer_values(copies.iter().map(Vec::as_slice), k, true);
     assert_eq!(
-        expected.len(),
-        copy_spectrum.len(),
-        "naive compaction changed the copy spectrum"
+        kmer_values(unitigs.iter().map(Vec::as_slice), k, true),
+        expected,
+        "case {case}, k={k}: unitig compaction changed the k-mer set"
     );
-    assert!(expected.iter().all(|kmer| copy_spectrum.contains(kmer)));
+
+    let shorts: Vec<Vec<u8>> = if k == 1 {
+        Vec::new()
+    } else {
+        (0..rng.random_range(1..=5))
+            .map(|_| {
+                (0..rng.random_range(1..k))
+                    .map(|_| b"ACGT"[rng.random_range(0..4)])
+                    .collect()
+            })
+            .collect()
+    };
+    unitigs.extend(shorts.iter().cloned());
 
     let mut packed = PackedSeqVec::default();
-    let ranges: Vec<_> = unitigs
-        .iter()
-        .map(|unitig| packed.push_ascii(unitig))
-        .collect();
-    // Exercise both packed key implementations through graph recovery,
-    // matching, and reconstruction on the same independently built unitigs.
-    for (key_type, output) in [
-        (
-            "u64",
-            matchtigs::masked_superstring::<u64>(k, packed.clone(), ranges.clone()),
-        ),
-        (
-            "u128",
-            matchtigs::masked_superstring::<u128>(k, packed, ranges),
-        ),
-    ] {
-        eprintln!(
-            "{key_type} output: {:>12} masked matchtigs, {:>12} total bases",
-            output.len(),
-            output.iter().map(Vec::len).sum::<usize>(),
-        );
-        let mut actual: Vec<_> = output
-            .iter()
-            .flat_map(|record| record.windows(k))
-            .filter(|window| window[k - 1].is_ascii_uppercase())
-            .map(|window| {
-                let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
-                encode_kmer_for_spectrum(&uppercase, true)
-            })
-            .collect();
-        actual.sort_unstable();
-        actual.dedup();
-        let missing: Vec<_> = expected
-            .iter()
-            .filter(|kmer| actual.binary_search(kmer).is_err())
-            .copied()
-            .collect();
-        let extra: Vec<_> = actual
-            .iter()
-            .filter(|kmer| expected.binary_search(kmer).is_err())
-            .copied()
-            .collect();
-        eprintln!(
-            "{key_type} canonical k-mers: {:>12} input, {:>12} output, {:>12} missing, {:>12} extra",
-            expected.len(),
-            actual.len(),
-            missing.len(),
-            extra.len(),
-        );
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "{key_type} masked matchtigs spectrum differs: missing {:?}, extra {:?}",
-            &missing[..missing.len().min(5)],
-            &extra[..extra.len().min(5)],
-        );
+    let ranges = unitigs.iter().map(|seq| packed.push_ascii(seq)).collect();
+    FuzzUnitigInput {
+        packed,
+        ranges,
+        expected,
+        shorts,
     }
 }
 
@@ -442,6 +420,100 @@ fn random_sequences_preserve_the_kmer_set() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_matchtigs() {
+    let mut rng = StdRng::seed_from_u64(0x8a1e_d62b_47c0_395f);
+    for (case, k) in fuzz_ks(&mut rng).into_iter().enumerate() {
+        for length in [10, 30, 100, 300, 1_000, 3_000] {
+            for rate in [0.01, 0.1] {
+                let FuzzUnitigInput {
+                    packed,
+                    ranges,
+                    expected,
+                    shorts,
+                } = fuzz_unitig_input(&mut rng, case, k, length, rate);
+                let output = if k <= 32 {
+                    matchtigs::masked_superstring::<u64>(k, packed, ranges)
+                } else {
+                    matchtigs::masked_superstring::<u128>(k, packed, ranges)
+                };
+
+                // Joins with less than k-1 overlap may introduce lowercase crossing
+                // k-mers, so compare the marked spectrum with the input spectrum.
+                let mut occurrences = HashMap::<u128, (usize, usize)>::new();
+                for record in &output {
+                    for window in record.windows(k) {
+                        let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
+                        let kmer = encode_kmer_for_spectrum(&uppercase, true);
+                        let counts = occurrences.entry(kmer).or_default();
+                        if window[k - 1].is_ascii_uppercase() {
+                            counts.0 += 1;
+                        } else {
+                            assert!(window[k - 1].is_ascii_lowercase());
+                            counts.1 += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    occurrences
+                        .iter()
+                        .filter_map(|(&kmer, &(uppercase, _))| (uppercase > 0).then_some(kmer))
+                        .collect::<HashSet<_>>(),
+                    expected,
+                    "case {case}, k={k}: marked k-mer set changed"
+                );
+                assert!(
+                    occurrences.values().all(|&(uppercase, _)| uppercase <= 1),
+                    "case {case}, k={k}: a k-mer has multiple uppercase occurrences: {occurrences:?}"
+                );
+                let mut actual_shorts: Vec<_> =
+                    output.into_iter().filter(|seq| seq.len() < k).collect();
+                let mut expected_shorts = shorts;
+                actual_shorts.sort();
+                expected_shorts.sort();
+                assert_eq!(
+                    actual_shorts, expected_shorts,
+                    "case {case}, k={k}: short sequences changed"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_mss() {
+    let mut rng = StdRng::seed_from_u64(0x8a1e_d62b_47c0_395f);
+    for (case, k) in fuzz_ks(&mut rng).into_iter().enumerate() {
+        for length in [10, 30, 100, 300, 1_000, 3_000] {
+            for rate in [0.01, 0.1] {
+                let FuzzUnitigInput {
+                    packed,
+                    ranges,
+                    expected,
+                    shorts: _,
+                } = fuzz_unitig_input(&mut rng, case, k, length, rate);
+                let output = if k <= 32 {
+                    mss::masked_superstring::<u64>(k, packed, ranges)
+                } else {
+                    mss::masked_superstring::<u128>(k, packed, ranges)
+                };
+                let marked: HashSet<_> = output
+                    .windows(k)
+                    .filter(|window| window[k - 1].is_ascii_uppercase())
+                    .map(|window| {
+                        let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
+                        encode_kmer_for_spectrum(&uppercase, true)
+                    })
+                    .collect();
+                assert_eq!(
+                    marked, expected,
+                    "case {case}, k={k}: marked k-mer set changed"
+                );
             }
         }
     }

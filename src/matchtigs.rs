@@ -263,7 +263,7 @@ where
             let mut local_tails = Vec::with_capacity(chunk.len());
             for index in chunk {
                 let range = ranges.range(index);
-                if range.len() < k {
+                if k == 1 || range.len() < k {
                     continue;
                 }
                 let id = (index as u32) * 2;
@@ -1011,7 +1011,7 @@ fn append(
     }
 
     // FIXME TEST THIS
-    if mask {
+    if mask && range.len() >= k {
         let num_lowercase = (k - 1 - overlap).min(range.len() - overlap);
         for base in &mut output[start..start + num_lowercase] {
             *base = base.to_ascii_lowercase();
