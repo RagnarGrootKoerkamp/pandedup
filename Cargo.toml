@@ -16,7 +16,7 @@ derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
 flate2 = { version = "1.1.9", features = ["zlib-ng"] }
 fxhash = "0.2.1"
 gxhash = "3.5.0"
-needletail = { version = "0.7.3", default-features = false, features = ["bzip2", "flate2", "zstd"] }
+helicase = { git = "https://github.com/imartayan/helicase", features = ["bz2", "packed-seq", "paraseq"] }
 num_cpus = "1.17.0"
 # ragc-core = "0.1.1"
 # ragc-core.path = "../forks/ragc/ragc-core"
@@ -34,7 +34,7 @@ ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", option
 libc = "0.2"
 voracious_radix_sort = { version = "1.2.0", features = ["voracious_multithread"] }
 rayon = "1.12.0"
-packed-seq = { version = "5.0.0", features = ["file_io"] }
+packed-seq = "5.0.0"
 
 
 [patch.crates-io]

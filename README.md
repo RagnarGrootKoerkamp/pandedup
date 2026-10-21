@@ -59,7 +59,7 @@ probably won't help the overall time.
 ### Masked superstring output
 
 The `mss` subcommand builds a masked superstring. It can read any FASTA/FASTQ format supported by
-needletail, including compressed files:
+helicase, including compressed files:
 
 ```sh
 pandedup mss input.fa.zst -k 64 -j 6 -o output.msfa

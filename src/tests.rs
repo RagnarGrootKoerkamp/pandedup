@@ -25,10 +25,11 @@ fn processing_does_not_join_across_ambiguous_bases() {
     assert_eq!((stats.output_contigs, stats.output_bp), (2, 7));
 
     let mut output_reader =
-        needletail::parse_fastx_reader(Cursor::new(writer.into_inner().unwrap())).unwrap();
+        AsciiFastxParser::from_reader(Cursor::new(writer.into_inner().unwrap())).unwrap();
     let mut output = Vec::new();
     while let Some(record) = output_reader.next() {
-        output.push(record.unwrap().seq().into_owned());
+        record.unwrap();
+        output.push(output_reader.get_dna_string().to_vec());
     }
     output.sort();
     assert_eq!(output, [b"ACG".to_vec(), b"TTGC".to_vec()]);
@@ -393,11 +394,12 @@ fn random_sequences_preserve_the_kmer_set() {
 
                                     let output = writer.into_inner().unwrap();
                                     let mut output_reader =
-                                        needletail::parse_fastx_reader(Cursor::new(output))
-                                            .unwrap();
+                                        AsciiFastxParser::from_reader(Cursor::new(output)).unwrap();
                                     let mut output_sequences = Vec::new();
                                     while let Some(record) = output_reader.next() {
-                                        output_sequences.push(record.unwrap().seq().into_owned());
+                                        record.unwrap();
+                                        output_sequences
+                                            .push(output_reader.get_dna_string().to_vec());
                                     }
                                     let actual = kmer_values(
                                         output_sequences.iter().map(Vec::as_slice),

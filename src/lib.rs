@@ -1,4 +1,5 @@
 use fxhash::{FxHashMap, FxHashSet};
+use helicase::{FastxParser, HelicaseParser, input::FromReader};
 use ragc_core::{Decompressor, DecompressorConfig};
 #[cfg(feature = "ggcat")]
 pub mod ggcat;
@@ -17,6 +18,51 @@ use std::{
 
 #[cfg(test)]
 mod tests;
+
+const ASCII_CONFIG: helicase::Config = helicase::ParserOptions::default()
+    .ignore_headers()
+    .ignore_quality()
+    .config();
+type AsciiFastxParser<'a> = FastxParser<'a, ASCII_CONFIG>;
+
+/// Read FASTA/FASTQ records in parallel, retaining boundaries but not input order.
+fn read_packed_fastx(
+    path: &Path,
+    threads: usize,
+) -> io::Result<(packed_seq::PackedSeqVec, Vec<Range<usize>>)> {
+    use helicase::{HelicaseParser, ParallelFastxParser, config::*};
+    use packed_seq::SeqVec;
+
+    const CONFIG: Config = ParserOptions::default()
+        .ignore_headers()
+        .ignore_quality()
+        .dna_packed()
+        .keep_non_actg()
+        .config();
+
+    let output = Mutex::new((packed_seq::PackedSeqVec::default(), Vec::new()));
+    ParallelFastxParser::<CONFIG>::from_file(path)?
+        .threads(threads)
+        .for_each(|mut parser| {
+            let mut seq = packed_seq::PackedSeqVec::default();
+            let mut ranges = Vec::new();
+            while let Some(event) = parser.next() {
+                event?;
+                ranges.push(seq.push_seq(parser.get_packed_seq()));
+            }
+            if !ranges.is_empty() {
+                let mut output = output.lock().unwrap();
+                let offset = output.0.push_seq(seq.as_slice()).start;
+                output.1.extend(
+                    ranges
+                        .into_iter()
+                        .map(|range| range.start + offset..range.end + offset),
+                );
+            }
+            Ok(())
+        })?;
+    Ok(output.into_inner().unwrap())
+}
 
 fn hasher(seq: &[u8]) -> u128 {
     // const SEED: i64 = 1983274983247984327;
@@ -650,11 +696,11 @@ impl InputReader for TarGzReader {
             break;
         }
         drop(guard);
-        let mut binding = std::io::Cursor::new(data);
-        let mut reader = needletail::parse_fastx_reader(&mut binding).unwrap();
+        let mut reader = AsciiFastxParser::from_reader(std::io::Cursor::new(data)).unwrap();
         let mut contigs = vec![];
-        while let Some(record) = reader.next() {
-            contigs.push(record.unwrap().seq().to_vec());
+        while let Some(event) = reader.next() {
+            event.unwrap();
+            contigs.push(reader.get_dna_string().to_vec());
         }
 
         Some((idx, Box::new(contigs.into_iter())))
@@ -663,13 +709,29 @@ impl InputReader for TarGzReader {
 
 /// Read a single FASTA/FASTQ sample from a (possibly compressed) input stream.
 struct FastxReader {
-    reader: Mutex<Box<dyn needletail::FastxReader>>,
+    reader: Mutex<Box<dyn helicase::parser::HelicaseParserIter + Send>>,
     consumed: AtomicUsize,
 }
 
 impl FastxReader {
     fn new(path: &str) -> Self {
-        let reader = needletail::parse_fastx_file(path).unwrap();
+        use helicase::{
+            input::{FileInput, FromInputData, InputData},
+            parser::{FastaParser, FastqParser, Format},
+        };
+
+        let input = FileInput::open(path).unwrap();
+        // FastxParser erases Send; box the concrete parsers with Send retained.
+        // FIXME: Cleanup after helicase adds FastxParser: Send
+        let reader: Box<dyn helicase::parser::HelicaseParserIter + Send> =
+            match Format::try_from_byte(input.first_byte()).unwrap() {
+                Format::Fasta => {
+                    Box::new(FastaParser::<ASCII_CONFIG, _>::from_input(input).unwrap())
+                }
+                Format::Fastq => {
+                    Box::new(FastqParser::<ASCII_CONFIG, _>::from_input(input).unwrap())
+                }
+            };
         Self {
             reader: Mutex::new(reader),
             consumed: AtomicUsize::new(0),
@@ -680,10 +742,13 @@ impl FastxReader {
 impl InputReader for FastxReader {
     fn next_sample(&self) -> Option<(usize, Box<dyn Iterator<Item = Vec<u8>> + '_>)> {
         let mut reader = self.reader.lock().unwrap();
-        let record = reader.next()?.unwrap();
+        reader.next()?.unwrap();
         let idx = self
             .consumed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some((idx, Box::new(std::iter::once(record.seq().to_vec()))))
+        Some((
+            idx,
+            Box::new(std::iter::once(reader.get_dna_string().to_vec())),
+        ))
     }
 }

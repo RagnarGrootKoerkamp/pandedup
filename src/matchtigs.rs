@@ -1237,7 +1237,8 @@ fn append_part(
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
-    let (seq, ranges) = PackedSeqVec::from_fastx(input);
+    let (seq, ranges) = crate::read_packed_fastx(input, rayon::current_num_threads())
+        .expect("Failed to read input FASTA/Q");
     info!("Seq: {} GB", compact(seq.len() / 4));
     info!(
         "Input range pairs: {} B",
@@ -1284,6 +1285,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
 #[cfg(test)]
 mod output_tests {
     use super::*;
+    use helicase::{HelicaseParser, input::FromReader};
 
     #[test]
     fn run_writes_masked_fasta_records() {
@@ -1309,12 +1311,14 @@ mod output_tests {
         std::fs::write(&input, input_fasta).unwrap();
         let mut expected_records = masked_superstring::<u64>(3, seq, ranges);
         run(&input, Some(&output), 3, true);
-        let mut reader =
-            needletail::parse_fastx_reader(std::io::Cursor::new(std::fs::read(&output).unwrap()))
-                .unwrap();
+        let mut reader = crate::AsciiFastxParser::from_reader(std::io::Cursor::new(
+            std::fs::read(&output).unwrap(),
+        ))
+        .unwrap();
         let mut actual_records = Vec::new();
         while let Some(record) = reader.next() {
-            actual_records.push(record.unwrap().seq().into_owned());
+            record.unwrap();
+            actual_records.push(reader.get_dna_string().to_vec());
         }
         expected_records.sort();
         actual_records.sort();

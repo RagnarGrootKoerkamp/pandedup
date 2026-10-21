@@ -6,8 +6,6 @@
 //! In the end, only over-reported kmers remain; ideally there are none of those...
 use std::{
     env,
-    fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
     sync::{
         RwLock,
@@ -16,12 +14,17 @@ use std::{
 };
 
 use fxhash::FxHashSet;
+use helicase::{FastxParser, HelicaseParser, ParserOptions, input::FromFile};
 use ragc_core::{Decompressor, DecompressorConfig};
 
 const K: usize = 64;
 // The bottom 0.1% of the 2^128 possible 64-mer values.
 const VALUE_LIMIT: u128 = u128::MAX / 1000;
 const MERGE_BATCH_SIZE: usize = 16_384;
+const CONFIG: helicase::Config = ParserOptions::default()
+    .ignore_headers()
+    .ignore_quality()
+    .config();
 
 fn visit_sequence_kmers(sequence: &[u8], mut visit: impl FnMut(u128)) {
     let mut value = 0u128;
@@ -128,12 +131,11 @@ fn remove_agc_kmers(path: &Path, output: FxHashSet<u128>) -> FxHashSet<u128> {
 }
 
 fn fasta_kmers(path: &Path) -> FxHashSet<u128> {
-    let decoder =
-        zstd::stream::read::Decoder::new(BufReader::new(File::open(path).unwrap())).unwrap();
-    let mut reader = needletail::parse_fastx_reader(decoder).unwrap();
+    let mut reader = FastxParser::<CONFIG>::from_file(path).unwrap();
     let mut kmers = FxHashSet::default();
-    while let Some(record) = reader.next() {
-        add_sequence_kmers(&record.unwrap().seq(), &mut kmers);
+    while let Some(event) = reader.next() {
+        event.unwrap();
+        add_sequence_kmers(reader.get_dna_string(), &mut kmers);
     }
     eprintln!(
         "finished reading {}: kmers: {}",

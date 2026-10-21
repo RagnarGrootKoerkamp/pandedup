@@ -4,6 +4,7 @@ use ggcat_api::{
     DnaSequence, DnaSequencesFileType, DynamicSequencesStream, ExtraElaboration, GGCATConfig,
     GGCATInstance, GeneralSequenceBlockData, MessageLevel, SequenceInfo,
 };
+use helicase::{HelicaseParser, input::FromFile};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -38,10 +39,12 @@ pub fn run(args: &GgcatConfig) -> PathBuf {
         name.ends_with(".fa") || name.ends_with(".fa.zst"),
         "input must be .fa or .fa.zst"
     );
-    let mut reader = needletail::parse_fastx_file(&args.input).expect("failed to read input FASTA");
+    let mut reader =
+        crate::AsciiFastxParser::from_file(&args.input).expect("failed to read input FASTA");
     let mut sequences = Vec::new();
     while let Some(record) = reader.next() {
-        sequences.push(record.expect("invalid FASTA record").seq().into_owned());
+        record.expect("invalid FASTA record");
+        sequences.push(reader.get_dna_string().to_vec());
     }
     let input_bases = sequences.iter().map(Vec::len).sum();
     log_file_stats("Read", &args.input, Some((sequences.len(), input_bases))).unwrap();

@@ -7,6 +7,9 @@ use std::{
 };
 
 use clap::Parser;
+use helicase::{FastxParser, HelicaseParser, ParserOptions, input::FromFile};
+
+const CONFIG: helicase::Config = ParserOptions::default().ignore_quality().config();
 
 #[derive(Parser)]
 struct Args {
@@ -18,22 +21,22 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut reader = needletail::parse_fastx_file(&args.input)?;
+    let mut reader = FastxParser::<CONFIG>::from_file(&args.input)?;
     let mut out = BufWriter::new(io::stdout().lock());
 
     let mut empty = 0;
-    while let Some(record) = reader.next() {
-        let record = record?;
-        let seq = record.seq();
+    while let Some(event) = reader.next() {
+        event?;
+        let seq = reader.get_dna_string();
         if seq.is_empty() {
             empty += 1;
             continue;
         }
         if seq.len() < args.k {
             out.write_all(b">")?;
-            out.write_all(record.id())?;
+            out.write_all(reader.get_header())?;
             out.write_all(b"\n")?;
-            out.write_all(&seq)?;
+            out.write_all(seq)?;
             out.write_all(b"\n")?;
         }
     }
