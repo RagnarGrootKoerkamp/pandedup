@@ -16,15 +16,16 @@ Cuttlefish and then a compression using greedy matchtigs.
 
 ### HPRCv2 spectrum
 
-A `k=64` k-mer spectrum of HPRCv2
+A `k=31` and `k=63` k-mer spectrum of HPRCv2
 ([this](https://s3-us-west-2.amazonaws.com/human-pangenomics/submissions/B4174A5F-F20E-4DCF-8470-F8A907B640BC--HPRCv2_0.6.1_pr_agc_submission/HPRC_r2_assemblies_0.6.1.agc)
-AGC file) can be found here: https://zenodo.org/records/21724558 (3.0GB).
-Note that this version has a small fraction of "fake" k-mers that were
-introduced by wrongly projecting `N` characters to `ACTG`.
+AGC file) can be found here: https://zenodo.org/records/23548656 (1.4GB and 2.4GB).
+Note that this also includes all contigs in the `.agc` of length less than `k`.
 
-A `k=63` version  without ambiguous bases can be found at
-https://ragnargrootkoerkamp.nl/upload/hprcv2-k63-greedytigs.fa.zst (2.4GB).
-This one was minimized using greedy matchtigs.
+These files were created by first running `pandedup dedup` to go from the input
+`.agc` to a smaller roughly deduped `.fa`. Then `pandedup ggcat` was run to call
+the GGCAT api to obtain the unitigs, and lastly `pandedup matchtigs` was used to
+build greedy matchtigs from those unitigs.
+
 
 ### Usage
 
