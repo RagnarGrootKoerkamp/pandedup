@@ -38,7 +38,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 use voracious_radix_sort::{RadixSort, Radixable};
 
 const DEAD: u32 = u32::MAX;
@@ -1057,6 +1057,7 @@ struct PlannedOutput {
 }
 
 const PART_BASES: usize = 32 * 1024 * 1024;
+const WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Build masked matchtig records from unitigs. Newly created crossing k-mers
 /// are lowercase, as in `mss::masked_superstring`.
@@ -1233,6 +1234,38 @@ fn append_part(
     debug_assert_eq!(output.len() - start, part.bases);
 }
 
+/// Buffer multiple small parts per write without splitting large parts.
+fn write_parts(
+    planned: &PlannedOutput,
+    writer: &mut (impl Write + Send),
+    k: usize,
+    mask: bool,
+    batch_bytes: usize,
+) -> std::io::Result<()> {
+    let writer = Mutex::new(writer);
+    planned
+        .parts
+        .par_iter()
+        .with_min_len(64)
+        .try_fold(Vec::new, |mut buffer, part| -> std::io::Result<Vec<u8>> {
+            buffer.extend_from_slice(b">\n");
+            append_part(&mut buffer, part, &planned.seq, &planned.ranges, k, mask);
+            buffer.push(b'\n');
+            if buffer.len() >= batch_bytes {
+                writer.lock().unwrap().write_all(&buffer)?;
+                buffer.clear();
+            }
+            Ok(buffer)
+        })
+        .try_for_each(|buffer| {
+            let buffer = buffer?;
+            if !buffer.is_empty() {
+                writer.lock().unwrap().write_all(&buffer)?;
+            }
+            Ok(())
+        })
+}
+
 /// Read unitigs and write matched paths as separate FASTA records.
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
@@ -1254,23 +1287,15 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf
     let output = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_msfa_output(input, "greedytigs"));
-    let file = Mutex::new(std::fs::File::create(&output).unwrap());
+    let mut file = std::fs::File::create(&output).unwrap();
     let written_records = planned
         .parts
         .iter()
         .filter(|part| part.starts_record)
         .count();
     let written_bases = planned.parts.iter().map(|part| part.bases).sum::<usize>();
-    planned
-        .parts
-        .par_iter()
-        .for_each_with(Vec::new(), |buffer, part| {
-            buffer.clear();
-            buffer.extend_from_slice(b">\n");
-            append_part(buffer, part, &planned.seq, &planned.ranges, k, mask);
-            buffer.push(b'\n');
-            file.lock().unwrap().write_all(buffer).unwrap();
-        });
+    debug!("#records {} #bases {}", written_records, written_bases);
+    write_parts(&planned, &mut file, k, mask, WRITE_BATCH_BYTES).unwrap();
     log_file_stats("Wrote", &output, Some((written_records, written_bases))).unwrap();
     info!(
         "matchtigs: {}, output {} bases in {} records ({})",
