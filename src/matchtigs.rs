@@ -813,6 +813,9 @@ fn match_ends(
         }
         direct_examined += 1;
         for source in graph.incoming(target) {
+            if source < target {
+                continue;
+            }
             visits.direct_overlap += 1;
             if !links[tail_slot(source)].is_empty() {
                 continue;
