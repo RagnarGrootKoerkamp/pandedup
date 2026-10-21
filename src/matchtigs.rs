@@ -186,40 +186,56 @@ impl Graph {
     }
 }
 
-struct RangeStarts {
+/// Record ends are the next start minus the u8 padding.
+struct RecordRanges {
+    /// len n+1, padded with last end
     starts: Vec<usize>,
+    /// len n
+    padding: Vec<u8>,
 }
 
-impl RangeStarts {
+impl RecordRanges {
     fn new(ranges: Vec<Range<usize>>) -> Self {
         let mut starts = Vec::with_capacity(ranges.len() + 1);
-        starts.push(ranges.first().map_or(0, |range| range.start));
-        for range in ranges {
+        let mut padding = Vec::with_capacity(ranges.len());
+        for [range, next] in ranges.array_windows::<2>() {
             assert!(range.start <= range.end, "invalid range");
-            assert_eq!(
-                starts.last().copied(),
-                Some(range.start),
-                "ranges are not adjacent"
-            );
-            starts.push(range.end);
+            let gap = next
+                .start
+                .checked_sub(range.end)
+                .expect("record ranges overlap or are out of order");
+            starts.push(range.start);
+            padding.push(u8::try_from(gap).expect("gap between records exceeds 255 bases"));
         }
-        Self { starts }
+        if let Some(last) = ranges.last() {
+            assert!(last.start <= last.end, "invalid range");
+            starts.push(last.start);
+            padding.push(0);
+        }
+        starts.push(ranges.last().map_or(0, |range| range.end));
+        Self { starts, padding }
     }
 
     fn len(&self) -> usize {
-        self.starts.len() - 1
+        self.padding.len()
     }
 
     fn range(&self, index: usize) -> Range<usize> {
-        self.starts[index]..self.starts[index + 1]
+        self.starts[index]..self.starts[index + 1] - usize::from(self.padding[index])
     }
 
     fn range_len(&self, index: usize) -> usize {
-        self.starts[index + 1] - self.starts[index]
+        self.range(index).len()
     }
 
     fn total_bases(&self) -> usize {
-        self.starts[self.len()] - self.starts[0]
+        self.starts[self.len()]
+            - self.starts[0]
+            - self
+                .padding
+                .iter()
+                .map(|&gap| usize::from(gap))
+                .sum::<usize>()
     }
 }
 
@@ -243,7 +259,7 @@ fn truncate_consumed<K>(ends: &mut Vec<End<K>>, remaining: usize) {
     }
 }
 
-fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &RangeStarts) -> Graph
+fn graph<K: MssKey>(k: usize, seq: &PackedSeqVec, ranges: &RecordRanges) -> Graph
 where
     End<K>: Radixable<K, Key = K>,
 {
@@ -397,7 +413,7 @@ impl Link {
 const UNREACHABLE: u8 = u8::MAX;
 
 /// The cost of crossing unitig `node`.
-fn traversal_weight(ranges: &RangeStarts, node: u32, k: usize) -> usize {
+fn traversal_weight(ranges: &RecordRanges, node: u32, k: usize) -> usize {
     ranges.range_len((node / 2) as usize) - (k - 1)
 }
 
@@ -434,7 +450,7 @@ impl DistanceField {
         &mut self,
         distance: usize,
         graph: &Graph,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         radius: usize,
         bridges: &mut BridgeQueue,
@@ -468,7 +484,7 @@ impl DistanceField {
         node: u32,
         distance: usize,
         graph: &Graph,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         radius: usize,
         visited: &mut u64,
@@ -497,7 +513,7 @@ impl DistanceField {
         node: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         radius: usize,
         reached_layer: usize,
@@ -529,7 +545,7 @@ impl DistanceField {
         source: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         radius: usize,
         reached_layer: usize,
@@ -616,7 +632,7 @@ impl DistanceField {
         mut node: u32,
         links: &[Link],
         graph: &Graph,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         visited: &mut u64,
     ) -> u32 {
@@ -685,7 +701,7 @@ fn connect(
 fn bridge_candidate(
     node: u32,
     field: &DistanceField,
-    ranges: &RangeStarts,
+    ranges: &RecordRanges,
     k: usize,
     settled_limit: usize,
     visited: &mut u64,
@@ -715,7 +731,7 @@ impl BridgeQueue {
         &mut self,
         node: u32,
         field: &DistanceField,
-        ranges: &RangeStarts,
+        ranges: &RecordRanges,
         k: usize,
         reached_layer: usize,
         first_unprocessed_cost: usize,
@@ -749,7 +765,7 @@ impl BridgeQueue {
 /// Greedy distance-ordered matching through central unitig traversals.
 fn match_ends(
     k: usize,
-    ranges: &RangeStarts,
+    ranges: &RecordRanges,
     graph: &Graph,
     initial_bases: usize,
 ) -> (Vec<Link>, usize) {
@@ -1036,7 +1052,7 @@ struct PathPart {
 
 struct PlannedOutput {
     seq: PackedSeqVec,
-    ranges: RangeStarts,
+    ranges: RecordRanges,
     parts: Vec<PathPart>,
 }
 
@@ -1085,12 +1101,15 @@ where
     End<K>: Radixable<K, Key = K>,
 {
     assert!(k > 0 && k <= K::BITS / 2);
-    let ranges = RangeStarts::new(ranges);
+    let ranges = RecordRanges::new(ranges);
     let initial_bases = ranges.total_bases();
     assert!(ranges.len() <= (u32::MAX as usize / 2), "too many unitigs");
     info!(
-        "Range starts: {} B",
-        compact(std::mem::size_of_val(ranges.starts.as_slice()))
+        "Record ranges: {} B",
+        compact(
+            std::mem::size_of_val(ranges.starts.as_slice())
+                + std::mem::size_of_val(ranges.padding.as_slice())
+        )
     );
     let graph = graph::<K>(k, &seq, &ranges);
 
@@ -1110,7 +1129,7 @@ where
     PlannedOutput { seq, ranges, parts }
 }
 
-fn plan_paths(ranges: &RangeStarts, links: Vec<Link>) -> Vec<PathPart> {
+fn plan_paths(ranges: &RecordRanges, links: Vec<Link>) -> Vec<PathPart> {
     info!("Plan output paths");
     let mut done = vec![false; ranges.len()];
     // make output seqs of length at most 32Mbp, to keep threads busy.
@@ -1194,7 +1213,7 @@ fn append_part(
     output: &mut Vec<u8>,
     part: &PathPart,
     seq: &PackedSeqVec,
-    ranges: &RangeStarts,
+    ranges: &RecordRanges,
     k: usize,
     mask: bool,
 ) {
