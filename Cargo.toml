@@ -15,7 +15,6 @@ clap = { version = "4.6.4", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
 flate2 = { version = "1.1.9", features = ["zlib-ng"] }
 fxhash = "0.2.1"
-gxhash = "3.5.0"
 helicase = { git = "https://github.com/imartayan/helicase", features = ["bz2", "packed-seq", "paraseq"] }
 num_cpus = "1.17.0"
 # ragc-core = "0.1.1"
