@@ -35,7 +35,7 @@ taking 4 minutes:
 pandedup dedup hprcv2.agc -k 64 -w 100 -o hprcv2.spss.k64.fa.zst --threads 64
 ```
 
-Run GGCAT on a `.fa` or `.fa.zst` file:
+Run GGCAT on a `.fa` or `.fa.zst` file (with the `ggcat` feature):
 
 ```sh
 pandedup ggcat hprcv2.spss.k64.fa.zst -k 64 --mode simplitigs

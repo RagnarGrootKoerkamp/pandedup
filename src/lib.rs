@@ -1,5 +1,6 @@
 use fxhash::{FxHashMap, FxHashSet};
 use ragc_core::{Decompressor, DecompressorConfig};
+#[cfg(feature = "ggcat")]
 pub mod ggcat;
 pub mod matchtigs;
 pub mod mss;

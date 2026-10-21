@@ -6,6 +6,10 @@ edition = "2024"
 [profile.release]
 debug = true
 
+[features]
+default = []
+ggcat = ["dep:ggcat-api"]
+
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 derive_more = { version = "2.1.1", features = ["add", "add_assign"] }
@@ -26,7 +30,7 @@ tar = "0.4.46"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 zstd = "0.13.3"
 # ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", default-features = false, features = ["hash-16bit", "hash-32bit", "hash-64bit", "hash-128bit", "hash-rkarp", "hash-forward"] }
-ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", default-features = false, features = ["hash-64bit", "hash-128bit"] }
+ggcat-api = { git = "https://github.com/algbio/ggcat", version = "2.2.0", optional = true, default-features = false, features = ["hash-64bit", "hash-128bit"] }
 libc = "0.2"
 voracious_radix_sort = { version = "1.2.0", features = ["voracious_multithread"] }
 rayon = "1.12.0"

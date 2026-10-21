@@ -1,4 +1,7 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "ggcat")]
+use clap::ValueEnum;
+use clap::{Args, Parser, Subcommand};
+#[cfg(feature = "ggcat")]
 use ggcat_api::ExtraElaboration;
 use std::{io::IsTerminal, num::NonZeroUsize, path::PathBuf, time::Instant};
 use tracing::Level;
@@ -46,6 +49,7 @@ enum Command {
     /// Deduplicate an input archive or FASTA file.
     Dedup(DedupArgs),
     /// Run GGCAT on a FASTA file.
+    #[cfg(feature = "ggcat")]
     Ggcat(GgcatArgs),
     /// Build a masked superstring from contigs.
     Mss(MssArgs),
@@ -81,6 +85,7 @@ struct DedupArgs {
 }
 
 #[derive(Args)]
+#[cfg(feature = "ggcat")]
 struct GgcatArgs {
     /// Input .fa or .fa.zst file.
     input: PathBuf,
@@ -99,6 +104,7 @@ struct GgcatArgs {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+#[cfg(feature = "ggcat")]
 enum GgcatMode {
     None,
     UnitigLinks,
@@ -109,6 +115,7 @@ enum GgcatMode {
     FastEulertigs,
 }
 
+#[cfg(feature = "ggcat")]
 impl From<GgcatMode> for ExtraElaboration {
     fn from(mode: GgcatMode) -> Self {
         match mode {
@@ -171,6 +178,7 @@ fn main() {
                 args.mini_k,
             );
         }
+        #[cfg(feature = "ggcat")]
         Command::Ggcat(args) => {
             pandedup::ggcat::run(&pandedup::ggcat::GgcatConfig {
                 input: args.input,
