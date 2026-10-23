@@ -709,29 +709,16 @@ impl InputReader for TarGzReader {
 
 /// Read a single FASTA/FASTQ sample from a (possibly compressed) input stream.
 struct FastxReader {
-    reader: Mutex<Box<dyn helicase::parser::HelicaseParserIter + Send>>,
+    reader: Mutex<FastxParser<'static, ASCII_CONFIG>>,
     consumed: AtomicUsize,
 }
 
 impl FastxReader {
     fn new(path: &str) -> Self {
-        use helicase::{
-            input::{FileInput, FromInputData, InputData},
-            parser::{FastaParser, FastqParser, Format},
-        };
+        use helicase::input::{FileInput, FromInputData};
 
         let input = FileInput::open(path).unwrap();
-        // FastxParser erases Send; box the concrete parsers with Send retained.
-        // FIXME: Cleanup after helicase adds FastxParser: Send
-        let reader: Box<dyn helicase::parser::HelicaseParserIter + Send> =
-            match Format::try_from_byte(input.first_byte()).unwrap() {
-                Format::Fasta => {
-                    Box::new(FastaParser::<ASCII_CONFIG, _>::from_input(input).unwrap())
-                }
-                Format::Fastq => {
-                    Box::new(FastqParser::<ASCII_CONFIG, _>::from_input(input).unwrap())
-                }
-            };
+        let reader = FastxParser::<ASCII_CONFIG>::from_input(input).unwrap();
         Self {
             reader: Mutex::new(reader),
             consumed: AtomicUsize::new(0),
