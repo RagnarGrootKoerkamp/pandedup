@@ -1273,8 +1273,7 @@ fn write_parts(
 pub fn run(input: &Path, output: Option<&Path>, k: usize, mask: bool) -> PathBuf {
     let timing = StageTiming::start();
     info!("Reading unitigs..");
-    let (seq, ranges) = crate::read_packed_fastx(input, rayon::current_num_threads())
-        .expect("Failed to read input FASTA/Q");
+    let (seq, ranges) = PackedSeqVec::from_fastx_parallel(input, rayon::current_num_threads());
     info!("Seq: {} GB", compact(seq.len() / 4));
     info!(
         "Input range pairs: {} B",

@@ -9,7 +9,10 @@ use std::{
 use clap::Parser;
 use helicase::{FastxParser, HelicaseParser, ParserOptions, input::FromFile};
 
-const CONFIG: helicase::Config = ParserOptions::default().ignore_quality().config();
+const CONFIG: helicase::Config = ParserOptions::default()
+    .ignore_quality()
+    .reject_non_actg()
+    .config();
 
 #[derive(Parser)]
 struct Args {

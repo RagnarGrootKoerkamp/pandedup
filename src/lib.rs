@@ -25,45 +25,6 @@ const ASCII_CONFIG: helicase::Config = helicase::ParserOptions::default()
     .config();
 type AsciiFastxParser<'a> = FastxParser<'a, ASCII_CONFIG>;
 
-/// Read FASTA/FASTQ records in parallel, retaining boundaries but not input order.
-fn read_packed_fastx(
-    path: &Path,
-    threads: usize,
-) -> io::Result<(packed_seq::PackedSeqVec, Vec<Range<usize>>)> {
-    use helicase::{HelicaseParser, ParallelFastxParser, config::*};
-    use packed_seq::SeqVec;
-
-    const CONFIG: Config = ParserOptions::default()
-        .ignore_headers()
-        .ignore_quality()
-        .dna_packed()
-        .keep_non_actg()
-        .config();
-
-    let output = Mutex::new((packed_seq::PackedSeqVec::default(), Vec::new()));
-    ParallelFastxParser::<CONFIG>::from_file(path)?
-        .threads(threads)
-        .for_each(|mut parser| {
-            let mut seq = packed_seq::PackedSeqVec::default();
-            let mut ranges = Vec::new();
-            while let Some(event) = parser.next() {
-                event?;
-                ranges.push(seq.push_seq(parser.get_packed_seq()));
-            }
-            if !ranges.is_empty() {
-                let mut output = output.lock().unwrap();
-                let offset = output.0.push_seq(seq.as_slice()).start;
-                output.1.extend(
-                    ranges
-                        .into_iter()
-                        .map(|range| range.start + offset..range.end + offset),
-                );
-            }
-            Ok(())
-        })?;
-    Ok(output.into_inner().unwrap())
-}
-
 fn hasher(seq: &[u8]) -> u128 {
     // const SEED: i64 = 1983274983247984327;
     // gxhash::gxhash128(seq, SEED)

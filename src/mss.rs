@@ -474,8 +474,7 @@ pub fn run(input: &Path, output: Option<&Path>, k: usize, threads: Option<usize>
     let pool = pool_builder.build().unwrap();
     let timing = StageTiming::start();
     info!("Reading input..");
-    let (seq, ranges) = crate::read_packed_fastx(input, pool.current_num_threads())
-        .expect("Failed to read input FASTA/Q");
+    let (seq, ranges) = PackedSeqVec::from_fastx_parallel(input, pool.current_num_threads());
     let input_bases = ranges.iter().map(|range| range.len()).sum();
     log_file_stats("Read", input, Some((ranges.len(), input_bases))).unwrap();
 

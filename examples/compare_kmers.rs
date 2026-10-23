@@ -24,6 +24,7 @@ const MERGE_BATCH_SIZE: usize = 16_384;
 const CONFIG: helicase::Config = ParserOptions::default()
     .ignore_headers()
     .ignore_quality()
+    .reject_non_actg()
     .config();
 
 fn visit_sequence_kmers(sequence: &[u8], mut visit: impl FnMut(u128)) {
