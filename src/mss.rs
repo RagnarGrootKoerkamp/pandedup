@@ -303,7 +303,6 @@ fn append_contig(
     reverse: bool,
     overlap: usize,
     k: usize,
-    has_previous: bool,
 ) {
     // FIXME: Use packed_seq utils for this somehow
     let mut bases = seq.slice(range.clone()).unpack();
@@ -314,23 +313,13 @@ fn append_contig(
         }
     }
     assert!(overlap < k && overlap <= bases.len());
-    if !output.is_empty() && overlap <= output.len() {
-        let end = output.len();
-        debug_assert!(
-            output[end - overlap..]
-                .iter()
-                .zip(&bases[..overlap])
-                .all(|(left, right)| left.to_ascii_uppercase() == *right)
-        );
-    }
-    if has_previous {
-        // The first k-1-overlap appended bases end the new crossing k-mers.
-        let mask_len = (k - 1 - overlap).min(bases.len() - overlap);
-        for base in &mut bases[overlap..overlap + mask_len] {
-            *base = base.to_ascii_lowercase();
-        }
-    }
-    output.extend_from_slice(&bases[overlap..]);
+
+    // Emit all bases apart from the overlap at the end with the next contig.
+    let emitted = bases.len() - overlap;
+    // The last k-1 bases of the contig don't start a new valid kmer.
+    let start = bases.len().saturating_sub(k - 1);
+    bases[start..emitted].make_ascii_lowercase();
+    output.extend_from_slice(&bases[..emitted]);
 }
 
 fn reconstruct_cycles<I: MssIndex>(
@@ -383,7 +372,8 @@ fn reconstruct_cycles<I: MssIndex>(
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut chunk_bases = 0;
-    for (index, (range, _, overlap)) in steps.iter().enumerate() {
+    for (index, (range, _, _)) in steps.iter().enumerate() {
+        let overlap = steps.get(index + 1).map_or(0, |step| step.2);
         let added = range.len() - overlap;
         if index > start && chunk_bases + added > OUTPUT_CHUNK_BASES {
             chunks.push(start..index);
@@ -403,8 +393,9 @@ fn reconstruct_cycles<I: MssIndex>(
             .map(|chunk| {
                 let mut output = Vec::new();
                 for index in chunk.clone() {
-                    let (range, reverse, overlap) = &steps[index];
-                    append_contig(&mut output, seq, range, *reverse, *overlap, k, index > 0);
+                    let (range, reverse, _) = &steps[index];
+                    let overlap = steps.get(index + 1).map_or(0, |step| step.2);
+                    append_contig(&mut output, seq, range, *reverse, overlap, k);
                 }
                 output
             })
@@ -799,4 +790,27 @@ where
 
     info!("Reconstructing cycles..");
     reconstruct_cycles(k, &seq, &ranges, &short_ranges, &links, emit)
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn masks_mark_starts_at_joins_and_record_ends() {
+        let mut seq = PackedSeqVec::default();
+        let first = seq.push_ascii(b"AAACCC");
+        let second = seq.push_ascii(b"CTAG");
+        let short = seq.push_ascii(b"AC");
+        let mut output = Vec::new();
+        append_contig(&mut output, &seq, &first, false, 1, 3);
+        append_contig(&mut output, &seq, &second, false, 0, 3);
+        assert_eq!(output, b"AAACcCTag");
+        output.clear();
+        append_contig(&mut output, &seq, &first, true, 0, 3);
+        assert_eq!(output, b"GGGTtt");
+        output.clear();
+        append_contig(&mut output, &seq, &short, false, 0, 3);
+        assert_eq!(output, b"ac");
+    }
 }

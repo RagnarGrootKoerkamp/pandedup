@@ -1021,20 +1021,17 @@ fn append(
 ) {
     let start = output.len();
     if !reverse {
-        seq.slice(range.start + overlap..range.end)
+        seq.slice(range.start..range.end - overlap)
             .unpack_into(output);
     } else {
-        // FIXME TEST THIS
-        seq.slice(range.start..range.end - overlap)
+        seq.slice(range.start + overlap..range.end)
             .unpack_rc_into(output);
     }
 
-    // FIXME TEST THIS
     if mask && range.len() >= k {
-        let num_lowercase = (k - 1 - overlap).min(range.len() - overlap);
-        for base in &mut output[start..start + num_lowercase] {
-            *base = base.to_ascii_lowercase();
-        }
+        // Only the first len-k+1 positions start input k-mers.
+        let starts = range.len() - k + 1;
+        output[start + starts..].make_ascii_lowercase();
     }
 }
 
@@ -1076,9 +1073,23 @@ where
     let strings: Vec<_> = planned
         .parts
         .par_iter()
-        .map(|part| {
+        .enumerate()
+        .map(|(index, part)| {
             let mut string = Vec::with_capacity(part.bases);
-            append_part(&mut string, part, &planned.seq, &planned.ranges, k, true);
+            let overlap = planned
+                .parts
+                .get(index + 1)
+                .filter(|next| !next.starts_record)
+                .map_or(0, |next| next.steps[0].overlap as usize);
+            append_part(
+                &mut string,
+                part,
+                &planned.seq,
+                &planned.ranges,
+                k,
+                true,
+                overlap,
+            );
             string
         })
         .collect();
@@ -1220,21 +1231,27 @@ fn append_part(
     ranges: &RecordRanges,
     k: usize,
     mask: bool,
+    outgoing_overlap: usize,
 ) {
     let start = output.len();
-    for step in &part.steps {
+    for (index, step) in part.steps.iter().enumerate() {
         let range = ranges.range((step.id / 2) as usize);
         append(
             output,
             seq,
             &range,
             step.id & 1 != 0,
-            step.overlap as usize,
+            part.steps
+                .get(index + 1)
+                .map_or(outgoing_overlap, |next| next.overlap as usize),
             k,
             mask,
         );
     }
-    debug_assert_eq!(output.len() - start, part.bases);
+    debug_assert_eq!(
+        output.len() - start,
+        part.bases + part.steps[0].overlap as usize - outgoing_overlap
+    );
 }
 
 /// Buffer multiple small parts per write without splitting large parts.
@@ -1252,7 +1269,7 @@ fn write_parts(
         .with_min_len(64)
         .try_fold(Vec::new, |mut buffer, part| -> std::io::Result<Vec<u8>> {
             buffer.extend_from_slice(b">\n");
-            append_part(&mut buffer, part, &planned.seq, &planned.ranges, k, mask);
+            append_part(&mut buffer, part, &planned.seq, &planned.ranges, k, mask, 0);
             buffer.push(b'\n');
             if buffer.len() >= batch_bytes {
                 writer.lock().unwrap().write_all(&buffer)?;

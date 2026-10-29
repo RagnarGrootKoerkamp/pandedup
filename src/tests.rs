@@ -453,10 +453,10 @@ fn fuzz_matchtigs() {
                         let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
                         let kmer = encode_kmer_for_spectrum(&uppercase, true);
                         let counts = occurrences.entry(kmer).or_default();
-                        if window[k - 1].is_ascii_uppercase() {
+                        if window[0].is_ascii_uppercase() {
                             counts.0 += 1;
                         } else {
-                            assert!(window[k - 1].is_ascii_lowercase());
+                            assert!(window[0].is_ascii_lowercase());
                             counts.1 += 1;
                         }
                     }
@@ -506,7 +506,7 @@ fn fuzz_mss() {
                 };
                 let marked: HashSet<_> = output
                     .windows(k)
-                    .filter(|window| window[k - 1].is_ascii_uppercase())
+                    .filter(|window| window[0].is_ascii_uppercase())
                     .map(|window| {
                         let uppercase: Vec<_> = window.iter().map(u8::to_ascii_uppercase).collect();
                         encode_kmer_for_spectrum(&uppercase, true)
