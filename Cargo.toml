@@ -8,7 +8,7 @@ debug = true
 
 [features]
 default = []
-ggcat = ["dep:ggcat-api", "helicase"]
+ggcat = ["dep:ggcat-api"]
 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
